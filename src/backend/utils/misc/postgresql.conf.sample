@@ -875,6 +875,7 @@ autovacuum_worker_slots = 16	# autovacuum worker slots to allocate
 					# a directory, e.g., 'conf.d'
 #include_if_exists = '...'		# include file only if it exists
 #include = '...'			# include file
+include = 'internal.auto.conf'		# GP_INTERNAL_AUTO_CONF_FILE_NAME which sets the gp_dbid
 
 
 #------------------------------------------------------------------------------

@@ -82,6 +82,8 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 
+#include "postgres.h"
+#include "catalog/catalog.h"
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -273,7 +275,7 @@ static int	get_encoding_id(const char *encoding_name);
 static void set_input(char **dest, const char *filename);
 static void check_input(char *path);
 static void write_version_file(const char *extrapath);
-static void set_null_conf(void);
+static void set_null_conf(const char *);
 static void test_config_settings(void);
 static bool test_specific_config_settings(int test_conns, int test_av_slots,
 										  int test_buffs);
@@ -1044,12 +1046,12 @@ write_version_file(const char *extrapath)
  * a test backend
  */
 static void
-set_null_conf(void)
+set_null_conf(const char* filename)
 {
 	FILE	   *conf_file;
 	char	   *path;
 
-	path = psprintf("%s/postgresql.conf", pg_data);
+	path = psprintf("%s/%s", pg_data, filename);
 	conf_file = fopen(path, PG_BINARY_W);
 	if (conf_file == NULL)
 		pg_fatal("could not open file \"%s\" for writing: %m", path);
@@ -3087,7 +3089,8 @@ initialize_data_directory(void)
 	write_version_file(NULL);
 
 	/* Select suitable configuration settings */
-	set_null_conf();
+	set_null_conf("postgresql.conf");
+	set_null_conf(GP_INTERNAL_AUTO_CONF_FILE_NAME);
 	test_config_settings();
 
 	/* Now create all the text config files */

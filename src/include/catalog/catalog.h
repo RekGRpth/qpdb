@@ -17,6 +17,14 @@
 #include "catalog/pg_class.h"
 #include "utils/relcache.h"
 
+/*
+ * This file is used to store internal configuration information specific to a
+ * server that's not same between primary and mirror pair. For example it
+ * stores gp_dbid, which is different for primary and mirror pair, even if
+ * contentid is same for them. This file is not copied over during
+ * pg_basebackup and pg_rewind to mirror from primary.
+ */
+#define GP_INTERNAL_AUTO_CONF_FILE_NAME "internal.auto.conf"
 
 extern bool IsSystemRelation(Relation relation);
 extern bool IsToastRelation(Relation relation);
