@@ -63,6 +63,13 @@ distclean:
 	@rm -rf autom4te.cache/
 	rm -f config.cache config.log config.status GNUmakefile
 
+# Create or destroy a demo cluster.
+create-demo-cluster:
+	$(MAKE) -C gpAux/gpdemo create-demo-cluster
+
+destroy-demo-cluster:
+	$(MAKE) -C gpAux/gpdemo destroy-demo-cluster
+
 check-tests: | temp-install
 check check-tests installcheck installcheck-parallel installcheck-tests: CHECKPREP_TOP=src/test/regress
 check check-tests installcheck installcheck-parallel installcheck-tests: submake-generated-headers
