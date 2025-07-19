@@ -16,6 +16,8 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "cdb/cdbvars.h"
 #include "utils/guc_tables.h"
 
@@ -30,6 +32,16 @@ struct config_bool ConfigureNamesBool_gp[] =
 
 struct config_int ConfigureNamesInt_gp[] =
 {
+	{
+		{"gp_dbid", PGC_POSTMASTER, PRESET_OPTIONS,
+			gettext_noop("The dbid used by this server."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
+		},
+		&GpIdentity.dbid,
+		UNINITIALIZED_GP_IDENTITY_VALUE, INT_MIN, INT_MAX,
+		NULL, NULL, NULL
+	},
 
 	/* End-of-list marker */
 	{

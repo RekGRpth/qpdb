@@ -58,4 +58,19 @@ extern char *gp_role_string;	/* Use by guc.c as staging area for value. */
 
 extern const char *role_to_string(GpRoleValue role);
 
+typedef struct GpId
+{
+	int32		dbid;			/* the dbid of this database */
+	int32		segindex;		/* content indicator: -1 for entry database,
+								 * 0, ..., n-1 for segment database *
+								 * a primary and its mirror have the same segIndex */
+} GpId;
+
+/* --------------------------------------------------------------------------------------------------
+ * Global variable declaration for the data for the single row of gp_id table
+ */
+extern GpId GpIdentity;
+
+#define UNINITIALIZED_GP_IDENTITY_VALUE (-10000)
+
 #endif   /* CDBVARS_H */

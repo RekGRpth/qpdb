@@ -41,6 +41,14 @@ GpRoleValue Gp_role;			/* Role paid by this Greenplum Database
 								 * backend */
 char	   *gp_role_string;		/* Staging area for guc.c */
 
+/* ----------------
+ * This variable is initialized by the postmaster from command line arguments
+ *
+ * Any code needing the "numsegments"
+ * can simply #include cdbvars.h, and use GpIdentity.numsegments
+ */
+GpId		GpIdentity = {UNINITIALIZED_GP_IDENTITY_VALUE, UNINITIALIZED_GP_IDENTITY_VALUE};
+
 /*
  * Convert a Greenplum Database role string (as for gp_role) to an
  * enum value of type GpRoleValue. Return GP_ROLE_UNDEFINED in case the
