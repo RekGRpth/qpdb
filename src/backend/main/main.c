@@ -420,6 +420,9 @@ help(const char *progname)
 	printf(_("  -T                 send SIGABRT to all backend processes if one dies\n"));
 	printf(_("  -W NUM             wait NUM seconds to allow attach from a debugger\n"));
 
+	printf(_("\nOptions for maintenance mode:\n"));
+	printf(_("  -m                 start the system in maintenance mode\n"));
+
 	printf(_("\nOptions for single-user mode:\n"));
 	printf(_("  --single           selects single-user mode (must be first argument)\n"));
 	printf(_("  DBNAME             database name (defaults to user name)\n"));
