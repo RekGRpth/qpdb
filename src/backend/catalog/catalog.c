@@ -48,6 +48,9 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* GPDB additions */
+#include "catalog/gp_segment_configuration.h"
+
 /*
  * Parameters to determine when to emit a log message in
  * GetNewOidWithIndex()
@@ -315,6 +318,9 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedSecLabelRelationId ||
 		relationId == SubscriptionRelationId ||
 		relationId == TableSpaceRelationId)
+		return true;
+	/* GPDB additions */
+	if (relationId == GpSegmentConfigRelationId)
 		return true;
 	/* These are their indexes */
 	if (relationId == AuthIdOidIndexId ||
