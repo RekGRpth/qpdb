@@ -23,6 +23,8 @@ SUBDIRS = access archive backup bootstrap catalog parser commands executor \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
 	jit
 
+SUBDIRS += cdb
+
 include $(srcdir)/common.mk
 
 # As of 1/2010:

@@ -102,6 +102,7 @@ enum config_group
 	PRESET_OPTIONS,
 	CUSTOM_OPTIONS,
 	DEVELOPER_OPTIONS,
+    GP_WORKER_IDENTITY, /* GPDB */
 };
 
 /*

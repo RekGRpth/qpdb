@@ -46,8 +46,11 @@ OBJS = \
 	pg_subscription.o \
 	pg_type.o \
 	storage.o \
-	toasting.o \
-	gp_segment_config.o \
+	toasting.o
+
+# GPDB
+OBJS += \
+	gp_segment_config.o
 
 include $(top_srcdir)/src/backend/common.mk
 

@@ -486,4 +486,9 @@ extern void GUC_check_errcode(int sqlerrcode);
 	pre_format_elog_string(errno, TEXTDOMAIN), \
 	GUC_check_errhint_string = format_elog_string
 
+/* in cdb/cdbvars.c */
+extern bool check_gp_role(char **newval, void **extra, GucSource source);
+extern void assign_gp_role(const char *newval, void *extra);
+extern const char *show_gp_role(void);
+
 #endif							/* GUC_H */

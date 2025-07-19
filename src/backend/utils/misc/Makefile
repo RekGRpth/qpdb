@@ -32,8 +32,11 @@ OBJS = \
 	stack_depth.o \
 	superuser.o \
 	timeout.o \
-	tzparser.o \
-	guc_gp.o \
+	tzparser.o
+
+# GPDB
+OBJS += \
+	guc_gp.o
 
 # This location might depend on the installation directories. Therefore
 # we can't substitute it into pg_config.h.

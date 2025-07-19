@@ -81,8 +81,10 @@ CATALOG_HEADERS := \
 	pg_publication_namespace.h \
 	pg_publication_rel.h \
 	pg_subscription.h \
-	pg_subscription_rel.h \
-	gp_segment_configuration.h \
+	pg_subscription_rel.h
+
+CATALOG_HEADERS += \
+	gp_segment_configuration.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 
