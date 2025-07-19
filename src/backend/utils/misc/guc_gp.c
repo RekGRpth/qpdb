@@ -21,8 +21,27 @@
 #include "cdb/cdbvars.h"
 #include "utils/guc_tables.h"
 
+/* Optimizer related gucs */
+bool		optimizer;
+
+static bool
+check_optimizer(bool *newval, void **extra, GucSource source)
+{
+	GUC_check_errmsg("ORCA is not supported by this build");
+	return true;
+}
+
 struct config_bool ConfigureNamesBool_gp[] =
 {
+	{
+		{"optimizer", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable GPORCA."),
+			NULL
+		},
+		&optimizer,
+		false,
+		check_optimizer, NULL, NULL
+	},
 
 	/* End-of-list marker */
 	{
