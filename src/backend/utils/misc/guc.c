@@ -929,9 +929,25 @@ build_guc_variables(void)
 		num_vars++;
 	}
 
+	for (i = 0; ConfigureNamesBool_gp[i].gen.name; i++)
+	{
+		struct config_bool *conf = &ConfigureNamesBool_gp[i];
+
+		conf->gen.vartype = PGC_BOOL;
+		num_vars++;
+	}
+
 	for (i = 0; ConfigureNamesInt[i].gen.name; i++)
 	{
 		struct config_int *conf = &ConfigureNamesInt[i];
+
+		conf->gen.vartype = PGC_INT;
+		num_vars++;
+	}
+
+	for (i = 0; ConfigureNamesInt_gp[i].gen.name; i++)
+	{
+		struct config_int *conf = &ConfigureNamesInt_gp[i];
 
 		conf->gen.vartype = PGC_INT;
 		num_vars++;
@@ -945,6 +961,14 @@ build_guc_variables(void)
 		num_vars++;
 	}
 
+	for (i = 0; ConfigureNamesReal_gp[i].gen.name; i++)
+	{
+		struct config_real *conf = &ConfigureNamesReal_gp[i];
+
+		conf->gen.vartype = PGC_REAL;
+		num_vars++;
+	}
+
 	for (i = 0; ConfigureNamesString[i].gen.name; i++)
 	{
 		struct config_string *conf = &ConfigureNamesString[i];
@@ -953,9 +977,25 @@ build_guc_variables(void)
 		num_vars++;
 	}
 
+	for (i = 0; ConfigureNamesString_gp[i].gen.name; i++)
+	{
+		struct config_string *conf = &ConfigureNamesString_gp[i];
+
+		conf->gen.vartype = PGC_STRING;
+		num_vars++;
+	}
+
 	for (i = 0; ConfigureNamesEnum[i].gen.name; i++)
 	{
 		struct config_enum *conf = &ConfigureNamesEnum[i];
+
+		conf->gen.vartype = PGC_ENUM;
+		num_vars++;
+	}
+
+	for (i = 0; ConfigureNamesEnum_gp[i].gen.name; i++)
+	{
+		struct config_enum *conf = &ConfigureNamesEnum_gp[i];
 
 		conf->gen.vartype = PGC_ENUM;
 		num_vars++;
@@ -988,9 +1028,33 @@ build_guc_variables(void)
 		hentry->gucvar = gucvar;
 	}
 
+	for (i = 0; ConfigureNamesBool_gp[i].gen.name; i++)
+	{
+		struct config_generic *gucvar = &ConfigureNamesBool_gp[i].gen;
+
+		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
+											  &gucvar->name,
+											  HASH_ENTER,
+											  &found);
+		Assert(!found);
+		hentry->gucvar = gucvar;
+	}
+
 	for (i = 0; ConfigureNamesInt[i].gen.name; i++)
 	{
 		struct config_generic *gucvar = &ConfigureNamesInt[i].gen;
+
+		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
+											  &gucvar->name,
+											  HASH_ENTER,
+											  &found);
+		Assert(!found);
+		hentry->gucvar = gucvar;
+	}
+
+	for (i = 0; ConfigureNamesInt_gp[i].gen.name; i++)
+	{
+		struct config_generic *gucvar = &ConfigureNamesInt_gp[i].gen;
 
 		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
 											  &gucvar->name,
@@ -1012,6 +1076,18 @@ build_guc_variables(void)
 		hentry->gucvar = gucvar;
 	}
 
+	for (i = 0; ConfigureNamesReal_gp[i].gen.name; i++)
+	{
+		struct config_generic *gucvar = &ConfigureNamesReal_gp[i].gen;
+
+		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
+											  &gucvar->name,
+											  HASH_ENTER,
+											  &found);
+		Assert(!found);
+		hentry->gucvar = gucvar;
+	}
+
 	for (i = 0; ConfigureNamesString[i].gen.name; i++)
 	{
 		struct config_generic *gucvar = &ConfigureNamesString[i].gen;
@@ -1024,9 +1100,33 @@ build_guc_variables(void)
 		hentry->gucvar = gucvar;
 	}
 
+	for (i = 0; ConfigureNamesString_gp[i].gen.name; i++)
+	{
+		struct config_generic *gucvar = &ConfigureNamesString_gp[i].gen;
+
+		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
+											  &gucvar->name,
+											  HASH_ENTER,
+											  &found);
+		Assert(!found);
+		hentry->gucvar = gucvar;
+	}
+
 	for (i = 0; ConfigureNamesEnum[i].gen.name; i++)
 	{
 		struct config_generic *gucvar = &ConfigureNamesEnum[i].gen;
+
+		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
+											  &gucvar->name,
+											  HASH_ENTER,
+											  &found);
+		Assert(!found);
+		hentry->gucvar = gucvar;
+	}
+
+	for (i = 0; ConfigureNamesEnum_gp[i].gen.name; i++)
+	{
+		struct config_generic *gucvar = &ConfigureNamesEnum_gp[i].gen;
 
 		hentry = (GUCHashEntry *) hash_search(guc_hashtab,
 											  &gucvar->name,

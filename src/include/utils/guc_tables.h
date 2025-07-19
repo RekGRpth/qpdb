@@ -338,4 +338,11 @@ extern char *config_enum_get_options(struct config_enum *record,
 									 const char *suffix,
 									 const char *separator);
 
+/* guc_gp.c exports these for guc.c */
+extern PGDLLIMPORT struct config_bool ConfigureNamesBool_gp[];
+extern PGDLLIMPORT struct config_int ConfigureNamesInt_gp[];
+extern PGDLLIMPORT struct config_real ConfigureNamesReal_gp[];
+extern PGDLLIMPORT struct config_string ConfigureNamesString_gp[];
+extern PGDLLIMPORT struct config_enum ConfigureNamesEnum_gp[];
+
 #endif							/* GUC_TABLES_H */
