@@ -116,4 +116,6 @@ murmurhash64(uint64 data)
 	return h;
 }
 
+extern uint32 int32_hash(const void *key, Size keysize);
+
 #endif							/* HASHFN_H */

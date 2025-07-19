@@ -84,6 +84,7 @@ CATALOG_HEADERS := \
 	pg_subscription_rel.h
 
 CATALOG_HEADERS += \
+	gp_id.h \
 	gp_segment_configuration.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)

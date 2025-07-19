@@ -29,6 +29,10 @@ SUBDIRS     = \
 	sort \
 	time
 
+# GPDB
+SUBDIRS += \
+	gp
+
 # location of Catalog.pm
 catalogdir  = $(top_srcdir)/src/backend/catalog
 

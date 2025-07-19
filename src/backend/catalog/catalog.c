@@ -49,6 +49,7 @@
 #include "utils/syscache.h"
 
 /* GPDB additions */
+#include "catalog/gp_id.h"
 #include "catalog/gp_segment_configuration.h"
 
 /*
@@ -320,7 +321,8 @@ IsSharedRelation(Oid relationId)
 		relationId == TableSpaceRelationId)
 		return true;
 	/* GPDB additions */
-	if (relationId == GpSegmentConfigRelationId)
+	if (relationId == GpIdRelationId ||
+		relationId == GpSegmentConfigRelationId)
 		return true;
 	/* These are their indexes */
 	if (relationId == AuthIdOidIndexId ||
@@ -344,6 +346,10 @@ IsSharedRelation(Oid relationId)
 		relationId == SubscriptionObjectIndexId ||
 		relationId == TablespaceNameIndexId ||
 		relationId == TablespaceOidIndexId)
+		return true;
+	/* GPDB added indexes */
+	if (relationId == GpSegmentConfigContentPreferred_roleIndexId ||
+		relationId == GpSegmentConfigDbidIndexId)
 		return true;
 	/* These are their toast tables and toast indexes */
 	if (relationId == PgDatabaseToastTable ||

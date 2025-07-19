@@ -19,6 +19,7 @@
 #ifndef CDBVARS_H
 #define CDBVARS_H
 
+#include "catalog/gp_segment_configuration.h" /* COORDINATOR_CONTENT_ID */
 /*
  * Parameters gp_role
  *
@@ -72,5 +73,6 @@ typedef struct GpId
 extern GpId GpIdentity;
 
 #define UNINITIALIZED_GP_IDENTITY_VALUE (-10000)
+#define IS_QUERY_DISPATCHER() (GpIdentity.segindex == COORDINATOR_CONTENT_ID)
 
 #endif   /* CDBVARS_H */

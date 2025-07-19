@@ -67,6 +67,9 @@ CATALOG(gp_segment_configuration,9999,GpSegmentConfigRelationId) BKI_SHARED_RELA
  */
 typedef FormData_gp_segment_configuration *Form_gp_segment_configuration;
 
+DECLARE_UNIQUE_INDEX(gp_segment_config_content_preferred_role_index, 7139, GpSegmentConfigContentPreferred_roleIndexId, gp_segment_configuration, btree(content int2_ops, preferred_role char_ops));
+DECLARE_UNIQUE_INDEX(gp_segment_config_dbid_index, 7140, GpSegmentConfigDbidIndexId, gp_segment_configuration, btree(dbid int2_ops));
+
 extern bool gp_segment_config_has_mirrors(void);
 
 #endif /*_GP_SEGMENT_CONFIGURATION_H_*/

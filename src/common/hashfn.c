@@ -690,3 +690,12 @@ uint32_hash(const void *key, Size keysize)
 	Assert(keysize == sizeof(uint32));
 	return hash_bytes_uint32(*((const uint32 *) key));
 }
+
+/*
+ * int32_hash: hash function for int32: no-op
+ */
+uint32
+int32_hash(const void *key, Size keysize)
+{
+	return *(uint32 *)key;
+}

@@ -17,14 +17,20 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "catalog/pg_collation_d.h"
 #include "postgres.h"
 
 #include "miscadmin.h"
-#include "storage/proc.h"
+#include "regex/regex.h"
 #include "utils/guc.h"
-
-/* GPDB */
 #include "cdb/cdbvars.h"
+#include "libpq-fe.h"
+#include "libpq-int.h"
+#include "cdb/cdbutil.h"
+#include "lib/stringinfo.h"
+#include "libpq/libpq-be.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 
 /*
  * ----------------

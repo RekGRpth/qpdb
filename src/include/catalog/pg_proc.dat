@@ -12572,4 +12572,10 @@
   proargnames => '{pid,io_id,io_generation,state,operation,off,length,target,handle_data_len,raw_result,result,target_desc,f_sync,f_localmem,f_buffered}',
   prosrc => 'pg_get_aios' },
 
+# GPDB exposed internally-defined functions. 
+{ oid => 9996, descr => 'Perform the catalog operations necessary for adding a new primary segment',
+   proname => 'gp_add_segment_primary', proisstrict => 'f', provolatile => 'v', proparallel => 'r', prorettype => 'int2', proargtypes => 'text text int4 text', prosrc => 'gp_add_segment_primary' },
+{ oid => 9997, descr => 'Perform the catalog operations necessary for adding a new segment',
+   proname => 'gp_add_segment', proisstrict => 'f', provolatile => 'v', proparallel => 'r', prorettype => 'int2', proargtypes => 'int2 int2 char char char char int4 text text text', prosrc => 'gp_add_segment' },
+
 ]
