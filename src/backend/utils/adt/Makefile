@@ -150,4 +150,8 @@ numeric.o: CFLAGS += ${CFLAGS_VECTORIZE}
 
 varlena.o: varlena.c levenshtein.c
 
+# GPDB additions
+OBJS += \
+	gp_optimizer_functions.o
+
 include $(top_srcdir)/src/backend/common.mk
