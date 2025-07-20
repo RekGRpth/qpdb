@@ -174,6 +174,11 @@ main(int argc, char *argv[])
 			fputs(PG_BACKEND_VERSIONSTR, stdout);
 			exit(0);
 		}
+		if (strcmp(argv[1], "--gp-version") == 0)
+		{
+			fputs("postgres (Greenplum Database) " GP_VERSION "\n", stdout);
+			exit(0);
+		}
 
 		/*
 		 * In addition to the above, we allow "--describe-config" and "-C var"
@@ -411,6 +416,7 @@ help(const char *progname)
 	printf(_("  --NAME=VALUE       set run-time parameter\n"));
 	printf(_("  --describe-config  describe configuration parameters, then exit\n"));
 	printf(_("  -?, --help         show this help, then exit\n"));
+	printf(_("  --gp-version       output Greenplum version information, then exit\n"));
 
 	printf(_("\nDeveloper options:\n"));
 	printf(_("  -f s|i|o|b|t|n|m|h forbid use of some plan types\n"));

@@ -51,6 +51,15 @@
 /* Define to 1 if you want National Language Support. (--enable-nls) */
 #undef ENABLE_NLS
 
+/* Greenplum major version as a string */
+#undef GP_MAJORVERSION
+
+/* A string containing the Greenplum version number */
+#undef GP_VERSION
+
+/* Greenplum version as a number */
+#undef GP_VERSION_NUM
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 
