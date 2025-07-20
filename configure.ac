@@ -2452,6 +2452,40 @@ if test x"$LDFLAGS_EX_BE" = x""; then
 fi
 AC_SUBST(LDFLAGS_EX_BE)
 
+# Get the Greenplum version string from VERSION
+
+GP_VERSION_LONG=`bash ./getversion`
+
+GP_VERSION_LONG="$GP_VERSION_LONG$with_extra_version"
+AC_SUBST(GP_VERSION_LONG)
+
+echo $GP_VERSION_LONG > VERSION
+GP_VERSION=`cat VERSION`
+
+GP_VERSION_SHORT=`bash ./getversion --short`
+GP_VERSION_SHORT="$GP_VERSION_SHORT$with_extra_version"
+AC_SUBST(GP_VERSION_SHORT)
+
+GP_BASH_VERSION_IN="gpMgmt/bin/lib/gp_bash_version.sh.in"
+GP_BASH_VERSION_SH="gpMgmt/bin/lib/gp_bash_version.sh"
+if grep '##' $GP_BASH_VERSION_IN > /dev/null 2>&1 ; then
+    sed "s,##.*##,$GP_VERSION," $GP_BASH_VERSION_IN > $GP_BASH_VERSION_SH
+fi
+
+GPTEST_IN="src/test/regress/GPTest.pm.in"
+GPTEST_PM="src/test/regress/GPTest.pm"
+if grep '##' $GPTEST_IN > /dev/null 2>&1 ; then
+    sed "s,##.*##,$GP_VERSION," $GPTEST_IN > $GPTEST_PM
+fi
+
+AC_DEFINE_UNQUOTED(GP_VERSION,
+                   ["$GP_VERSION"],
+                   [A string containing the Greenplum version number])
+
+[GP_MAJORVERSION=`expr "$GP_VERSION" : '\([0-9][0-9]*\)'`]
+AC_SUBST(GP_MAJORVERSION)
+AC_DEFINE_UNQUOTED(GP_MAJORVERSION, "$GP_MAJORVERSION", [Greenplum major version as a string])
+
 # Create compiler version string
 if test x"$GCC" = x"yes" ; then
   cc_string=`${CC} --version | sed q`
@@ -2483,6 +2517,12 @@ if test x"$PG_SYSROOT" != x; then
   LDFLAGS=`echo "$LDFLAGS" | sed -e "s| $PG_SYSROOT | \\\$(PG_SYSROOT) |"`
 fi
 AC_SUBST(PG_SYSROOT)
+
+#
+[GP_VERSION_NUM="`echo "$PACKAGE_VERSION" | sed 's/[A-Za-z].*$//' |
+tr '.' '	' |
+$AWK '{printf "%d%02d%02d", $1, $2, (NF >= 3) ? $3 : 0}'`"]
+AC_DEFINE_UNQUOTED(GP_VERSION_NUM, $GP_VERSION_NUM, [Greenplum version as a number])
 
 
 # Begin output steps
@@ -2520,6 +2560,8 @@ AC_SUBST(vpath_build)
 
 
 AC_CONFIG_FILES([GNUmakefile src/Makefile.global])
+
+AC_CONFIG_FILES([src/include/catalog/gp_version_at_initdb.dat])
 
 AC_CONFIG_LINKS([
   src/backend/port/pg_sema.c:${SEMA_IMPLEMENTATION}
