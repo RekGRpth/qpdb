@@ -39,7 +39,7 @@
 /*
  * Defines for gp_id table
  */
-CATALOG(gp_id,9998,GpIdRelationId) BKI_SHARED_RELATION
+CATALOG(gp_id,5101,GpIdRelationId) BKI_SHARED_RELATION
 {
 	NameData	gpname;
 	int16		numsegments;
