@@ -741,6 +741,15 @@ extern void pgstat_acquire_replslot(struct ReplicationSlot *slot);
 extern void pgstat_drop_replslot(struct ReplicationSlot *slot);
 extern PgStat_StatReplSlotEntry *pgstat_fetch_replslot(NameData slotname);
 
+struct CdbDispatchResults;
+struct pg_result;
+extern void pgstat_send_qd_tabstats(void);								/* GPDB */
+extern void pgstat_combine_one_qe_result(List **oidList,           /* GPDB */
+										 struct pg_result *pgresult,
+										 int nest_level,
+										 int32 segindex);
+extern void pgstat_combine_from_qe(struct CdbDispatchResults *results,	/* GPDB */
+								   int writerSliceIndex);
 
 /*
  * Functions in pgstat_slru.c

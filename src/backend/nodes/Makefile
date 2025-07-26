@@ -63,6 +63,9 @@ node_headers = \
 	nodes/value.h \
 	utils/rel.h
 
+# node_headers += \
+# 	cdb/cdbpathlocus.h
+
 # see also catalog/Makefile for an explanation of these make rules
 
 all: generated-header-symlinks

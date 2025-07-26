@@ -108,6 +108,15 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
 
+/*
+ * Whether request on cancel or termination have arrived?
+ */
+static inline bool
+CancelRequested()
+{
+	return InterruptPending && (ProcDiePending || QueryCancelPending);
+}
+
 /* Test whether an interrupt is pending */
 #ifndef WIN32
 #define INTERRUPTS_PENDING_CONDITION() \

@@ -21,6 +21,13 @@
 #include "cdb/cdbvars.h"
 #include "utils/guc_tables.h"
 
+static bool check_dispatch_log_stats(bool *newval, void **extra, GucSource source);
+
+bool		Debug_print_full_dtm = false;
+bool		Debug_cancel_print = false;
+
+bool		log_dispatch_stats = false;
+
 /* Optimizer related gucs */
 bool		optimizer;
 
@@ -33,6 +40,38 @@ check_optimizer(bool *newval, void **extra, GucSource source)
 
 struct config_bool ConfigureNamesBool_gp[] =
 {
+	{
+		{"log_dispatch_stats", PGC_SUSET, STATS_MONITORING,
+			gettext_noop("Writes dispatcher performance statistics to the server log."),
+			NULL
+		},
+		&log_dispatch_stats,
+		false,
+		check_dispatch_log_stats, NULL, NULL
+	},
+
+	{
+		{"debug_print_full_dtm", PGC_SUSET, LOGGING_WHAT,
+			gettext_noop("Prints full DTM information to server log."),
+			NULL,
+			GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&Debug_print_full_dtm,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"debug_cancel_print", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Print cancel detail information."),
+			NULL,
+			GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		},
+		&Debug_cancel_print,
+		false,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"optimizer", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enable GPORCA."),
@@ -115,4 +154,24 @@ struct config_enum ConfigureNamesEnum_gp[] =
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, NULL, NULL, NULL
 	}
 };
+
+static bool
+check_dispatch_log_stats(bool *newval, void **extra, GucSource source)
+{
+	if (*newval &&
+		(log_parser_stats || log_planner_stats || log_executor_stats || log_statement_stats))
+	{
+		if (source >= PGC_S_INTERACTIVE)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot enable \"log_dispatch_stats\" when "
+							"\"log_statement_stats\", "
+							"\"log_parser_stats\", \"log_planner_stats\", "
+							"or \"log_executor_stats\" is true")));
+		/* source == PGC_S_OVERRIDE means do it anyway, eg at xact abort */
+		else if (source != PGC_S_OVERRIDE)
+			return false;
+	}
+	return true;
+}
 

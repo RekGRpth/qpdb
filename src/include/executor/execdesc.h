@@ -51,6 +51,16 @@ typedef struct QueryDesc
 	/* This field is set by ExecutePlan */
 	bool		already_executed;	/* true if previously executed */
 
+	/* This field is set by ExecutorEnd after collecting cdbdisp results */
+	uint64		es_processed;	/* # of tuples processed */
+	bool		extended_query;   /* simple or extended query protocol? */
+	char		*portal_name;	/* NULL for unnamed portal */
+
+	QueryDispatchDesc *ddesc;
+
+	/* CDB: EXPLAIN ANALYZE statistics */
+	struct CdbExplain_ShowStatCtx  *showstatctx;
+
 	/* This is always set NULL by the core system, but plugins can change it */
 	struct Instrumentation *totaltime;	/* total time spent in ExecutorRun */
 } QueryDesc;

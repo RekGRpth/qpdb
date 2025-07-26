@@ -212,4 +212,6 @@ extern void AtEOXact_TypeCache(void);
 
 extern void AtEOSubXact_TypeCache(void);
 
+extern List *build_tuple_node_list(int start);
+
 #endif							/* TYPCACHE_H */

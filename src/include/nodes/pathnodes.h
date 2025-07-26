@@ -22,6 +22,9 @@
 #include "nodes/parsenodes.h"
 #include "storage/block.h"
 
+// #include "cdb/cdbpathlocus.h"
+#include "nodes/plannodes.h"
+
 
 /*
  * Relids
@@ -629,6 +632,23 @@ typedef struct PartitionSchemeData
 }			PartitionSchemeData;
 
 typedef struct PartitionSchemeData *PartitionScheme;
+
+/**
+ * Fetch the root (PlannerInfo) for a subplan
+ */
+static inline struct PlannerInfo *planner_subplan_get_root(struct PlannerInfo *root, SubPlan *subplan)
+{
+	return (PlannerInfo *) list_nth(root->glob->subroots, subplan->plan_id - 1);
+}
+
+/*
+ * Rewrite the Plan associated with a SubPlan node during planning.
+ */
+static inline void planner_subplan_put_plan(struct PlannerInfo *root, SubPlan *subplan, Plan *plan) 
+{
+	ListCell *cell = list_nth_cell(root->glob->subplans, subplan->plan_id-1);
+	lfirst(cell) = plan;
+}
 
 /*----------
  * RelOptInfo

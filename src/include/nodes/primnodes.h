@@ -22,6 +22,43 @@
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
 
+// #include "cdb/cdbpathlocus.h" /* For CdbLocusType */
+/*
+ * CdbLocusType
+ *
+ * The difference between SegmentGeneral and Replicated is that a path
+ * with Replicated locus *must* be executed on all of the segments, whereas
+ * a SegmentGeneral *may* be executed on all of the segments, or just one
+ * of them, as is convenient. Replicated is used as the locus for
+ * UPDATEs/DELETEs/INSERTs to replicated tables; it's important that the
+ * plan gets executed on all segments so that all segments are updated.
+ * SegmentGeneral is used when querying replicated tables.
+ */
+typedef enum CdbLocusType
+{
+    CdbLocusType_Null,
+    CdbLocusType_Entry,         /* a single backend process on the entry db:
+                                 * usually the qDisp itself, but could be a
+                                 * qExec started by the entry postmaster.
+                                 */
+    CdbLocusType_SingleQE,      /* a single backend process on any db: the
+                                 * qDisp itself, or a qExec started by a
+                                 * segment postmaster or the entry postmaster.
+                                 */
+    CdbLocusType_General,       /* compatible with any locus (data is
+                                 * self-contained in the query plan or
+                                 * generally available in any qExec or qDisp) */
+    CdbLocusType_SegmentGeneral,/* generally available in any qExec, but not
+								 * available in qDisp */
+	CdbLocusType_OuterQuery,	/* generally available in any qExec or qDisp, but
+								 * contains correlated vars from outer query, so must
+								 * not be redistributed */
+    CdbLocusType_Replicated,    /* replicated over all qExecs of an N-gang */
+    CdbLocusType_Hashed,        /* hash partitioned over all qExecs of N-gang */
+    CdbLocusType_HashedOJ,      /* result of hash partitioned outer join, NULLs can be anywhere */
+    CdbLocusType_Strewn,        /* partitioned on no known function */
+    CdbLocusType_End            /* = last valid CdbLocusType + 1 */
+} CdbLocusType;
 
 typedef enum OverridingKind
 {
@@ -526,6 +563,16 @@ typedef struct Aggref
 	ParseLoc	location;
 } Aggref;
 
+typedef struct
+{
+	Expr		xpr;
+
+	Index		agg_expr_id;
+	Bitmapset  *agg_args_id_bms; /* each DQA's arg indexes bitmapset */
+	Expr	   *agg_filter;		/* DQA's filter. since tuplesplit, filter have to push down */
+	Bitmapset  *agg_vars_ref;	/* vars of normal agg, which assigned to this DQAExpr */
+} DQAExpr;
+
 /*
  * GroupingFunc
  *
@@ -959,6 +1006,20 @@ typedef struct BoolExpr
 	List	   *args;			/* arguments to this expression */
 	ParseLoc	location;		/* token location, or -1 if unknown */
 } BoolExpr;
+
+/*
+ * TableValueExpr - a "TABLE( <subquery> )" expression indicating a subquery
+ * expression that is passed as a value to a function.
+ *
+ * This is <table value constructor by query> within the SQL Standard
+ */
+typedef struct TableValueExpr
+{
+	NodeTag     type;
+	Node       *subquery;
+	int         location;
+} TableValueExpr;
+
 
 /*
  * SubLink
@@ -2370,5 +2431,15 @@ typedef struct OnConflictExpr
 	int			exclRelIndex;	/* RT index of 'excluded' relation */
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 } OnConflictExpr;
+
+/*
+ * DMLActionExpr
+ *
+ * Represents the expression which introduces the action in a SplitUpdate statement
+ */
+typedef struct DMLActionExpr
+{
+	Expr        xpr;
+} DMLActionExpr;
 
 #endif							/* PRIMNODES_H */

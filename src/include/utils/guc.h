@@ -250,6 +250,9 @@ extern PGDLLIMPORT bool Debug_print_parse;
 extern PGDLLIMPORT bool Debug_print_rewritten;
 extern PGDLLIMPORT bool Debug_pretty_print;
 
+extern PGDLLIMPORT bool Debug_print_full_dtm;
+extern PGDLLIMPORT bool Debug_cancel_print;
+
 #ifdef DEBUG_NODE_TESTS_ENABLED
 extern PGDLLIMPORT bool Debug_copy_parse_plan_trees;
 extern PGDLLIMPORT bool Debug_write_read_parse_plan_trees;
@@ -262,6 +265,8 @@ extern PGDLLIMPORT bool log_executor_stats;
 extern PGDLLIMPORT bool log_statement_stats;
 extern PGDLLIMPORT bool log_btree_build_stats;
 extern PGDLLIMPORT char *event_source;
+
+extern PGDLLIMPORT bool log_dispatch_stats;
 
 extern PGDLLIMPORT bool check_function_bodies;
 extern PGDLLIMPORT bool current_role_is_superuser;

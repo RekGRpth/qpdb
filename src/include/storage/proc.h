@@ -287,6 +287,16 @@ struct PGPROC
 									 * ProcGlobal->subxidStates[i] */
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
 
+	/*
+	 * Current command_id for the running query
+	 * This counter can be used by external monitoring infrastructure.
+	 * As a monitoring approach, each query execution is assigned with a unique
+	 * ID. The queryCommandId is part of the ID. Monitoring extension with
+	 * shared memory access can use queryCommandId to map query execution with
+	 * a backend entity to access related metrics information.
+	 */
+	int			queryCommandId;
+
 	/* Support for group XID clearing. */
 	/* true, if member of ProcArray group waiting for XID clear */
 	bool		procArrayGroupMember;

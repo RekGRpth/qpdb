@@ -11,6 +11,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
 
+SUBDIRS := dispatcher
 
 
 OBJS = \

@@ -645,6 +645,20 @@ typedef TransactionId MultiXactId;
 
 typedef uint32 MultiXactOffset;
 
+typedef int32 DistributedSnapshotId;
+
+/* GPDB */
+typedef uint64 DistributedTransactionId;
+#define InvalidDistributedTransactionId	((DistributedTransactionId) 0)
+#define FirstDistributedTransactionId	((DistributedTransactionId) 1)
+#define LastDistributedTransactionId	((DistributedTransactionId) 0xffffFFFFffffFFFF)
+
+/*
+ * max(LastDistributedTransactionId) is 20-bytes, and then plus NULL.
+ * FIXME: Use hex later to save a bit memory.
+ */
+#define TMGIDSIZE 21
+
 typedef uint32 CommandId;
 
 #define FirstCommandId	((CommandId) 0)
@@ -839,6 +853,7 @@ typedef NameData *Name;
 
 #define Assert(condition)	((void)true)
 #define AssertMacro(condition)	((void)true)
+#define AssertImply(condition1, condition2)	((void)true)
 
 #elif defined(FRONTEND)
 
@@ -867,6 +882,9 @@ typedef NameData *Name;
 #define AssertMacro(condition) \
 	((void) ((condition) || \
 			 (ExceptionalCondition(#condition, __FILE__, __LINE__), 0)))
+
+#define AssertImply(cond1, cond2) \
+		Assert(!(cond1) || (cond2))
 
 #endif							/* USE_ASSERT_CHECKING && !FRONTEND */
 
