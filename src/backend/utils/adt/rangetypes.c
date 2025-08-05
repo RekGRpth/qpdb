@@ -285,8 +285,7 @@ range_send(PG_FUNCTION_ARGS)
 
 	if (RANGE_HAS_LBOUND(flags))
 	{
-		Datum		bound = PointerGetDatum(SendFunctionCall(&cache->typioproc,
-															 lower.val));
+		bytea	   *bound = SendFunctionCall(&cache->typioproc, lower.val);
 		uint32		bound_len = VARSIZE(bound) - VARHDRSZ;
 		char	   *bound_data = VARDATA(bound);
 
@@ -296,8 +295,7 @@ range_send(PG_FUNCTION_ARGS)
 
 	if (RANGE_HAS_UBOUND(flags))
 	{
-		Datum		bound = PointerGetDatum(SendFunctionCall(&cache->typioproc,
-															 upper.val));
+		bytea	   *bound = SendFunctionCall(&cache->typioproc, upper.val);
 		uint32		bound_len = VARSIZE(bound) - VARHDRSZ;
 		char	   *bound_data = VARDATA(bound);
 
@@ -1444,7 +1442,7 @@ hash_range(PG_FUNCTION_ARGS)
 		upper_hash = 0;
 
 	/* Merge hashes of flags and bounds */
-	result = hash_uint32((uint32) flags);
+	result = hash_bytes_uint32((uint32) flags);
 	result ^= lower_hash;
 	result = pg_rotate_left32(result, 1);
 	result ^= upper_hash;

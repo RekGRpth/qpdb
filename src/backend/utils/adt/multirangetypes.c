@@ -394,12 +394,13 @@ multirange_send(PG_FUNCTION_ARGS)
 	for (int i = 0; i < range_count; i++)
 	{
 		Datum		range;
+		bytea	   *outputbytes;
 
 		range = RangeTypePGetDatum(ranges[i]);
-		range = PointerGetDatum(SendFunctionCall(&cache->typioproc, range));
+		outputbytes = SendFunctionCall(&cache->typioproc, range);
 
-		pq_sendint32(buf, VARSIZE(range) - VARHDRSZ);
-		pq_sendbytes(buf, VARDATA(range), VARSIZE(range) - VARHDRSZ);
+		pq_sendint32(buf, VARSIZE(outputbytes) - VARHDRSZ);
+		pq_sendbytes(buf, VARDATA(outputbytes), VARSIZE(outputbytes) - VARHDRSZ);
 	}
 
 	PG_RETURN_BYTEA_P(pq_endtypsend(buf));
@@ -2833,7 +2834,7 @@ hash_multirange(PG_FUNCTION_ARGS)
 			upper_hash = 0;
 
 		/* Merge hashes of flags and bounds */
-		range_hash = hash_uint32((uint32) flags);
+		range_hash = hash_bytes_uint32((uint32) flags);
 		range_hash ^= lower_hash;
 		range_hash = pg_rotate_left32(range_hash, 1);
 		range_hash ^= upper_hash;
