@@ -391,7 +391,6 @@ CachedFunctionHashEntry
 CachedFunctionHashKey
 CachedPlan
 CachedPlanSource
-CachedPlanType
 CallContext
 CallStmt
 CancelRequestPacket
@@ -2276,6 +2275,7 @@ PlanInvalItem
 PlanRowMark
 PlanState
 PlannedStmt
+PlannedStmtOrigin
 PlannerGlobal
 PlannerInfo
 PlannerParamItem
@@ -3757,6 +3757,7 @@ leafSegmentInfo
 leaf_item
 libpq_gettext_func
 libpq_source
+libpqsrv_PGresult
 line_t
 lineno_t
 list_sort_comparator

@@ -1996,10 +1996,7 @@ if cc.links('''
   cdata.set('HAVE__BUILTIN_OP_OVERFLOW', 1)
 endif
 
-
-# XXX: The configure.ac check for __cpuid() is broken, we don't copy that
-# here. To prevent problems due to two detection methods working, stop
-# checking after one.
+# Check for __get_cpuid() and __cpuid().
 if cc.links('''
     #include <cpuid.h>
     int main(int arg, char **argv)
@@ -3474,6 +3471,13 @@ installed_targets = [
   nls_mo_targets,
   ecpg_targets,
 ]
+
+if oauth_flow_supported
+  installed_targets += [
+    libpq_oauth_so,
+    libpq_oauth_st,
+  ]
+endif
 
 # all targets that require building code
 all_built = [
