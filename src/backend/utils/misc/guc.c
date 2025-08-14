@@ -1903,7 +1903,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 configdir);
 		if (errno == ENOENT)
 			write_stderr("Run initdb or pg_basebackup to initialize a PostgreSQL data directory.\n");
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1930,7 +1930,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "You must specify the --config-file or -D invocation "
 					 "option or set the PGDATA environment variable.\n",
 					 progname);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1951,8 +1951,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	{
 		write_stderr("%s: could not access the server configuration file \"%s\": %m\n",
 					 progname, ConfigFileName);
-		free(configdir);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -1982,7 +1981,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 
 	/*
@@ -2034,7 +2033,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 	SetConfigOption("hba_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
 
@@ -2065,7 +2064,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
-		return false;
+		goto fail;
 	}
 	SetConfigOption("ident_file", fname, PGC_POSTMASTER, PGC_S_OVERRIDE);
 
@@ -2077,6 +2076,11 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	free(configdir);
 
 	return true;
+
+fail:
+	free(configdir);
+
+	return false;
 }
 
 /*
