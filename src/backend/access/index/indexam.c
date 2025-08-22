@@ -263,6 +263,16 @@ index_beginscan(Relation heapRelation,
 
 	Assert(snapshot != InvalidSnapshot);
 
+	/* Check that a historic snapshot is not used for non-catalog tables */
+	if (IsHistoricMVCCSnapshot(snapshot) &&
+		!RelationIsAccessibleInLogicalDecoding(heapRelation))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot query non-catalog table \"%s\" during logical decoding",
+						RelationGetRelationName(heapRelation))));
+	}
+
 	scan = index_beginscan_internal(indexRelation, nkeys, norderbys, snapshot, NULL, false);
 
 	/*
