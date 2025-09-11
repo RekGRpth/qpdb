@@ -102,6 +102,7 @@ ExecHashSubPlan(SubPlanState *node,
 				ExprContext *econtext,
 				bool *isNull)
 {
+	bool		result = false;
 	SubPlan    *subplan = node->subplan;
 	PlanState  *planstate = node->planstate;
 	TupleTableSlot *slot;
@@ -133,14 +134,6 @@ ExecHashSubPlan(SubPlanState *node,
 	slot = ExecProject(node->projLeft);
 
 	/*
-	 * Note: because we are typically called in a per-tuple context, we have
-	 * to explicitly clear the projected tuple before returning. Otherwise,
-	 * we'll have a double-free situation: the per-tuple context will probably
-	 * be reset before we're called again, and then the tuple slot will think
-	 * it still needs to free the tuple.
-	 */
-
-	/*
 	 * If the LHS is all non-null, probe for an exact match in the main hash
 	 * table.  If we find one, the result is TRUE. Otherwise, scan the
 	 * partly-null table to see if there are any rows that aren't provably
@@ -161,19 +154,10 @@ ExecHashSubPlan(SubPlanState *node,
 							   slot,
 							   node->cur_eq_comp,
 							   node->lhs_hash_expr) != NULL)
-		{
-			ExecClearTuple(slot);
-			return BoolGetDatum(true);
-		}
-		if (node->havenullrows &&
-			findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
-		{
-			ExecClearTuple(slot);
+			result = true;
+		else if (node->havenullrows &&
+				 findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
 			*isNull = true;
-			return BoolGetDatum(false);
-		}
-		ExecClearTuple(slot);
-		return BoolGetDatum(false);
 	}
 
 	/*
@@ -186,34 +170,31 @@ ExecHashSubPlan(SubPlanState *node,
 	 * aren't provably unequal to the LHS; if so, the result is UNKNOWN.
 	 * Otherwise, the result is FALSE.
 	 */
-	if (node->hashnulls == NULL)
-	{
-		ExecClearTuple(slot);
-		return BoolGetDatum(false);
-	}
-	if (slotAllNulls(slot))
-	{
-		ExecClearTuple(slot);
+	else if (node->hashnulls == NULL)
+		 /* just return FALSE */ ;
+	else if (slotAllNulls(slot))
 		*isNull = true;
-		return BoolGetDatum(false);
-	}
 	/* Scan partly-null table first, since more likely to get a match */
-	if (node->havenullrows &&
-		findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
-	{
-		ExecClearTuple(slot);
+	else if (node->havenullrows &&
+			 findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
 		*isNull = true;
-		return BoolGetDatum(false);
-	}
-	if (node->havehashrows &&
-		findPartialMatch(node->hashtable, slot, node->cur_eq_funcs))
-	{
-		ExecClearTuple(slot);
+	else if (node->havehashrows &&
+			 findPartialMatch(node->hashtable, slot, node->cur_eq_funcs))
 		*isNull = true;
-		return BoolGetDatum(false);
-	}
+
+	/*
+	 * Note: because we are typically called in a per-tuple context, we have
+	 * to explicitly clear the projected tuple before returning. Otherwise,
+	 * we'll have a double-free situation: the per-tuple context will probably
+	 * be reset before we're called again, and then the tuple slot will think
+	 * it still needs to free the tuple.
+	 */
 	ExecClearTuple(slot);
-	return BoolGetDatum(false);
+
+	/* Also must reset the innerecontext after each hashtable lookup. */
+	ResetExprContext(node->innerecontext);
+
+	return BoolGetDatum(result);
 }
 
 /*
@@ -548,7 +529,7 @@ buildSubPlanHash(SubPlanState *node, ExprContext *econtext)
 											  0,
 											  node->planstate->state->es_query_cxt,
 											  node->hashtablecxt,
-											  node->hashtempcxt,
+											  innerecontext->ecxt_per_tuple_memory,
 											  false);
 
 	if (!subplan->unknownEqFalse)
@@ -577,7 +558,7 @@ buildSubPlanHash(SubPlanState *node, ExprContext *econtext)
 												  0,
 												  node->planstate->state->es_query_cxt,
 												  node->hashtablecxt,
-												  node->hashtempcxt,
+												  innerecontext->ecxt_per_tuple_memory,
 												  false);
 	}
 	else
@@ -639,7 +620,7 @@ buildSubPlanHash(SubPlanState *node, ExprContext *econtext)
 
 		/*
 		 * Reset innerecontext after each inner tuple to free any memory used
-		 * during ExecProject.
+		 * during ExecProject and hashtable lookup.
 		 */
 		ResetExprContext(innerecontext);
 	}
@@ -858,7 +839,6 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->hashtable = NULL;
 	sstate->hashnulls = NULL;
 	sstate->hashtablecxt = NULL;
-	sstate->hashtempcxt = NULL;
 	sstate->innerecontext = NULL;
 	sstate->keyColIdx = NULL;
 	sstate->tab_eq_funcoids = NULL;
@@ -914,11 +894,6 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 			AllocSetContextCreate(CurrentMemoryContext,
 								  "Subplan HashTable Context",
 								  ALLOCSET_DEFAULT_SIZES);
-		/* and a small one for the hash tables to use as temp storage */
-		sstate->hashtempcxt =
-			AllocSetContextCreate(CurrentMemoryContext,
-								  "Subplan HashTable Temp Context",
-								  ALLOCSET_SMALL_SIZES);
 		/* and a short-lived exprcontext for function evaluation */
 		sstate->innerecontext = CreateExprContext(estate);
 
