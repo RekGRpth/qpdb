@@ -28,27 +28,16 @@
  * We don't want to include nodes/pathnodes.h here, because non-planner
  * code should generally treat PlannerInfo as an opaque typedef.
  * But we'd like such code to use that typedef name, so define the
- * typedef either here or in pathnodes.h, whichever is read first.
+ * typedef both here and in pathnodes.h.
  */
-#ifndef HAVE_PLANNERINFO_TYPEDEF
 typedef struct PlannerInfo PlannerInfo;
-#define HAVE_PLANNERINFO_TYPEDEF 1
-#endif
-
-/* Likewise for IndexOptInfo and SpecialJoinInfo. */
-#ifndef HAVE_INDEXOPTINFO_TYPEDEF
 typedef struct IndexOptInfo IndexOptInfo;
-#define HAVE_INDEXOPTINFO_TYPEDEF 1
-#endif
-#ifndef HAVE_SPECIALJOININFO_TYPEDEF
 typedef struct SpecialJoinInfo SpecialJoinInfo;
-#define HAVE_SPECIALJOININFO_TYPEDEF 1
-#endif
 
 /* It also seems best not to include plannodes.h, params.h, or htup.h here */
-struct PlannedStmt;
-struct ParamListInfoData;
-struct HeapTupleData;
+typedef struct PlannedStmt PlannedStmt;
+typedef struct ParamListInfoData *ParamListInfo;
+typedef struct HeapTupleData *HeapTuple;
 
 
 /* in path/clausesel.c: */
@@ -113,9 +102,9 @@ extern PGDLLIMPORT int debug_parallel_query;
 extern PGDLLIMPORT bool parallel_leader_participation;
 extern PGDLLIMPORT bool enable_distinct_reordering;
 
-extern struct PlannedStmt *planner(Query *parse, const char *query_string,
-								   int cursorOptions,
-								   struct ParamListInfoData *boundParams);
+extern PlannedStmt *planner(Query *parse, const char *query_string,
+							int cursorOptions,
+							ParamListInfo boundParams);
 
 extern Expr *expression_planner(Expr *expr);
 extern Expr *expression_planner_with_deps(Expr *expr,
@@ -158,7 +147,7 @@ extern bool var_is_nonnullable(PlannerInfo *root, Var *var, bool use_rel_info);
 
 extern List *expand_function_arguments(List *args, bool include_out_arguments,
 									   Oid result_type,
-									   struct HeapTupleData *func_tuple);
+									   HeapTuple func_tuple);
 
 extern ScalarArrayOpExpr *make_SAOP_expr(Oid oper, Node *leftexpr,
 										 Oid coltype, Oid arraycollid,
