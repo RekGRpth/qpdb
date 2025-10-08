@@ -1063,6 +1063,7 @@ CREATE VIEW pg_stat_replication_slots AS
             s.stream_txns,
             s.stream_count,
             s.stream_bytes,
+            s.mem_exceeded_count,
             s.total_txns,
             s.total_bytes,
             s.stats_reset
@@ -1131,7 +1132,8 @@ CREATE VIEW pg_stat_user_functions AS
             P.proname AS funcname,
             pg_stat_get_function_calls(P.oid) AS calls,
             pg_stat_get_function_total_time(P.oid) AS total_time,
-            pg_stat_get_function_self_time(P.oid) AS self_time
+            pg_stat_get_function_self_time(P.oid) AS self_time,
+            pg_stat_get_function_stat_reset_time(P.oid) AS stats_reset
     FROM pg_proc P LEFT JOIN pg_namespace N ON (N.oid = P.pronamespace)
     WHERE P.prolang != 12  -- fast check to eliminate built-in functions
           AND pg_stat_get_function_calls(P.oid) IS NOT NULL;

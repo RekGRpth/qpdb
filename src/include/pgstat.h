@@ -212,7 +212,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB8
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCB9
 
 typedef struct PgStat_ArchiverStats
 {
@@ -384,6 +384,7 @@ typedef struct PgStat_StatFuncEntry
 
 	PgStat_Counter total_time;	/* times in microseconds */
 	PgStat_Counter self_time;
+	TimestampTz stat_reset_timestamp;
 } PgStat_StatFuncEntry;
 
 typedef struct PgStat_StatReplSlotEntry
@@ -394,6 +395,7 @@ typedef struct PgStat_StatReplSlotEntry
 	PgStat_Counter stream_txns;
 	PgStat_Counter stream_count;
 	PgStat_Counter stream_bytes;
+	PgStat_Counter mem_exceeded_count;
 	PgStat_Counter total_txns;
 	PgStat_Counter total_bytes;
 	TimestampTz stat_reset_timestamp;

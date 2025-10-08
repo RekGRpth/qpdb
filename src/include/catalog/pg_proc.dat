@@ -5691,9 +5691,9 @@
 { oid => '6169', descr => 'statistics: information about replication slot',
   proname => 'pg_stat_get_replication_slot', provolatile => 's',
   proparallel => 'r', prorettype => 'record', proargtypes => 'text',
-  proallargtypes => '{text,text,int8,int8,int8,int8,int8,int8,int8,int8,timestamptz}',
-  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o}',
-  proargnames => '{slot_name,slot_name,spill_txns,spill_count,spill_bytes,stream_txns,stream_count,stream_bytes,total_txns,total_bytes,stats_reset}',
+  proallargtypes => '{text,text,int8,int8,int8,int8,int8,int8,int8,int8,int8,timestamptz}',
+  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{slot_name,slot_name,spill_txns,spill_count,spill_bytes,stream_txns,stream_count,stream_bytes,mem_exceeded_count,total_txns,total_bytes,stats_reset}',
   prosrc => 'pg_stat_get_replication_slot' },
 
 { oid => '6230', descr => 'statistics: check if a stats object exists',
@@ -6071,6 +6071,10 @@
   proname => 'pg_stat_get_function_self_time', provolatile => 's',
   proparallel => 'r', prorettype => 'float8', proargtypes => 'oid',
   prosrc => 'pg_stat_get_function_self_time' },
+{ oid => '8745', descr => 'statistics: last reset for a function',
+  proname => 'pg_stat_get_function_stat_reset_time', provolatile => 's',
+  proparallel => 'r', prorettype => 'timestamptz', proargtypes => 'oid',
+  prosrc => 'pg_stat_get_function_stat_reset_time' },
 
 { oid => '3037',
   descr => 'statistics: number of scans done for table/index in current transaction',
