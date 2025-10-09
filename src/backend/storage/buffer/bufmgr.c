@@ -518,7 +518,6 @@ static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
 static void BufferSync(int flags);
-static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
@@ -534,6 +533,8 @@ static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
 static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress);
 static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
@@ -1066,7 +1067,7 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 		 * already valid.)
 		 */
 		if (!isLocalBuf)
-			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 		/* Set BM_VALID, terminate IO, and wake up any waiters */
 		if (isLocalBuf)
@@ -2324,8 +2325,8 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 	bool		from_ring;
 
 	/*
-	 * Ensure, while the spinlock's not yet held, that there's a free refcount
-	 * entry, and a resource owner slot for the pin.
+	 * Ensure, before we pin a victim buffer, that there's a free refcount
+	 * entry and resource owner slot for the pin.
 	 */
 	ReservePrivateRefCountEntry();
 	ResourceOwnerEnlarge(CurrentResourceOwner);
@@ -2334,16 +2335,11 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 again:
 
 	/*
-	 * Select a victim buffer.  The buffer is returned with its header
-	 * spinlock still held!
+	 * Select a victim buffer.  The buffer is returned pinned and owned by
+	 * this backend.
 	 */
 	buf_hdr = StrategyGetBuffer(strategy, &buf_state, &from_ring);
 	buf = BufferDescriptorGetBuffer(buf_hdr);
-
-	Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
-
-	/* Pin the buffer and then release the buffer spinlock */
-	PinBuffer_Locked(buf_hdr);
 
 	/*
 	 * We shouldn't have any other pins for this buffer.
@@ -2823,7 +2819,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		}
 
 		if (lock)
-			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
 		TerminateBufferIO(buf_hdr, false, BM_VALID, true, false);
 	}
@@ -2836,14 +2832,14 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 }
 
 /*
- * BufferIsExclusiveLocked
+ * BufferIsLockedByMe
  *
- *      Checks if buffer is exclusive-locked.
+ *      Checks if this backend has the buffer locked in any mode.
  *
  * Buffer must be pinned.
  */
 bool
-BufferIsExclusiveLocked(Buffer buffer)
+BufferIsLockedByMe(Buffer buffer)
 {
 	BufferDesc *bufHdr;
 
@@ -2857,8 +2853,48 @@ BufferIsExclusiveLocked(Buffer buffer)
 	else
 	{
 		bufHdr = GetBufferDescriptor(buffer - 1);
+		return LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr));
+	}
+}
+
+/*
+ * BufferIsLockedByMeInMode
+ *
+ *      Checks if this backend has the buffer locked in the specified mode.
+ *
+ * Buffer must be pinned.
+ */
+bool
+BufferIsLockedByMeInMode(Buffer buffer, int mode)
+{
+	BufferDesc *bufHdr;
+
+	Assert(BufferIsPinned(buffer));
+
+	if (BufferIsLocal(buffer))
+	{
+		/* Content locks are not maintained for local buffers. */
+		return true;
+	}
+	else
+	{
+		LWLockMode	lw_mode;
+
+		switch (mode)
+		{
+			case BUFFER_LOCK_EXCLUSIVE:
+				lw_mode = LW_EXCLUSIVE;
+				break;
+			case BUFFER_LOCK_SHARE:
+				lw_mode = LW_SHARED;
+				break;
+			default:
+				pg_unreachable();
+		}
+
+		bufHdr = GetBufferDescriptor(buffer - 1);
 		return LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-									LW_EXCLUSIVE);
+									lw_mode);
 	}
 }
 
@@ -2887,8 +2923,7 @@ BufferIsDirty(Buffer buffer)
 	else
 	{
 		bufHdr = GetBufferDescriptor(buffer - 1);
-		Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-									LW_EXCLUSIVE));
+		Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
 	}
 
 	return pg_atomic_read_u32(&bufHdr->state) & BM_DIRTY;
@@ -2922,8 +2957,7 @@ MarkBufferDirty(Buffer buffer)
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
 	Assert(BufferIsPinned(buffer));
-	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-								LW_EXCLUSIVE));
+	Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
 	for (;;)
@@ -3078,7 +3112,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 			{
 				result = (buf_state & BM_VALID) != 0;
 
-				ref = NewPrivateRefCountEntry(b);
+				TrackNewBufferPin(b);
 
 				/*
 				 * Assume that we acquired a buffer pin for the purposes of
@@ -3110,11 +3144,12 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 		 * cannot meddle with that.
 		 */
 		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
+
+		Assert(ref->refcount > 0);
+		ref->refcount++;
+		ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 	}
 
-	ref->refcount++;
-	Assert(ref->refcount > 0);
-	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 	return result;
 }
 
@@ -3143,8 +3178,6 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 static void
 PinBuffer_Locked(BufferDesc *buf)
 {
-	Buffer		b;
-	PrivateRefCountEntry *ref;
 	uint32		buf_state;
 
 	/*
@@ -3169,12 +3202,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	buf_state += BUF_REFCOUNT_ONE;
 	UnlockBufHdr(buf, buf_state);
 
-	b = BufferDescriptorGetBuffer(buf);
-
-	ref = NewPrivateRefCountEntry(b);
-	ref->refcount++;
-
-	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
+	TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
 }
 
 /*
@@ -3257,7 +3285,10 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		 */
 		VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
 
-		/* I'd better not still hold the buffer content lock */
+		/*
+		 * I'd better not still hold the buffer content lock. Can't use
+		 * BufferIsLockedByMe(), as that asserts the buffer is pinned.
+		 */
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
 
 		/*
@@ -3287,6 +3318,17 @@ UnpinBufferNoOwner(BufferDesc *buf)
 
 		ForgetPrivateRefCountEntry(ref);
 	}
+}
+
+inline void
+TrackNewBufferPin(Buffer buf)
+{
+	PrivateRefCountEntry *ref;
+
+	ref = NewPrivateRefCountEntry(buf);
+	ref->refcount++;
+
+	ResourceOwnerRememberBuffer(CurrentResourceOwner, buf);
 }
 
 #define ST_SORT sort_checkpoint_bufferids
@@ -3319,7 +3361,7 @@ BufferSync(int flags)
 	Oid			last_tsid;
 	binaryheap *ts_heap;
 	int			i;
-	int			mask = BM_DIRTY;
+	uint32		mask = BM_DIRTY;
 	WritebackContext wb_context;
 
 	/*
@@ -3927,11 +3969,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * buffer is clean by the time we've locked it.)
 	 */
 	PinBuffer_Locked(bufHdr);
-	LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-
-	LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 
 	tag = bufHdr->tag;
 
@@ -4376,6 +4415,19 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
+}
+
+/*
+ * Convenience wrapper around FlushBuffer() that locks/unlocks the buffer
+ * before/after calling FlushBuffer().
+ */
+static void
+FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+					IOObject io_object, IOContext io_context)
+{
+	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+	FlushBuffer(buf, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	LWLockRelease(BufferDescriptorGetContentLock(buf));
 }
 
 /*
@@ -4967,9 +5019,7 @@ FlushRelationBuffers(Relation rel)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5064,9 +5114,7 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5292,9 +5340,7 @@ FlushDatabaseBuffers(Oid dbid)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
-			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
+			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5318,7 +5364,7 @@ FlushOneBuffer(Buffer buffer)
 
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
-	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
+	Assert(BufferIsLockedByMe(buffer));
 
 	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 }
@@ -5409,7 +5455,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 	Assert(GetPrivateRefCount(buffer) > 0);
 	/* here, either share or exclusive lock is OK */
-	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
+	Assert(BufferIsLockedByMe(buffer));
 
 	/*
 	 * This routine might get called many times on the same page, if we are
@@ -5892,8 +5938,7 @@ IsBufferCleanupOK(Buffer buffer)
 	bufHdr = GetBufferDescriptor(buffer - 1);
 
 	/* caller must hold exclusive lock on buffer */
-	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
-								LW_EXCLUSIVE));
+	Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
 
 	buf_state = LockBufHdr(bufHdr);
 
@@ -6242,7 +6287,7 @@ LockBufHdr(BufferDesc *desc)
  * Obviously the buffer could be locked by the time the value is returned, so
  * this is primarily useful in CAS style loops.
  */
-static uint32
+pg_noinline uint32
 WaitBufHdrUnlocked(BufferDesc *buf)
 {
 	SpinDelayStatus delayStatus;
@@ -6569,10 +6614,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 	/* If it was dirty, try to clean it once. */
 	if (buf_state & BM_DIRTY)
 	{
-		LWLockAcquire(BufferDescriptorGetContentLock(desc), LW_SHARED);
-		FlushBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 		*buffer_flushed = true;
-		LWLockRelease(BufferDescriptorGetContentLock(desc));
 	}
 
 	/* This will return false if it becomes dirty or someone else pins it. */
