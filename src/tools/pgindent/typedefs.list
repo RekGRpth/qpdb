@@ -1758,6 +1758,7 @@ NextValueExpr
 Node
 NodeTag
 NonEmptyRange
+NoneCompressorState
 Notification
 NotificationList
 NotifyStmt
@@ -2922,7 +2923,7 @@ SyncRepStandbyData
 SyncRequestHandler
 SyncRequestType
 SyncStandbySlotsConfigData
-SyncingTablesState
+SyncingRelationsState
 SysFKRelationship
 SysScanDesc
 SyscacheCallbackFunction
