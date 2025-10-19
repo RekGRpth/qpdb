@@ -1163,6 +1163,15 @@ init_database_collation(void)
 }
 
 /*
+ * Get database default locale.
+ */
+pg_locale_t
+pg_database_locale(void)
+{
+	return pg_newlocale_from_collation(DEFAULT_COLLATION_OID);
+}
+
+/*
  * Create a pg_locale_t from a collation OID.  Results are cached for the
  * lifetime of the backend.  Thus, do not free the result with freelocale().
  *
@@ -1491,6 +1500,18 @@ pg_iswspace(pg_wchar wc, pg_locale_t locale)
 				(pg_char_properties[wc] & PG_ISSPACE));
 	else
 		return locale->ctype->wc_isspace(wc, locale);
+}
+
+bool
+pg_iswxdigit(pg_wchar wc, pg_locale_t locale)
+{
+	if (locale->ctype == NULL)
+		return (wc <= (pg_wchar) 127 &&
+				((pg_char_properties[wc] & PG_ISDIGIT) ||
+				 ((wc >= 'A' && wc <= 'F') ||
+				  (wc >= 'a' && wc <= 'f'))));
+	else
+		return locale->ctype->wc_isxdigit(wc, locale);
 }
 
 pg_wchar

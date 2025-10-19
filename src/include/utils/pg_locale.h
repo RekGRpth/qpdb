@@ -110,6 +110,7 @@ struct ctype_methods
 	bool		(*wc_isprint) (pg_wchar wc, pg_locale_t locale);
 	bool		(*wc_ispunct) (pg_wchar wc, pg_locale_t locale);
 	bool		(*wc_isspace) (pg_wchar wc, pg_locale_t locale);
+	bool		(*wc_isxdigit) (pg_wchar wc, pg_locale_t locale);
 	pg_wchar	(*wc_toupper) (pg_wchar wc, pg_locale_t locale);
 	pg_wchar	(*wc_tolower) (pg_wchar wc, pg_locale_t locale);
 
@@ -175,6 +176,7 @@ struct pg_locale_struct
 };
 
 extern void init_database_collation(void);
+extern pg_locale_t pg_database_locale(void);
 extern pg_locale_t pg_newlocale_from_collation(Oid collid);
 
 extern char *get_collation_actual_version(char collprovider, const char *collcollate);
@@ -217,6 +219,7 @@ extern bool pg_iswgraph(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswprint(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswpunct(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswspace(pg_wchar wc, pg_locale_t locale);
+extern bool pg_iswxdigit(pg_wchar wc, pg_locale_t locale);
 extern pg_wchar pg_towupper(pg_wchar wc, pg_locale_t locale);
 extern pg_wchar pg_towlower(pg_wchar wc, pg_locale_t locale);
 
