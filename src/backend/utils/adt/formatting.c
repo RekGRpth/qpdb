@@ -118,9 +118,9 @@
 typedef struct
 {
 	const char *name;			/* suffix string		*/
-	int			len,			/* suffix length		*/
-				id,				/* used in node->suffix */
-				type;			/* prefix / postfix		*/
+	size_t		len;			/* suffix length		*/
+	int			id;				/* used in node->suffix */
+	int			type;			/* prefix / postfix		*/
 } KeySuffix;
 
 /*
@@ -139,7 +139,7 @@ typedef enum
 typedef struct
 {
 	const char *name;
-	int			len;
+	size_t		len;
 	int			id;
 	bool		is_digit;
 	FromCharDateMode date_mode;
@@ -436,7 +436,7 @@ typedef struct
 	bool		has_tz;			/* was there a TZ field? */
 	int			gmtoffset;		/* GMT offset of fixed-offset zone abbrev */
 	pg_tz	   *tzp;			/* pg_tz for dynamic abbrev */
-	char	   *abbrev;			/* dynamic abbrev */
+	const char *abbrev;			/* dynamic abbrev */
 } TmFromChar;
 
 #define ZERO_tmfc(_X) memset(_X, 0, sizeof(TmFromChar))
@@ -1055,38 +1055,38 @@ static void dump_index(const KeyWord *k, const int *index);
 static void dump_node(FormatNode *node, int max);
 #endif
 
-static const char *get_th(char *num, int type);
-static char *str_numth(char *dest, char *num, int type);
+static const char *get_th(const char *num, int type);
+static char *str_numth(char *dest, const char *num, int type);
 static int	adjust_partial_year_to_2020(int year);
-static int	strspace_len(const char *str);
+static size_t strspace_len(const char *str);
 static bool from_char_set_mode(TmFromChar *tmfc, const FromCharDateMode mode,
 							   Node *escontext);
 static bool from_char_set_int(int *dest, const int value, const FormatNode *node,
 							  Node *escontext);
-static int	from_char_parse_int_len(int *dest, const char **src, const int len,
+static int	from_char_parse_int_len(int *dest, const char **src, const size_t len,
 									FormatNode *node, Node *escontext);
 static int	from_char_parse_int(int *dest, const char **src, FormatNode *node,
 								Node *escontext);
-static int	seq_search_ascii(const char *name, const char *const *array, int *len);
-static int	seq_search_localized(const char *name, char **array, int *len,
+static int	seq_search_ascii(const char *name, const char *const *array, size_t *len);
+static int	seq_search_localized(const char *name, char **array, size_t *len,
 								 Oid collid);
 static bool from_char_seq_search(int *dest, const char **src,
 								 const char *const *array,
 								 char **localized_array, Oid collid,
 								 FormatNode *node, Node *escontext);
-static bool do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
+static bool do_to_timestamp(const text *date_txt, const text *fmt, Oid collid, bool std,
 							struct pg_tm *tm, fsec_t *fsec, struct fmt_tz *tz,
 							int *fprec, uint32 *flags, Node *escontext);
 static char *fill_str(char *str, int c, int max);
-static FormatNode *NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree);
+static FormatNode *NUM_cache(int len, NUMDesc *Num, const text *pars_str, bool *shouldFree);
 static char *int_to_roman(int number);
-static int	roman_to_int(NUMProc *Np, int input_len);
+static int	roman_to_int(NUMProc *Np, size_t input_len);
 static void NUM_prepare_locale(NUMProc *Np);
-static char *get_last_relevant_decnum(char *num);
-static void NUM_numpart_from_char(NUMProc *Np, int id, int input_len);
+static char *get_last_relevant_decnum(const char *num);
+static void NUM_numpart_from_char(NUMProc *Np, int id, size_t input_len);
 static void NUM_numpart_to_char(NUMProc *Np, int id);
 static char *NUM_processor(FormatNode *node, NUMDesc *Num, char *inout,
-						   char *number, int input_len, int to_char_out_pre_spaces,
+						   char *number, size_t input_len, int to_char_out_pre_spaces,
 						   int sign, bool is_to_char, Oid collid);
 static DCHCacheEntry *DCH_cache_getnew(const char *str, bool std);
 static DCHCacheEntry *DCH_cache_search(const char *str, bool std);
@@ -1109,7 +1109,7 @@ index_seq_search(const char *str, const KeyWord *kw, const int *index)
 	if (!KeyWord_INDEX_FILTER(*str))
 		return NULL;
 
-	if ((poz = *(index + (*str - ' '))) > -1)
+	if ((poz = index[*str - ' ']) > -1)
 	{
 		const KeyWord *k = kw + poz;
 
@@ -1200,7 +1200,7 @@ NUMDesc_prepare(NUMDesc *num, FormatNode *n)
 			break;
 
 		case NUM_B:
-			if (num->pre == 0 && num->post == 0 && (!IS_ZERO(num)))
+			if (num->pre == 0 && num->post == 0 && !IS_ZERO(num))
 				num->flag |= NUM_F_BLANK;
 			break;
 
@@ -1524,14 +1524,14 @@ dump_node(FormatNode *node, int max)
  * type --> 0 upper, 1 lower
  */
 static const char *
-get_th(char *num, int type)
+get_th(const char *num, int type)
 {
-	int			len = strlen(num),
-				last;
+	size_t		len = strlen(num);
+	char		last;
 
 	Assert(len > 0);
 
-	last = *(num + (len - 1));
+	last = num[len - 1];
 	if (!isdigit((unsigned char) last))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
@@ -1541,7 +1541,7 @@ get_th(char *num, int type)
 	 * All "teens" (<x>1[0-9]) get 'TH/th', while <x>[02-9][123] still get
 	 * 'ST/st', 'ND/nd', 'RD/rd', respectively
 	 */
-	if ((len > 1) && (num[len - 2] == '1'))
+	if (len > 1 && num[len - 2] == '1')
 		last = 0;
 
 	switch (last)
@@ -1570,7 +1570,7 @@ get_th(char *num, int type)
  * type --> 0 upper, 1 lower
  */
 static char *
-str_numth(char *dest, char *num, int type)
+str_numth(char *dest, const char *num, int type)
 {
 	if (dest != num)
 		strcpy(dest, num);
@@ -2072,10 +2072,10 @@ adjust_partial_year_to_2020(int year)
 }
 
 
-static int
+static size_t
 strspace_len(const char *str)
 {
-	int			len = 0;
+	size_t		len = 0;
 
 	while (*str && isspace((unsigned char) *str))
 	{
@@ -2158,13 +2158,13 @@ from_char_set_int(int *dest, const int value, const FormatNode *node,
  * with DD and MI).
  */
 static int
-from_char_parse_int_len(int *dest, const char **src, const int len, FormatNode *node,
+from_char_parse_int_len(int *dest, const char **src, const size_t len, FormatNode *node,
 						Node *escontext)
 {
 	long		result;
 	char		copy[DCH_MAX_ITEM_SIZ + 1];
 	const char *init = *src;
-	int			used;
+	size_t		used;
 
 	/*
 	 * Skip any whitespace before parsing the integer.
@@ -2172,7 +2172,7 @@ from_char_parse_int_len(int *dest, const char **src, const int len, FormatNode *
 	*src += strspace_len(*src);
 
 	Assert(len <= DCH_MAX_ITEM_SIZ);
-	used = (int) strlcpy(copy, *src, len + 1);
+	used = strlcpy(copy, *src, len + 1);
 
 	if (S_FM(node->suffix) || is_next_separator(node))
 	{
@@ -2199,7 +2199,7 @@ from_char_parse_int_len(int *dest, const char **src, const int len, FormatNode *
 					(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
 					 errmsg("source string too short for \"%s\" formatting field",
 							node->key->name),
-					 errdetail("Field requires %d characters, but only %d remain.",
+					 errdetail("Field requires %zu characters, but only %zu remain.",
 							   len, used),
 					 errhint("If your source string is not fixed-width, "
 							 "try using the \"FM\" modifier.")));
@@ -2213,7 +2213,7 @@ from_char_parse_int_len(int *dest, const char **src, const int len, FormatNode *
 					(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
 					 errmsg("invalid value \"%s\" for \"%s\"",
 							copy, node->key->name),
-					 errdetail("Field requires %d characters, but only %d could be parsed.",
+					 errdetail("Field requires %zu characters, but only %zu could be parsed.",
 							   len, used),
 					 errhint("If your source string is not fixed-width, "
 							 "try using the \"FM\" modifier.")));
@@ -2273,7 +2273,7 @@ from_char_parse_int(int *dest, const char **src, FormatNode *node,
  * suitable for comparisons to ASCII strings.
  */
 static int
-seq_search_ascii(const char *name, const char *const *array, int *len)
+seq_search_ascii(const char *name, const char *const *array, size_t *len)
 {
 	unsigned char firstc;
 
@@ -2326,7 +2326,7 @@ seq_search_ascii(const char *name, const char *const *array, int *len)
  * the arrays exported by pg_locale.c aren't const.
  */
 static int
-seq_search_localized(const char *name, char **array, int *len, Oid collid)
+seq_search_localized(const char *name, char **array, size_t *len, Oid collid)
 {
 	char	   *upper_name;
 	char	   *lower_name;
@@ -2343,7 +2343,7 @@ seq_search_localized(const char *name, char **array, int *len, Oid collid)
 	 */
 	for (char **a = array; *a != NULL; a++)
 	{
-		int			element_len = strlen(*a);
+		size_t		element_len = strlen(*a);
 
 		if (strncmp(name, *a, element_len) == 0)
 		{
@@ -2364,7 +2364,7 @@ seq_search_localized(const char *name, char **array, int *len, Oid collid)
 	{
 		char	   *upper_element;
 		char	   *lower_element;
-		int			element_len;
+		size_t		element_len;
 
 		/* Likewise upper/lower-case array element */
 		upper_element = str_toupper(*a, strlen(*a), collid);
@@ -2413,7 +2413,7 @@ from_char_seq_search(int *dest, const char **src, const char *const *array,
 					 char **localized_array, Oid collid,
 					 FormatNode *node, Node *escontext)
 {
-	int			len;
+	size_t		len;
 
 	if (localized_array == NULL)
 		*dest = seq_search_ascii(*src, array, &len);
@@ -3875,13 +3875,13 @@ DCH_cache_fetch(const char *str, bool std)
  * for formatting.
  */
 static text *
-datetime_to_char_body(TmToChar *tmtc, text *fmt, bool is_interval, Oid collid)
+datetime_to_char_body(TmToChar *tmtc, const text *fmt, bool is_interval, Oid collid)
 {
 	FormatNode *format;
 	char	   *fmt_str,
 			   *result;
 	bool		incache;
-	int			fmt_len;
+	size_t		fmt_len;
 	text	   *res;
 
 	/*
@@ -4311,7 +4311,7 @@ bool
 datetime_format_has_tz(const char *fmt_str)
 {
 	bool		incache;
-	int			fmt_len = strlen(fmt_str);
+	size_t		fmt_len = strlen(fmt_str);
 	int			result;
 	FormatNode *format;
 
@@ -4371,7 +4371,7 @@ datetime_format_has_tz(const char *fmt_str)
  * struct 'tm', 'fsec', struct 'tz', and 'fprec'.
  */
 static bool
-do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
+do_to_timestamp(const text *date_txt, const text *fmt, Oid collid, bool std,
 				struct pg_tm *tm, fsec_t *fsec, struct fmt_tz *tz,
 				int *fprec, uint32 *flags, Node *escontext)
 {
@@ -4807,7 +4807,7 @@ static char *
 fill_str(char *str, int c, int max)
 {
 	memset(str, c, max);
-	*(str + max) = '\0';
+	str[max] = '\0';
 	return str;
 }
 
@@ -4945,7 +4945,7 @@ NUM_cache_fetch(const char *str)
  * Cache routine for NUM to_char version
  */
 static FormatNode *
-NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree)
+NUM_cache(int len, NUMDesc *Num, const text *pars_str, bool *shouldFree)
 {
 	FormatNode *format = NULL;
 	char	   *str;
@@ -5067,10 +5067,10 @@ int_to_roman(int number)
  * If input is invalid, return -1.
  */
 static int
-roman_to_int(NUMProc *Np, int input_len)
+roman_to_int(NUMProc *Np, size_t input_len)
 {
 	int			result = 0;
-	int			len;
+	size_t		len;
 	char		romanChars[MAX_ROMAN_LEN];
 	int			romanValues[MAX_ROMAN_LEN];
 	int			repeatCount = 1;
@@ -5109,7 +5109,7 @@ roman_to_int(NUMProc *Np, int input_len)
 		return -1;				/* No valid roman numerals. */
 
 	/* Check for valid combinations and compute the represented value. */
-	for (int i = 0; i < len; i++)
+	for (size_t i = 0; i < len; i++)
 	{
 		char		currChar = romanChars[i];
 		int			currValue = romanValues[i];
@@ -5297,7 +5297,7 @@ NUM_prepare_locale(NUMProc *Np)
  * behavior as if FM hadn't been specified).
  */
 static char *
-get_last_relevant_decnum(char *num)
+get_last_relevant_decnum(const char *num)
 {
 	char	   *result,
 			   *p = strchr(num, '.');
@@ -5324,7 +5324,7 @@ get_last_relevant_decnum(char *num)
  * Number extraction for TO_NUMBER()
  */
 static void
-NUM_numpart_from_char(NUMProc *Np, int id, int input_len)
+NUM_numpart_from_char(NUMProc *Np, int id, size_t input_len)
 {
 	bool		isread = false;
 
@@ -5358,7 +5358,7 @@ NUM_numpart_from_char(NUMProc *Np, int id, int input_len)
 		 */
 		if (IS_LSIGN(Np->Num) && Np->Num->lsign == NUM_LSIGN_PRE)
 		{
-			int			x = 0;
+			size_t		x = 0;
 
 #ifdef DEBUG_TO_FROM_CHAR
 			elog(DEBUG_elog_output, "Try read locale pre-sign (%c)", *Np->inout_p);
@@ -5437,7 +5437,7 @@ NUM_numpart_from_char(NUMProc *Np, int id, int input_len)
 		 * Np->decimal is always just "." if we don't have a D format token.
 		 * So we just unconditionally match to Np->decimal.
 		 */
-		int			x = strlen(Np->decimal);
+		size_t		x = strlen(Np->decimal);
 
 #ifdef DEBUG_TO_FROM_CHAR
 		elog(DEBUG_elog_output, "Try read decimal point (%c)",
@@ -5476,7 +5476,7 @@ NUM_numpart_from_char(NUMProc *Np, int id, int input_len)
 			(Np->inout_p + 1) < Np->inout + input_len &&
 			!isdigit((unsigned char) *(Np->inout_p + 1)))
 		{
-			int			x;
+			size_t		x;
 			char	   *tmp = Np->inout_p++;
 
 #ifdef DEBUG_TO_FROM_CHAR
@@ -5728,7 +5728,7 @@ NUM_numpart_to_char(NUMProc *Np, int id)
  * Skip over "n" input characters, but only if they aren't numeric data
  */
 static void
-NUM_eat_non_data_chars(NUMProc *Np, int n, int input_len)
+NUM_eat_non_data_chars(NUMProc *Np, int n, size_t input_len)
 {
 	while (n-- > 0)
 	{
@@ -5742,14 +5742,14 @@ NUM_eat_non_data_chars(NUMProc *Np, int n, int input_len)
 
 static char *
 NUM_processor(FormatNode *node, NUMDesc *Num, char *inout,
-			  char *number, int input_len, int to_char_out_pre_spaces,
+			  char *number, size_t input_len, int to_char_out_pre_spaces,
 			  int sign, bool is_to_char, Oid collid)
 {
 	FormatNode *n;
 	NUMProc		_Np,
 			   *Np = &_Np;
 	const char *pattern;
-	int			pattern_len;
+	size_t		pattern_len;
 
 	MemSet(Np, 0, sizeof(NUMProc));
 
@@ -5830,7 +5830,7 @@ NUM_processor(FormatNode *node, NUMDesc *Num, char *inout,
 			 */
 			if (Np->last_relevant && Np->Num->zero_end > Np->out_pre_spaces)
 			{
-				int			last_zero_pos;
+				size_t		last_zero_pos;
 				char	   *last_zero;
 
 				/* note that Np->number cannot be zero-length here */
@@ -6222,7 +6222,7 @@ do { \
  */
 #define NUM_TOCHAR_finish \
 do { \
-	int		len; \
+	size_t	len; \
 									\
 	NUM_processor(format, &Num, VARDATA(result), numstr, 0, out_pre_spaces, sign, true, PG_GET_COLLATION()); \
 									\
@@ -6367,7 +6367,7 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		int			numstr_pre_len;
+		size_t		numstr_pre_len;
 		Numeric		val = value;
 		Numeric		x;
 
@@ -6464,7 +6464,7 @@ int4_to_char(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		int			numstr_pre_len;
+		size_t		numstr_pre_len;
 
 		if (IS_MULTI(&Num))
 		{
@@ -6573,7 +6573,7 @@ int8_to_char(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		int			numstr_pre_len;
+		size_t		numstr_pre_len;
 
 		if (IS_MULTI(&Num))
 		{
@@ -6687,7 +6687,7 @@ float4_to_char(PG_FUNCTION_ARGS)
 	{
 		float4		val = value;
 		char	   *orgnum;
-		int			numstr_pre_len;
+		size_t		numstr_pre_len;
 
 		if (IS_MULTI(&Num))
 		{
@@ -6799,7 +6799,7 @@ float8_to_char(PG_FUNCTION_ARGS)
 	{
 		float8		val = value;
 		char	   *orgnum;
-		int			numstr_pre_len;
+		size_t		numstr_pre_len;
 
 		if (IS_MULTI(&Num))
 		{

@@ -93,8 +93,6 @@
 
 /* ----------------------------------------------------------------
  *				Section 1: compiler characteristics
- *
- * type prefixes (const, signed, volatile, inline) are handled in pg_config.h.
  * ----------------------------------------------------------------
  */
 
@@ -107,6 +105,12 @@
 #undef inline
 #define inline
 #endif
+
+/*
+ * Previously used PostgreSQL-specific spelling, for backward compatibility
+ * for extensions.
+ */
+#define pg_restrict restrict
 
 /*
  * Attribute macros
@@ -1371,6 +1375,29 @@ typedef intptr_t sigjmp_buf[5];
 
 /* /port compatibility functions */
 #include "port.h"
+
+/*
+ * char16_t and char32_t
+ *      Unicode code points.
+ *
+ * uchar.h should always be available in C11, but it's not available on
+ * Mac. However, these types are keywords in C++11, so when using C++, we
+ * can't redefine the types.
+ *
+ * XXX: when uchar.h is available everywhere, we can remove this check and
+ * just include uchar.h unconditionally.
+ *
+ * XXX: this section is out of place because uchar.h needs to be included
+ * after port.h, due to an interaction with win32_port.h in some cases.
+ */
+#ifdef HAVE_UCHAR_H
+#include <uchar.h>
+#else
+#ifndef __cplusplus
+typedef uint16_t char16_t;
+typedef uint32_t char32_t;
+#endif
+#endif
 
 /* IWYU pragma: end_exports */
 
