@@ -14,6 +14,9 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
@@ -143,7 +146,7 @@ execTuplesHashPrepare(int numCols,
  *	eqfuncoids: OIDs of equality comparison functions to use
  *	hashfunctions: FmgrInfos of datatype-specific hashing functions to use
  *	collations: collations to use in comparisons
- *	nbuckets: initial estimate of hashtable size
+ *	nelements: initial estimate of hashtable size
  *	additionalsize: size of data that may be stored along with the hash entry
  *	metacxt: memory context for long-lived data and the simplehash table
  *	tuplescxt: memory context in which to store the hashed tuples themselves
@@ -186,7 +189,7 @@ BuildTupleHashTable(PlanState *parent,
 					const Oid *eqfuncoids,
 					FmgrInfo *hashfunctions,
 					Oid *collations,
-					long nbuckets,
+					double nelements,
 					Size additionalsize,
 					MemoryContext metacxt,
 					MemoryContext tuplescxt,
@@ -194,30 +197,30 @@ BuildTupleHashTable(PlanState *parent,
 					bool use_variable_hash_iv)
 {
 	TupleHashTable hashtable;
-	Size		entrysize;
-	Size		hash_mem_limit;
+	uint32		nbuckets;
 	MemoryContext oldcontext;
 	uint32		hash_iv = 0;
 
-	Assert(nbuckets > 0);
+	/*
+	 * tuplehash_create requires a uint32 element count, so we had better
+	 * clamp the given nelements to fit in that.  As long as we have to do
+	 * that, we might as well protect against completely insane input like
+	 * zero or NaN.  But it is not our job here to enforce issues like staying
+	 * within hash_mem: the caller should have done that, and we don't have
+	 * enough info to second-guess.
+	 */
+	if (isnan(nelements) || nelements <= 0)
+		nbuckets = 1;
+	else if (nelements >= PG_UINT32_MAX)
+		nbuckets = PG_UINT32_MAX;
+	else
+		nbuckets = (uint32) nelements;
 
 	/* tuplescxt must be separate, else ResetTupleHashTable breaks things */
 	Assert(metacxt != tuplescxt);
 
 	/* ensure additionalsize is maxalign'ed */
 	additionalsize = MAXALIGN(additionalsize);
-
-	/*
-	 * Limit initial table size request to not more than hash_mem.
-	 *
-	 * XXX this calculation seems pretty misguided, as it counts only overhead
-	 * and not the tuples themselves.  But we have no knowledge of the
-	 * expected tuple width here.
-	 */
-	entrysize = sizeof(TupleHashEntryData) + additionalsize;
-	hash_mem_limit = get_hash_memory_limit() / entrysize;
-	if (nbuckets > hash_mem_limit)
-		nbuckets = hash_mem_limit;
 
 	oldcontext = MemoryContextSwitchTo(metacxt);
 
@@ -300,6 +303,64 @@ ResetTupleHashTable(TupleHashTable hashtable)
 {
 	tuplehash_reset(hashtable->hashtab);
 	MemoryContextReset(hashtable->tuplescxt);
+}
+
+/*
+ * Estimate the amount of space needed for a TupleHashTable with nentries
+ * entries, if the tuples have average data width tupleWidth and the caller
+ * requires additionalsize extra space per entry.
+ *
+ * Return SIZE_MAX if it'd overflow size_t.
+ *
+ * nentries is "double" because this is meant for use by the planner,
+ * which typically works with double rowcount estimates.  So we'd need to
+ * clamp to integer somewhere and that might as well be here.  We do expect
+ * the value not to be NaN or negative, else the result will be garbage.
+ */
+Size
+EstimateTupleHashTableSpace(double nentries,
+							Size tupleWidth,
+							Size additionalsize)
+{
+	Size		sh_space;
+	double		tuples_space;
+
+	/* First estimate the space needed for the simplehash table */
+	sh_space = tuplehash_estimate_space(nentries);
+
+	/* Give up if that's already too big */
+	if (sh_space >= SIZE_MAX)
+		return sh_space;
+
+	/*
+	 * Compute space needed for hashed tuples with additional data.  nentries
+	 * must be somewhat sane, so it should be safe to compute this product.
+	 *
+	 * We assume that the hashed tuples will be kept in a BumpContext so that
+	 * there is not additional per-tuple overhead.
+	 *
+	 * (Note that this is only accurate if MEMORY_CONTEXT_CHECKING is off,
+	 * else bump.c will add a MemoryChunk header to each tuple.  However, it
+	 * seems undesirable for debug builds to make different planning choices
+	 * than production builds, so we assume the production behavior always.)
+	 */
+	tuples_space = nentries * (MAXALIGN(SizeofMinimalTupleHeader) +
+							   MAXALIGN(tupleWidth) +
+							   MAXALIGN(additionalsize));
+
+	/*
+	 * Check for size_t overflow.  This coding is trickier than it may appear,
+	 * because on 64-bit machines SIZE_MAX cannot be represented exactly as a
+	 * double.  We must cast it explicitly to suppress compiler warnings about
+	 * an inexact conversion, and we must trust that any double value that
+	 * compares strictly less than "(double) SIZE_MAX" will cast to a
+	 * representable size_t value.
+	 */
+	if (sh_space + tuples_space >= (double) SIZE_MAX)
+		return SIZE_MAX;
+
+	/* We don't bother estimating size of the miscellaneous overhead data */
+	return (Size) (sh_space + tuples_space);
 }
 
 /*
