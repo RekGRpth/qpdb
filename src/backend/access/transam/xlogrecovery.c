@@ -3687,8 +3687,27 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 					 * Before we leave XLOG_FROM_STREAM state, make sure that
 					 * walreceiver is not active, so that it won't overwrite
 					 * WAL that we restore from archive.
+					 *
+					 * If walreceiver is actively streaming (or attempting to
+					 * connect), we must shut it down. However, if it's
+					 * already in WAITING state (e.g., due to timeline
+					 * divergence), we only need to reset the install flag to
+					 * allow archive restoration.
 					 */
-					XLogShutdownWalRcv();
+					if (WalRcvStreaming())
+						XLogShutdownWalRcv();
+					else
+					{
+						/*
+						 * WALRCV_STOPPING state is a transient state while
+						 * the startup process is in ShutdownWalRcv().  It
+						 * should never appear here since we would be waiting
+						 * for the walreceiver to reach WALRCV_STOPPED in that
+						 * case.
+						 */
+						Assert(WalRcvGetState() != WALRCV_STOPPING);
+						ResetInstallXLogFileSegmentActive();
+					}
 
 					/*
 					 * Before we sleep, re-scan for possible new timelines if
