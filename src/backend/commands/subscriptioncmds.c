@@ -393,7 +393,7 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 				lsn = DatumGetLSN(DirectFunctionCall1(pg_lsn_in,
 													  CStringGetDatum(lsn_str)));
 
-				if (XLogRecPtrIsInvalid(lsn))
+				if (!XLogRecPtrIsValid(lsn))
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid WAL location (LSN): %s", lsn_str)));
@@ -1895,7 +1895,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				 * If the user sets subskiplsn, we do a sanity check to make
 				 * sure that the specified LSN is a probable value.
 				 */
-				if (!XLogRecPtrIsInvalid(opts.lsn))
+				if (XLogRecPtrIsValid(opts.lsn))
 				{
 					RepOriginId originid;
 					char		originname[NAMEDATALEN];
@@ -1907,7 +1907,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					remote_lsn = replorigin_get_progress(originid, false);
 
 					/* Check the given LSN is at least a future LSN */
-					if (!XLogRecPtrIsInvalid(remote_lsn) && opts.lsn < remote_lsn)
+					if (XLogRecPtrIsValid(remote_lsn) && opts.lsn < remote_lsn)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 								 errmsg("skip WAL location (LSN %X/%08X) must be greater than origin LSN %X/%08X",
@@ -2599,33 +2599,30 @@ check_publications_origin_tables(WalReceiverConn *wrconn, List *publications,
 	 */
 	if (publist)
 	{
-		StringInfo	pubnames = makeStringInfo();
-		StringInfo	err_msg = makeStringInfo();
-		StringInfo	err_hint = makeStringInfo();
+		StringInfoData pubnames;
 
 		/* Prepare the list of publication(s) for warning message. */
-		GetPublicationsStr(publist, pubnames, false);
+		initStringInfo(&pubnames);
+		GetPublicationsStr(publist, &pubnames, false);
 
 		if (check_table_sync)
-		{
-			appendStringInfo(err_msg, _("subscription \"%s\" requested copy_data with origin = NONE but might copy data that had a different origin"),
-							 subname);
-			appendStringInfoString(err_hint, _("Verify that initial data copied from the publisher tables did not come from other origins."));
-		}
+			ereport(WARNING,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("subscription \"%s\" requested copy_data with origin = NONE but might copy data that had a different origin",
+						   subname),
+					errdetail_plural("The subscription subscribes to a publication (%s) that contains tables that are written to by other subscriptions.",
+									 "The subscription subscribes to publications (%s) that contain tables that are written to by other subscriptions.",
+									 list_length(publist), pubnames.data),
+					errhint("Verify that initial data copied from the publisher tables did not come from other origins."));
 		else
-		{
-			appendStringInfo(err_msg, _("subscription \"%s\" enabled retain_dead_tuples but might not reliably detect conflicts for changes from different origins"),
-							 subname);
-			appendStringInfoString(err_hint, _("Consider using origin = NONE or disabling retain_dead_tuples."));
-		}
-
-		ereport(WARNING,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg_internal("%s", err_msg->data),
-				errdetail_plural("The subscription subscribes to a publication (%s) that contains tables that are written to by other subscriptions.",
-								 "The subscription subscribes to publications (%s) that contain tables that are written to by other subscriptions.",
-								 list_length(publist), pubnames->data),
-				errhint_internal("%s", err_hint->data));
+			ereport(WARNING,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("subscription \"%s\" enabled retain_dead_tuples but might not reliably detect conflicts for changes from different origins",
+						   subname),
+					errdetail_plural("The subscription subscribes to a publication (%s) that contains tables that are written to by other subscriptions.",
+									 "The subscription subscribes to publications (%s) that contain tables that are written to by other subscriptions.",
+									 list_length(publist), pubnames.data),
+					errhint("Consider using origin = NONE or disabling retain_dead_tuples."));
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
@@ -2716,24 +2713,20 @@ check_publications_origin_sequences(WalReceiverConn *wrconn, List *publications,
 	 */
 	if (publist)
 	{
-		StringInfo	pubnames = makeStringInfo();
-		StringInfo	err_msg = makeStringInfo();
-		StringInfo	err_hint = makeStringInfo();
+		StringInfoData pubnames;
 
 		/* Prepare the list of publication(s) for warning message. */
-		GetPublicationsStr(publist, pubnames, false);
-
-		appendStringInfo(err_msg, _("subscription \"%s\" requested copy_data with origin = NONE but might copy data that had a different origin"),
-						 subname);
-		appendStringInfoString(err_hint, _("Verify that initial data copied from the publisher sequences did not come from other origins."));
+		initStringInfo(&pubnames);
+		GetPublicationsStr(publist, &pubnames, false);
 
 		ereport(WARNING,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg_internal("%s", err_msg->data),
+				errmsg("subscription \"%s\" requested copy_data with origin = NONE but might copy data that had a different origin",
+					   subname),
 				errdetail_plural("The subscription subscribes to a publication (%s) that contains sequences that are written to by other subscriptions.",
 								 "The subscription subscribes to publications (%s) that contain sequences that are written to by other subscriptions.",
-								 list_length(publist), pubnames->data),
-				errhint_internal("%s", err_hint->data));
+								 list_length(publist), pubnames.data),
+				errhint("Verify that initial data copied from the publisher sequences did not come from other origins."));
 	}
 
 	ExecDropSingleTupleTableSlot(slot);

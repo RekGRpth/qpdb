@@ -514,7 +514,7 @@ bool		InitializingApplyWorker = false;
  * by the user.
  */
 static XLogRecPtr skip_xact_finish_lsn = InvalidXLogRecPtr;
-#define is_skipping_changes() (unlikely(!XLogRecPtrIsInvalid(skip_xact_finish_lsn)))
+#define is_skipping_changes() (unlikely(XLogRecPtrIsValid(skip_xact_finish_lsn)))
 
 /* BufFile handle of the current streaming file */
 static BufFile *stream_fd = NULL;
@@ -4126,7 +4126,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 						 * due to a bug, we don't want to proceed as it can
 						 * incorrectly advance oldest_nonremovable_xid.
 						 */
-						if (XLogRecPtrIsInvalid(rdt_data.remote_lsn))
+						if (!XLogRecPtrIsValid(rdt_data.remote_lsn))
 							elog(ERROR, "cannot get the latest WAL position from the publisher");
 
 						maybe_advance_nonremovable_xid(&rdt_data, true);
@@ -4613,7 +4613,7 @@ wait_for_publisher_status(RetainDeadTuplesData *rdt_data,
 static void
 wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 {
-	Assert(!XLogRecPtrIsInvalid(rdt_data->remote_lsn) &&
+	Assert(XLogRecPtrIsValid(rdt_data->remote_lsn) &&
 		   TransactionIdIsValid(rdt_data->candidate_xid));
 
 	/*
@@ -5606,7 +5606,8 @@ start_apply(XLogRecPtr origin_startpos)
 			 * idle state.
 			 */
 			AbortOutOfAnyTransaction();
-			pgstat_report_subscription_error(MySubscription->oid, !am_tablesync_worker());
+			pgstat_report_subscription_error(MySubscription->oid,
+											 MyLogicalRepWorker->type);
 
 			PG_RE_THROW();
 		}
@@ -5953,15 +5954,12 @@ DisableSubscriptionAndExit(void)
 
 	RESUME_INTERRUPTS();
 
-	if (am_leader_apply_worker() || am_tablesync_worker())
-	{
-		/*
-		 * Report the worker failed during either table synchronization or
-		 * apply.
-		 */
-		pgstat_report_subscription_error(MyLogicalRepWorker->subid,
-										 !am_tablesync_worker());
-	}
+	/*
+	 * Report the worker failed during sequence synchronization, table
+	 * synchronization, or apply.
+	 */
+	pgstat_report_subscription_error(MyLogicalRepWorker->subid,
+									 MyLogicalRepWorker->type);
 
 	/* Disable the subscription */
 	StartTransactionCommand();
@@ -6031,7 +6029,7 @@ maybe_start_skipping_changes(XLogRecPtr finish_lsn)
 	 * function is called for every remote transaction and we assume that
 	 * skipping the transaction is not used often.
 	 */
-	if (likely(XLogRecPtrIsInvalid(MySubscription->skiplsn) ||
+	if (likely(!XLogRecPtrIsValid(MySubscription->skiplsn) ||
 			   MySubscription->skiplsn != finish_lsn))
 		return;
 
@@ -6077,7 +6075,7 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 	XLogRecPtr	myskiplsn = MySubscription->skiplsn;
 	bool		started_tx = false;
 
-	if (likely(XLogRecPtrIsInvalid(myskiplsn)) || am_parallel_apply_worker())
+	if (likely(!XLogRecPtrIsValid(myskiplsn)) || am_parallel_apply_worker())
 		return;
 
 	if (!IsTransactionState())
@@ -6173,7 +6171,7 @@ apply_error_callback(void *arg)
 			errcontext("processing remote data for replication origin \"%s\" during message type \"%s\"",
 					   errarg->origin_name,
 					   logicalrep_message_type(errarg->command));
-		else if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+		else if (!XLogRecPtrIsValid(errarg->finish_lsn))
 			errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" in transaction %u",
 					   errarg->origin_name,
 					   logicalrep_message_type(errarg->command),
@@ -6189,7 +6187,7 @@ apply_error_callback(void *arg)
 	{
 		if (errarg->remote_attnum < 0)
 		{
-			if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+			if (!XLogRecPtrIsValid(errarg->finish_lsn))
 				errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" for replication target relation \"%s.%s\" in transaction %u",
 						   errarg->origin_name,
 						   logicalrep_message_type(errarg->command),
@@ -6207,7 +6205,7 @@ apply_error_callback(void *arg)
 		}
 		else
 		{
-			if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+			if (!XLogRecPtrIsValid(errarg->finish_lsn))
 				errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" for replication target relation \"%s.%s\" column \"%s\" in transaction %u",
 						   errarg->origin_name,
 						   logicalrep_message_type(errarg->command),
