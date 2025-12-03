@@ -94,8 +94,7 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			{
 				/* No; copy it to itupPtr++, but skip copy if not needed */
 				if (itupPtr != itup)
-					memmove((Pointer) itupPtr, (Pointer) itup,
-							state.sizeOfBloomTuple);
+					memmove(itupPtr, itup, state.sizeOfBloomTuple);
 				itupPtr = BloomPageGetNextTuple(&state, itupPtr);
 			}
 
@@ -122,7 +121,7 @@ blbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			if (BloomPageGetMaxOffset(page) == 0)
 				BloomPageSetDeleted(page);
 			/* Adjust pd_lower */
-			((PageHeader) page)->pd_lower = (Pointer) itupPtr - page;
+			((PageHeader) page)->pd_lower = (char *) itupPtr - page;
 			/* Finish WAL-logging */
 			GenericXLogFinish(gxlogState);
 		}
