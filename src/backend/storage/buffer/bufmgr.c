@@ -2866,7 +2866,7 @@ BufferIsLockedByMe(Buffer buffer)
  * Buffer must be pinned.
  */
 bool
-BufferIsLockedByMeInMode(Buffer buffer, int mode)
+BufferIsLockedByMeInMode(Buffer buffer, BufferLockMode mode)
 {
 	BufferDesc *bufHdr;
 
@@ -5601,7 +5601,7 @@ UnlockBuffers(void)
  * Acquire or release the content_lock for the buffer.
  */
 void
-LockBuffer(Buffer buffer, int mode)
+LockBuffer(Buffer buffer, BufferLockMode mode)
 {
 	BufferDesc *buf;
 
@@ -5799,7 +5799,7 @@ LockBufferForCleanup(Buffer buffer)
 			SetStartupBufferPinWaitBufId(-1);
 		}
 		else
-			ProcWaitForSignal(WAIT_EVENT_BUFFER_PIN);
+			ProcWaitForSignal(WAIT_EVENT_BUFFER_CLEANUP);
 
 		/*
 		 * Remove flag marking us as waiter. Normally this will not be set

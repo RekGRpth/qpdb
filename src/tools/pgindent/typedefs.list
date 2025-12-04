@@ -345,6 +345,7 @@ BufferCachePagesRec
 BufferDesc
 BufferDescPadded
 BufferHeapTupleTableSlot
+BufferLockMode
 BufferLookupEnt
 BufferManagerRelation
 BufferStrategyControl
@@ -3269,7 +3270,7 @@ WSANETWORKEVENTS
 WSAPROTOCOL_INFO
 WaitEvent
 WaitEventActivity
-WaitEventBufferPin
+WaitEventBuffer
 WaitEventClient
 WaitEventCustomCounterData
 WaitEventCustomEntryByInfo
