@@ -3935,7 +3935,7 @@ extern bool InjectionPointDetach(const char *name);
 
     <para>
      An example can be found in
-     <filename>src/test/modules/injection_points</filename> in the PostgreSQL
+     <filename>src/test/modules/test_custom_stats</filename> in the PostgreSQL
      source tree.
     </para>
 
