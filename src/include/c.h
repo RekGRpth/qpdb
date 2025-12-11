@@ -59,6 +59,7 @@
 #include "pg_config_os.h"		/* config from include/port/PORTNAME.h */
 
 /* System header files that should be available everywhere in Postgres */
+#include <assert.h>
 #include <inttypes.h>
 #include <stdalign.h>
 #include <stdio.h>
@@ -226,6 +227,16 @@
 #define PG_USED_FOR_ASSERTS_ONLY
 #else
 #define PG_USED_FOR_ASSERTS_ONLY pg_attribute_unused()
+#endif
+
+/*
+ * Our C and C++ compilers may have different ideas about which printf
+ * archetype best represents what src/port/snprintf.c can do.
+ */
+#ifndef __cplusplus
+#define PG_PRINTF_ATTRIBUTE PG_C_PRINTF_ATTRIBUTE
+#else
+#define PG_PRINTF_ATTRIBUTE PG_CXX_PRINTF_ATTRIBUTE
 #endif
 
 /* GCC supports format attributes */
@@ -862,7 +873,6 @@ typedef NameData *Name;
 
 #elif defined(FRONTEND)
 
-#include <assert.h>
 #define Assert(p) assert(p)
 #define AssertMacro(p)	((void) assert(p))
 

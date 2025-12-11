@@ -122,18 +122,12 @@ struct ctype_methods
 	bool		(*wc_ispunct) (pg_wchar wc, pg_locale_t locale);
 	bool		(*wc_isspace) (pg_wchar wc, pg_locale_t locale);
 	bool		(*wc_isxdigit) (pg_wchar wc, pg_locale_t locale);
+	bool		(*wc_iscased) (pg_wchar wc, pg_locale_t locale);
 	pg_wchar	(*wc_toupper) (pg_wchar wc, pg_locale_t locale);
 	pg_wchar	(*wc_tolower) (pg_wchar wc, pg_locale_t locale);
 
 	/* required */
 	bool		(*char_is_cased) (char ch, pg_locale_t locale);
-
-	/*
-	 * Optional. If defined, will only be called for single-byte encodings. If
-	 * not defined, or if the encoding is multibyte, will fall back to
-	 * pg_strlower().
-	 */
-	char		(*char_tolower) (unsigned char ch, pg_locale_t locale);
 };
 
 /*
@@ -185,8 +179,6 @@ extern pg_locale_t pg_newlocale_from_collation(Oid collid);
 extern char *get_collation_actual_version(char collprovider, const char *collcollate);
 
 extern bool char_is_cased(char ch, pg_locale_t locale);
-extern bool char_tolower_enabled(pg_locale_t locale);
-extern char char_tolower(unsigned char ch, pg_locale_t locale);
 extern size_t pg_strlower(char *dst, size_t dstsize,
 						  const char *src, ssize_t srclen,
 						  pg_locale_t locale);
@@ -223,6 +215,7 @@ extern bool pg_iswprint(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswpunct(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswspace(pg_wchar wc, pg_locale_t locale);
 extern bool pg_iswxdigit(pg_wchar wc, pg_locale_t locale);
+extern bool pg_iswcased(pg_wchar wc, pg_locale_t locale);
 extern pg_wchar pg_towupper(pg_wchar wc, pg_locale_t locale);
 extern pg_wchar pg_towlower(pg_wchar wc, pg_locale_t locale);
 
