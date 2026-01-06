@@ -2460,8 +2460,8 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
  * Finds an operator from a CompareType.  This is used for temporal index
  * constraints (and other temporal features) to look up equality and overlaps
  * operators.  We ask an opclass support function to translate from the
- * compare type to the internal strategy numbers.  If the function isn't
- * defined or it gives no result, we set *strat to InvalidStrategy.
+ * compare type to the internal strategy numbers.  Raises ERROR on search
+ * failure.
  */
 void
 GetOperatorFromCompareType(Oid opclass, Oid rhstype, CompareType cmptype,
@@ -2473,34 +2473,36 @@ GetOperatorFromCompareType(Oid opclass, Oid rhstype, CompareType cmptype,
 
 	Assert(cmptype == COMPARE_EQ || cmptype == COMPARE_OVERLAP || cmptype == COMPARE_CONTAINED_BY);
 
+	/*
+	 * Use the opclass to get the opfamily, opcintype, and access method. If
+	 * any of this fails, quit early.
+	 */
+	if (!get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
+		elog(ERROR, "cache lookup failed for opclass %u", opclass);
+
 	amid = get_opclass_method(opclass);
 
-	*opid = InvalidOid;
+	/*
+	 * Ask the index AM to translate to its internal stratnum
+	 */
+	*strat = IndexAmTranslateCompareType(cmptype, amid, opfamily, true);
+	if (*strat == InvalidStrategy)
+		ereport(ERROR,
+				errcode(ERRCODE_UNDEFINED_OBJECT),
+				cmptype == COMPARE_EQ ? errmsg("could not identify an equality operator for type %s", format_type_be(opcintype)) :
+				cmptype == COMPARE_OVERLAP ? errmsg("could not identify an overlaps operator for type %s", format_type_be(opcintype)) :
+				cmptype == COMPARE_CONTAINED_BY ? errmsg("could not identify a contained-by operator for type %s", format_type_be(opcintype)) : 0,
+				errdetail("Could not translate compare type %d for operator family \"%s\" of access method \"%s\".",
+						  cmptype, get_opfamily_name(opfamily, false), get_am_name(amid)));
 
-	if (get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
-	{
-		/*
-		 * Ask the index AM to translate to its internal stratnum
-		 */
-		*strat = IndexAmTranslateCompareType(cmptype, amid, opfamily, true);
-		if (*strat == InvalidStrategy)
-			ereport(ERROR,
-					errcode(ERRCODE_UNDEFINED_OBJECT),
-					cmptype == COMPARE_EQ ? errmsg("could not identify an equality operator for type %s", format_type_be(opcintype)) :
-					cmptype == COMPARE_OVERLAP ? errmsg("could not identify an overlaps operator for type %s", format_type_be(opcintype)) :
-					cmptype == COMPARE_CONTAINED_BY ? errmsg("could not identify a contained-by operator for type %s", format_type_be(opcintype)) : 0,
-					errdetail("Could not translate compare type %d for operator family \"%s\" of access method \"%s\".",
-							  cmptype, get_opfamily_name(opfamily, false), get_am_name(amid)));
-
-		/*
-		 * We parameterize rhstype so foreign keys can ask for a <@ operator
-		 * whose rhs matches the aggregate function. For example range_agg
-		 * returns anymultirange.
-		 */
-		if (!OidIsValid(rhstype))
-			rhstype = opcintype;
-		*opid = get_opfamily_member(opfamily, opcintype, rhstype, *strat);
-	}
+	/*
+	 * We parameterize rhstype so foreign keys can ask for a <@ operator whose
+	 * rhs matches the aggregate function. For example range_agg returns
+	 * anymultirange.
+	 */
+	if (!OidIsValid(rhstype))
+		rhstype = opcintype;
+	*opid = get_opfamily_member(opfamily, opcintype, rhstype, *strat);
 
 	if (!OidIsValid(*opid))
 		ereport(ERROR,
