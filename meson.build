@@ -1336,7 +1336,21 @@ if not pyopt.disabled()
   pm = import('python')
   python3_inst = pm.find_installation(python.full_path(), required: pyopt)
   if python3_inst.found()
-    python3_dep = python3_inst.dependency(embed: true, required: pyopt)
+    # On MSVC, link against python3.lib instead of python3XX.lib for
+    # Python Limited API.  Right now, this is the only platform that
+    # needs this workaround.  In the long run, Meson should handle
+    # this internally:
+    # <https://github.com/mesonbuild/meson/issues/13824>.
+    if host_system == 'windows' and cc.get_id() == 'msvc'
+      python3_libdir = python3_inst.get_variable('prefix') / 'libs'
+      python3_lib = cc.find_library('python3', dirs: python3_libdir, required: pyopt)
+      python3_dep = declare_dependency(
+        include_directories: include_directories(python3_inst.get_variable('prefix') / 'include'),
+        dependencies: python3_lib,
+      )
+    else
+      python3_dep = python3_inst.dependency(embed: true, required: pyopt)
+    endif
     # Remove this check after we depend on Meson >= 1.1.0
     if not cc.check_header('Python.h', dependencies: python3_dep, required: pyopt, include_directories: postgres_inc)
       python3_dep = not_found_dep
@@ -2833,12 +2847,13 @@ int main(void)
 endforeach
 
 
-# Even though restrict is in C99 and should be supported by all
-# supported compilers, this indirection is useful because __restrict
-# also works in C++ in all supported compilers.  (If not, then we
-# might have to write a real test.)  (restrict is not part of the C++
-# standard.)
-cdata.set('restrict', '__restrict')
+# MSVC doesn't cope well with defining restrict to __restrict, the
+# spelling it understands, because it conflicts with
+# __declspec(restrict) in C++ mode.  Therefore we define pg_restrict
+# to the appropriate definition, which presumably won't conflict.
+#
+# We assume C99 support, so we don't need to make this conditional.
+cdata.set('pg_restrict', '__restrict')
 
 
 # Most libraries are included only if they demonstrably provide a function we
