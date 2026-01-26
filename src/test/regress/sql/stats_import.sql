@@ -15,6 +15,12 @@ CREATE TABLE stats_import.test(
     tags text[]
 ) WITH (autovacuum_enabled = false);
 
+CREATE TABLE stats_import.test_mr(
+    id INTEGER PRIMARY KEY,
+    name text,
+    mrange int4multirange
+) WITH (autovacuum_enabled = false);
+
 SELECT
     pg_catalog.pg_restore_relation_stats(
         'schemaname', 'stats_import',
@@ -764,6 +770,24 @@ AND tablename = 'test'
 AND inherited = false
 AND attname = 'id';
 
+-- test for multiranges
+INSERT INTO stats_import.test_mr
+VALUES
+  (1, 'red', '{[1,3),[5,9),[20,30)}'::int4multirange),
+  (2, 'red', '{[11,13),[15,19),[20,30)}'::int4multirange),
+  (3, 'red', '{[21,23),[25,29),[120,130)}'::int4multirange);
+
+-- ensure that we set attribute stats for a multirange
+SELECT pg_catalog.pg_restore_attribute_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_mr',
+  'attname', 'mrange',
+  'inherited', false,
+  'range_length_histogram', '{19,29,109}'::text,
+  'range_empty_frac', '0'::real,
+  'range_bounds_histogram', '{"[1,30)","[11,30)","[21,130)"}'::text
+);
+
 --
 -- Test the ability to exactly copy data from one table to an identical table,
 -- correctly reconstructing the stakind order as well as the staopN and
@@ -785,6 +809,14 @@ CREATE INDEX is_odd ON stats_import.test(((comp).a % 2 = 1));
 
 CREATE STATISTICS stats_import.test_stat
   ON name, comp, lower(arange), array_length(tags,1)
+  FROM stats_import.test;
+
+CREATE STATISTICS stats_import.test_stat_ndistinct (ndistinct)
+  ON name, comp
+  FROM stats_import.test;
+
+CREATE STATISTICS stats_import.test_stat_dependencies (dependencies)
+  ON name, comp
   FROM stats_import.test;
 
 -- Generate statistics on table with data
@@ -1112,5 +1144,134 @@ RESET ROLE;
 REVOKE MAINTAIN ON stats_import.test FROM regress_test_extstat_clear;
 REVOKE ALL ON SCHEMA stats_import FROM regress_test_extstat_clear;
 DROP ROLE regress_test_extstat_clear;
+
+-- Tests for pg_restore_extended_stats().
+--  Invalid argument values.
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', NULL,
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', NULL,
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', NULL,
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', NULL,
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', NULL);
+-- Missing objects
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'schema_not_exist',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'table_not_exist',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'schema_not_exist',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'ext_stats_not_exist',
+  'inherited', false);
+-- Incorrect relation/extended stats combination
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+
+-- Check that MAINTAIN is required when restoring statistics.
+CREATE ROLE regress_test_extstat_restore;
+GRANT ALL ON SCHEMA stats_import TO regress_test_extstat_restore;
+SET ROLE regress_test_extstat_restore;
+-- No data to restore; this fails on a permission failure.
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false);
+RESET ROLE;
+GRANT MAINTAIN ON stats_import.test_clone TO regress_test_extstat_restore;
+SET ROLE regress_test_extstat_restore;
+-- This works, check the lock on the relation while on it.
+BEGIN;
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false,
+  'n_distinct', '[{"attributes" : [2,3], "ndistinct" : 4}]'::pg_ndistinct);
+SELECT mode FROM pg_locks WHERE locktype = 'relation' AND
+  relation = 'stats_import.test_clone'::regclass AND
+  pid = pg_backend_pid();
+COMMIT;
+RESET ROLE;
+REVOKE MAINTAIN ON stats_import.test_clone FROM regress_test_extstat_restore;
+REVOKE ALL ON SCHEMA stats_import FROM regress_test_extstat_restore;
+DROP ROLE regress_test_extstat_restore;
+
+-- ndistinct value doesn't match object definition
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_ndistinct',
+  'inherited', false,
+  'n_distinct', '[{"attributes" : [1,3], "ndistinct" : 4}]'::pg_ndistinct);
+-- Incorrect extended stats kind, ndistinct not supported
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_dependencies',
+  'inherited', false,
+  'n_distinct', '[{"attributes" : [1,3], "ndistinct" : 4}]'::pg_ndistinct);
+
+-- ok: ndistinct
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_ndistinct',
+  'inherited', false,
+  'n_distinct', '[{"attributes" : [2,3], "ndistinct" : 4}]'::pg_ndistinct);
+
+SELECT replace(e.n_distinct,   '}, ', E'},\n') AS n_distinct
+FROM pg_stats_ext AS e
+WHERE e.statistics_schemaname = 'stats_import' AND
+    e.statistics_name = 'test_stat_ndistinct' AND
+    e.inherited = false;
 
 DROP SCHEMA stats_import CASCADE;
