@@ -40,9 +40,14 @@ typedef struct xl_replorigin_drop
  */
 #define MAX_RONAME_LEN	512
 
-extern PGDLLIMPORT ReplOriginId replorigin_session_origin;
-extern PGDLLIMPORT XLogRecPtr replorigin_session_origin_lsn;
-extern PGDLLIMPORT TimestampTz replorigin_session_origin_timestamp;
+typedef struct ReplOriginXactState
+{
+	ReplOriginId origin;
+	XLogRecPtr	origin_lsn;
+	TimestampTz origin_timestamp;
+} ReplOriginXactState;
+
+extern PGDLLIMPORT ReplOriginXactState replorigin_xact_state;
 
 /* GUCs */
 extern PGDLLIMPORT int max_active_replication_origins;
@@ -66,6 +71,9 @@ extern void replorigin_session_advance(XLogRecPtr remote_commit,
 extern void replorigin_session_setup(ReplOriginId node, int acquired_by);
 extern void replorigin_session_reset(void);
 extern XLogRecPtr replorigin_session_get_progress(bool flush);
+
+/* Per-transaction replication origin state manipulation */
+extern void replorigin_xact_clear(bool clear_origin);
 
 /* Checkpoint/Startup integration */
 extern void CheckPointReplicationOrigin(void);
