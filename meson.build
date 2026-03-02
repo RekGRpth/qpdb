@@ -2953,6 +2953,31 @@ int main(void)
   endif
 endforeach
 
+# Check if the C++ compiler understands typeof or a variant.
+if have_cxx
+  foreach kw : ['typeof', '__typeof__']
+    if cxx.compiles('''
+int main(void)
+{
+    int x = 0;
+    @0@(x) y;
+    y = x;
+    return y;
+}
+'''.format(kw),
+      name: 'C++ ' + kw,
+      args: test_c_args, include_directories: postgres_inc)
+
+      cdata.set('HAVE_CXX_TYPEOF', 1)
+      if kw != 'typeof'
+        cdata.set('pg_cxx_typeof', kw)
+      endif
+
+      break
+    endif
+  endforeach
+endif
+
 
 # MSVC doesn't cope well with defining restrict to __restrict, the
 # spelling it understands, because it conflicts with
@@ -3015,6 +3040,7 @@ func_checks = [
   ['dlsym', {'dependencies': [dl_dep], 'define': false}],
   ['elf_aux_info'],
   ['explicit_bzero'],
+  ['explicit_memset'],
   ['getauxval'],
   ['getifaddrs'],
   ['getopt', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt}],
@@ -3026,6 +3052,7 @@ func_checks = [
   ['kqueue'],
   ['localeconv_l'],
   ['mbstowcs_l'],
+  ['memset_explicit'],
   ['mkdtemp'],
   ['posix_fadvise'],
   ['posix_fallocate'],

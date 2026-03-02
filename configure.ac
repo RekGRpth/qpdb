@@ -1732,6 +1732,7 @@ PGAC_PRINTF_ARCHETYPE
 PGAC_CXX_PRINTF_ARCHETYPE
 PGAC_C_STATEMENT_EXPRESSIONS
 PGAC_C_TYPEOF
+PGAC_CXX_TYPEOF
 PGAC_C_TYPES_COMPATIBLE
 PGAC_C_BUILTIN_CONSTANT_P
 PGAC_C_BUILTIN_OP_OVERFLOW
@@ -1841,6 +1842,7 @@ AC_CHECK_FUNCS(m4_normalize([
 	copyfile
 	copy_file_range
 	elf_aux_info
+	explicit_memset
 	getauxval
 	getifaddrs
 	getpeerucred
@@ -1848,6 +1850,7 @@ AC_CHECK_FUNCS(m4_normalize([
 	kqueue
 	localeconv_l
 	mbstowcs_l
+	memset_explicit
 	posix_fallocate
 	ppoll
 	pthread_is_threaded_np
