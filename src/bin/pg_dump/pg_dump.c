@@ -4623,9 +4623,59 @@ getPublications(Archive *fout)
 			(strcmp(PQgetvalue(res, i, i_pubviaroot), "t") == 0);
 		pubinfo[i].pubgencols_type =
 			*(PQgetvalue(res, i, i_pubgencols));
+		pubinfo[i].except_tables = (SimplePtrList)
+		{
+			NULL, NULL
+		};
 
 		/* Decide whether we want to dump it */
 		selectDumpableObject(&(pubinfo[i].dobj), fout);
+
+		/*
+		 * Get the list of tables for publications specified in the EXCEPT
+		 * TABLE clause.
+		 *
+		 * Although individual EXCEPT TABLE entries could be stored in
+		 * PublicationRelInfo, dumpPublicationTable cannot be used to emit
+		 * them, because there is no ALTER PUBLICATION ... ADD command to add
+		 * individual table entries to the EXCEPT TABLE list.
+		 *
+		 * Therefore, the approach is to dump the complete EXCEPT TABLE list
+		 * in a single CREATE PUBLICATION statement. PublicationInfo is used
+		 * to collect this information, which is then emitted by
+		 * dumpPublication().
+		 */
+		if (fout->remoteVersion >= 190000)
+		{
+			int			ntbls;
+			PGresult   *res_tbls;
+
+			resetPQExpBuffer(query);
+			appendPQExpBuffer(query,
+							  "SELECT prrelid\n"
+							  "FROM pg_catalog.pg_publication_rel\n"
+							  "WHERE prpubid = %u AND prexcept",
+							  pubinfo[i].dobj.catId.oid);
+
+			res_tbls = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+
+			ntbls = PQntuples(res_tbls);
+
+			for (int j = 0; j < ntbls; j++)
+			{
+				Oid			prrelid;
+				TableInfo  *tbinfo;
+
+				prrelid = atooid(PQgetvalue(res_tbls, j, 0));
+
+				tbinfo = findTableByOid(prrelid);
+
+				if (tbinfo != NULL)
+					simple_ptr_list_append(&pubinfo[i].except_tables, tbinfo);
+			}
+
+			PQclear(res_tbls);
+		}
 	}
 
 cleanup:
@@ -4662,10 +4712,29 @@ dumpPublication(Archive *fout, const PublicationInfo *pubinfo)
 	appendPQExpBuffer(query, "CREATE PUBLICATION %s",
 					  qpubname);
 
-	if (pubinfo->puballtables && pubinfo->puballsequences)
-		appendPQExpBufferStr(query, " FOR ALL TABLES, ALL SEQUENCES");
-	else if (pubinfo->puballtables)
+	if (pubinfo->puballtables)
+	{
+		int			n_except = 0;
+
 		appendPQExpBufferStr(query, " FOR ALL TABLES");
+
+		/* Include EXCEPT TABLE clause if there are except_tables. */
+		for (SimplePtrListCell *cell = pubinfo->except_tables.head; cell; cell = cell->next)
+		{
+			TableInfo  *tbinfo = (TableInfo *) cell->ptr;
+
+			if (++n_except == 1)
+				appendPQExpBufferStr(query, " EXCEPT TABLE (");
+			else
+				appendPQExpBufferStr(query, ", ");
+			appendPQExpBuffer(query, "ONLY %s", fmtQualifiedDumpable(tbinfo));
+		}
+		if (n_except > 0)
+			appendPQExpBufferStr(query, ")");
+
+		if (pubinfo->puballsequences)
+			appendPQExpBufferStr(query, ", ALL SEQUENCES");
+	}
 	else if (pubinfo->puballsequences)
 		appendPQExpBufferStr(query, " FOR ALL SEQUENCES");
 
@@ -4845,6 +4914,7 @@ getPublicationTables(Archive *fout, TableInfo tblinfo[], int numTables)
 
 	/* Collect all publication membership info. */
 	if (fout->remoteVersion >= 150000)
+	{
 		appendPQExpBufferStr(query,
 							 "SELECT tableoid, oid, prpubid, prrelid, "
 							 "pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual, "
@@ -4857,6 +4927,9 @@ getPublicationTables(Archive *fout, TableInfo tblinfo[], int numTables)
 							 "      WHERE attrelid = pr.prrelid AND attnum = prattrs[s])\n"
 							 "  ELSE NULL END) prattrs "
 							 "FROM pg_catalog.pg_publication_rel pr");
+		if (fout->remoteVersion >= 190000)
+			appendPQExpBufferStr(query, " WHERE NOT pr.prexcept");
+	}
 	else
 		appendPQExpBufferStr(query,
 							 "SELECT tableoid, oid, prpubid, prrelid, "
@@ -18655,11 +18728,58 @@ dumpStatisticsExtStats(Archive *fout, const StatsExtInfo *statsextinfo)
 		if (fout->remoteVersion >= 130000)
 			appendPQExpBufferStr(pq,
 								 "e.most_common_vals, e.most_common_freqs, "
-								 "e.most_common_base_freqs ");
+								 "e.most_common_base_freqs, ");
 		else
 			appendPQExpBufferStr(pq,
 								 "NULL AS most_common_vals, NULL AS most_common_freqs, "
-								 "NULL AS most_common_base_freqs ");
+								 "NULL AS most_common_base_freqs, ");
+
+		/* Expressions were introduced in v14 */
+		if (fout->remoteVersion >= 140000)
+		{
+			/*
+			 * There is no ordering column in pg_stats_ext_exprs.  However, we
+			 * can rely on the unnesting of pg_statistic.ext_data.stxdexpr to
+			 * maintain the desired order of expression elements.
+			 */
+			appendPQExpBufferStr(pq,
+								 "( "
+								 "SELECT jsonb_pretty(jsonb_agg("
+								 "nullif(j.obj, '{}'::jsonb))) "
+								 "FROM pg_stats_ext_exprs AS ee "
+								 "CROSS JOIN LATERAL jsonb_strip_nulls("
+								 "    jsonb_build_object( "
+								 "       'null_frac', ee.null_frac::text, "
+								 "       'avg_width', ee.avg_width::text, "
+								 "       'n_distinct', ee.n_distinct::text, "
+								 "       'most_common_vals', ee.most_common_vals::text, "
+								 "       'most_common_freqs', ee.most_common_freqs::text, "
+								 "       'histogram_bounds', ee.histogram_bounds::text, "
+								 "       'correlation', ee.correlation::text, "
+								 "       'most_common_elems', ee.most_common_elems::text, "
+								 "       'most_common_elem_freqs', ee.most_common_elem_freqs::text, "
+								 "       'elem_count_histogram', ee.elem_count_histogram::text");
+
+			/* These three have been added to pg_stats_ext_exprs in v19. */
+			if (fout->remoteVersion >= 190000)
+				appendPQExpBufferStr(pq,
+									 ", "
+									 "       'range_length_histogram', ee.range_length_histogram::text, "
+									 "       'range_empty_frac', ee.range_empty_frac::text, "
+									 "       'range_bounds_histogram', ee.range_bounds_histogram::text");
+
+			appendPQExpBufferStr(pq,
+								 "    )) AS j(obj)"
+								 "WHERE ee.statistics_schemaname = $1 "
+								 "AND ee.statistics_name = $2 ");
+			/* Inherited expressions introduced in v15 */
+			if (fout->remoteVersion >= 150000)
+				appendPQExpBufferStr(pq, "AND ee.inherited = e.inherited");
+
+			appendPQExpBufferStr(pq, ") AS exprs ");
+		}
+		else
+			appendPQExpBufferStr(pq, "NULL AS exprs ");
 
 		/* pg_stats_ext introduced in v12 */
 		if (fout->remoteVersion >= 120000)
@@ -18713,6 +18833,7 @@ dumpStatisticsExtStats(Archive *fout, const StatsExtInfo *statsextinfo)
 		int			i_mcv = PQfnumber(res, "most_common_vals");
 		int			i_mcf = PQfnumber(res, "most_common_freqs");
 		int			i_mcbf = PQfnumber(res, "most_common_base_freqs");
+		int			i_exprs = PQfnumber(res, "exprs");
 
 		for (int i = 0; i < nstats; i++)
 		{
@@ -18759,6 +18880,10 @@ dumpStatisticsExtStats(Archive *fout, const StatsExtInfo *statsextinfo)
 			if (!PQgetisnull(res, i, i_mcbf))
 				appendNamedArgument(out, fout, "most_common_base_freqs", "double precision[]",
 									PQgetvalue(res, i, i_mcbf));
+
+			if (!PQgetisnull(res, i, i_exprs))
+				appendNamedArgument(out, fout, "exprs", "jsonb",
+									PQgetvalue(res, i, i_exprs));
 
 			appendPQExpBufferStr(out, "\n);\n");
 		}
