@@ -7703,29 +7703,6 @@ fi
 rm -f core conftest.err conftest.$ac_objext \
     conftest$ac_exeext conftest.$ac_ext
 
-# Defend against gcc -ffast-math
-if test "$GCC" = yes; then
-cat confdefs.h - <<_ACEOF >conftest.$ac_ext
-/* end confdefs.h.  */
-
-int
-main ()
-{
-#ifdef __FAST_MATH__
-choke me
-#endif
-  ;
-  return 0;
-}
-_ACEOF
-if ac_fn_c_try_compile "$LINENO"; then :
-
-else
-  as_fn_error $? "do not put -ffast-math in CFLAGS" "$LINENO" 5
-fi
-rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
-fi
-
 # Defend against clang being used on x86-32 without SSE2 enabled.  As current
 # versions of clang do not understand -fexcess-precision=standard, the use of
 # x87 floating point operations leads to problems like isinf possibly returning
@@ -15110,13 +15087,9 @@ if ${pgac_cv_c_typeof_unqual+:} false; then :
   $as_echo_n "(cached) " >&6
 else
   pgac_cv_c_typeof_unqual=no
-# Test the underscore variant first so that there is a higher chance
-# that clang used for bitcode also supports it, since we don't test
-# that separately.
-#
 # Test with a void pointer, because MSVC doesn't handle that, and we
 # need that for copyObject().
-for pgac_kw in __typeof_unqual__ typeof_unqual; do
+for pgac_kw in typeof_unqual __typeof_unqual__; do
   cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
@@ -15167,7 +15140,7 @@ ac_compile='$CXX -c $CXXFLAGS $CPPFLAGS conftest.$ac_ext >&5'
 ac_link='$CXX -o conftest$ac_exeext $CXXFLAGS $CPPFLAGS $LDFLAGS conftest.$ac_ext $LIBS >&5'
 ac_compiler_gnu=$ac_cv_cxx_compiler_gnu
 
-for pgac_kw in __typeof_unqual__ typeof_unqual; do
+for pgac_kw in typeof_unqual __typeof_unqual__; do
   cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 

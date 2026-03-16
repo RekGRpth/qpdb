@@ -359,6 +359,10 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 			tle->resorigtbl = rte->relid;
 			tle->resorigcol = attnum;
 			break;
+		case RTE_GRAPH_TABLE:
+			tle->resorigtbl = rte->relid;
+			tle->resorigcol = InvalidAttrNumber;
+			break;
 		case RTE_SUBQUERY:
 			/* Subselect-in-FROM: copy up from the subselect */
 			if (attnum != InvalidAttrNumber)
@@ -1572,6 +1576,8 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 		}
 		Assert(lname == NULL && lvar == NULL);	/* lists same length? */
 
+		TupleDescFinalize(tupleDesc);
+
 		return tupleDesc;
 	}
 
@@ -1582,6 +1588,7 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 		case RTE_RELATION:
 		case RTE_VALUES:
 		case RTE_NAMEDTUPLESTORE:
+		case RTE_GRAPH_TABLE:
 		case RTE_RESULT:
 
 			/*

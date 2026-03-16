@@ -40,6 +40,7 @@
 #include "lib/bloomfilter.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "storage/large_object.h"
 #include "utils/acl.h"
 #include "utils/array.h"
@@ -889,6 +890,10 @@ acldefault(ObjectType objtype, Oid ownerId)
 		case OBJECT_PARAMETER_ACL:
 			world_default = ACL_NO_RIGHTS;
 			owner_default = ACL_ALL_RIGHTS_PARAMETER_ACL;
+			break;
+		case OBJECT_PROPGRAPH:
+			world_default = ACL_NO_RIGHTS;
+			owner_default = ACL_ALL_RIGHTS_PROPGRAPH;
 			break;
 		default:
 			elog(ERROR, "unrecognized object type: %d", (int) objtype);
@@ -1841,6 +1846,7 @@ aclexplode(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "is_grantable",
 						   BOOLOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/* allocate memory for user context */

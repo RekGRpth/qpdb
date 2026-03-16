@@ -14,6 +14,7 @@
 #ifndef EXECUTOR_H
 #define EXECUTOR_H
 
+#include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "fmgr.h"
@@ -597,7 +598,8 @@ extern void ExecInitResultTupleSlotTL(PlanState *planstate,
 									  const TupleTableSlotOps *tts_ops);
 extern void ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 								  TupleDesc tupledesc,
-								  const TupleTableSlotOps *tts_ops);
+								  const TupleTableSlotOps *tts_ops,
+								  uint16 flags);
 extern TupleTableSlot *ExecInitExtraTupleSlot(EState *estate,
 											  TupleDesc tupledesc,
 											  const TupleTableSlotOps *tts_ops);

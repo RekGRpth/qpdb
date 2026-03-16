@@ -25,6 +25,7 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -308,6 +309,12 @@ static const struct dropmsgstrings dropmsgstringarray[] = {
 		gettext_noop("index \"%s\" does not exist, skipping"),
 		gettext_noop("\"%s\" is not an index"),
 	gettext_noop("Use DROP INDEX to remove an index.")},
+	{RELKIND_PROPGRAPH,
+		ERRCODE_UNDEFINED_OBJECT,
+		gettext_noop("property graph \"%s\" does not exist"),
+		gettext_noop("property graph \"%s\" does not exist, skipping"),
+		gettext_noop("\"%s\" is not a property graph"),
+	gettext_noop("Use DROP PROPERTY GRAPH to remove a property graph.")},
 	{'\0', 0, NULL, NULL, NULL, NULL}
 };
 
@@ -1038,6 +1045,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		}
 	}
 
+	TupleDescFinalize(descriptor);
+
 	/*
 	 * For relations with table AM and partitioned tables, select access
 	 * method to use: an explicitly indicated one, or (in the case of a
@@ -1466,6 +1475,8 @@ BuildDescForRelation(const List *columns)
 		populate_compact_attribute(desc, attnum - 1);
 	}
 
+	TupleDescFinalize(desc);
+
 	return desc;
 }
 
@@ -1546,7 +1557,7 @@ DropErrorMsgWrongType(const char *relname, char wrongkind, char rightkind)
 /*
  * RemoveRelations
  *		Implements DROP TABLE, DROP INDEX, DROP SEQUENCE, DROP VIEW,
- *		DROP MATERIALIZED VIEW, DROP FOREIGN TABLE
+ *		DROP MATERIALIZED VIEW, DROP FOREIGN TABLE, DROP PROPERTY GRAPH
  */
 void
 RemoveRelations(DropStmt *drop)
@@ -1608,6 +1619,10 @@ RemoveRelations(DropStmt *drop)
 
 		case OBJECT_FOREIGN_TABLE:
 			relkind = RELKIND_FOREIGN_TABLE;
+			break;
+
+		case OBJECT_PROPGRAPH:
+			relkind = RELKIND_PROPGRAPH;
 			break;
 
 		default:
@@ -4215,7 +4230,7 @@ RenameConstraint(RenameStmt *stmt)
 }
 
 /*
- * Execute ALTER TABLE/INDEX/SEQUENCE/VIEW/MATERIALIZED VIEW/FOREIGN TABLE
+ * Execute ALTER TABLE/INDEX/SEQUENCE/VIEW/MATERIALIZED VIEW/FOREIGN TABLE/PROPERTY GRAPH
  * RENAME
  */
 ObjectAddress
@@ -5160,7 +5175,7 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_ClusterOn:		/* CLUSTER ON */
 		case AT_DropCluster:	/* SET WITHOUT CLUSTER */
 			ATSimplePermissions(cmd->subtype, rel,
-								ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_MATVIEW);
+								ATT_TABLE | ATT_MATVIEW);
 			/* These commands never recurse */
 			/* No command-specific prep needed */
 			pass = AT_PASS_MISC;
@@ -16325,6 +16340,7 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 		case RELKIND_MATVIEW:
 		case RELKIND_FOREIGN_TABLE:
 		case RELKIND_PARTITIONED_TABLE:
+		case RELKIND_PROPGRAPH:
 			/* ok to change owner */
 			break;
 		case RELKIND_INDEX:
@@ -19892,6 +19908,11 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a composite type", rv->relname)));
+
+	if (reltype == OBJECT_PROPGRAPH && relkind != RELKIND_PROPGRAPH)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a property graph", rv->relname)));
 
 	if (reltype == OBJECT_INDEX && relkind != RELKIND_INDEX &&
 		relkind != RELKIND_PARTITIONED_INDEX
