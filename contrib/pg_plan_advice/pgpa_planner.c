@@ -90,6 +90,7 @@ typedef enum pgpa_jo_outcome
 
 typedef struct pgpa_planner_state
 {
+	MemoryContext mcxt;
 	bool		generate_advice_feedback;
 	bool		generate_advice_string;
 	pgpa_trove *trove;
@@ -324,10 +325,18 @@ pgpa_planner_setup(PlannerGlobal *glob, Query *parse, const char *query_string,
 	 * some purpose. That could be (1) recording that we will need to generate
 	 * an advice string, (2) storing a trove of supplied advice, or (3)
 	 * facilitating debugging cross-checks when asserts are enabled.
+	 *
+	 * Currently, the active memory context should be one that will last for
+	 * the entire duration of query planning, but if GEQO is in use, it's
+	 * possible that some of our callbacks may be invoked later with
+	 * CurrentMemoryContext set to some shorter-lived context. So, record the
+	 * context that should be used for allocations that need to live as long
+	 * as the pgpa_planner_state itself.
 	 */
 	if (needs_pps)
 	{
 		pps = palloc0_object(pgpa_planner_state);
+		pps->mcxt = CurrentMemoryContext;
 		pps->generate_advice_feedback = generate_advice_feedback;
 		pps->generate_advice_string = generate_advice_string;
 		pps->trove = trove;
@@ -616,11 +625,15 @@ pgpa_join_path_setup(PlannerInfo *root, RelOptInfo *joinrel,
 			/* If not a duplicate, append to the list. */
 			if (!found)
 			{
-				pgpa_sj_unique_rel *ur = palloc_object(pgpa_sj_unique_rel);
+				pgpa_sj_unique_rel *ur;
+				MemoryContext oldcontext;
 
+				oldcontext = MemoryContextSwitchTo(pps->mcxt);
+				ur = palloc_object(pgpa_sj_unique_rel);
 				ur->plan_name = root->plan_name;
-				ur->relids = uniquerel->relids;
+				ur->relids = bms_copy(uniquerel->relids);
 				pps->sj_unique_rels = lappend(pps->sj_unique_rels, ur);
+				MemoryContextSwitchTo(oldcontext);
 			}
 		}
 	}
@@ -996,7 +1009,7 @@ pgpa_planner_apply_join_path_advice(JoinType jointype, uint64 *pgs_mask_p,
 	Bitmapset  *jo_deny_rel_indexes = NULL;
 	Bitmapset  *jm_indexes = NULL;
 	bool		jm_conflict = false;
-	uint32		join_mask = 0;
+	uint64		join_mask = 0;
 	Bitmapset  *sj_permit_indexes = NULL;
 	Bitmapset  *sj_deny_indexes = NULL;
 
@@ -1048,7 +1061,7 @@ pgpa_planner_apply_join_path_advice(JoinType jointype, uint64 *pgs_mask_p,
 	while ((i = bms_next_member(pjs->join_indexes, i)) >= 0)
 	{
 		pgpa_trove_entry *entry = &pjs->join_entries[i];
-		uint32		my_join_mask;
+		uint64		my_join_mask;
 
 		/* Handle join order advice. */
 		if (entry->tag == PGPA_TAG_JOIN_ORDER)
