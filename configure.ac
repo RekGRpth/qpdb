@@ -1443,7 +1443,7 @@ if test "$with_ssl" = openssl ; then
   # Function introduced in OpenSSL 1.0.2, not in LibreSSL.
   AC_CHECK_FUNCS([SSL_CTX_set_cert_cb])
   # Function introduced in OpenSSL 1.1.1, not in LibreSSL.
-  AC_CHECK_FUNCS([X509_get_signature_info SSL_CTX_set_num_tickets SSL_CTX_set_keylog_callback])
+  AC_CHECK_FUNCS([X509_get_signature_info SSL_CTX_set_num_tickets SSL_CTX_set_keylog_callback SSL_CTX_set_client_hello_cb])
   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
 elif test "$with_ssl" != no ; then
   AC_MSG_ERROR([--with-ssl must specify openssl])
@@ -2026,6 +2026,14 @@ Could not execute a simple test program.  This may be a problem
 related to locating shared libraries.  Check the file 'config.log'
 for the exact reason.]])],
 [AC_MSG_RESULT([cross-compiling])])
+
+# These flags are supported in all C11-capable GCC/Clang versions,
+# so no capability test is needed.  Added here to avoid affecting configure probes,
+# particularly PGAC_PRINTF_ARCHETYPE which uses -Werror and would fail to detect
+# gnu_printf if -Wstrict-prototypes is active.
+if test "$GCC" = yes -a "$ICC" = no; then
+  CFLAGS="$CFLAGS -Wstrict-prototypes -Wold-style-definition"
+fi
 
 # --------------------
 # Run tests below here
