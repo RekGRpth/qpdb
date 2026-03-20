@@ -1240,7 +1240,7 @@ Copy_common_options, "DEFAULT", "FORCE_NOT_NULL", "FORCE_NULL", "FREEZE", \
 
 /* COPY TO options */
 #define Copy_to_options \
-Copy_common_options, "FORCE_QUOTE"
+Copy_common_options, "FORCE_QUOTE", "FORCE_ARRAY"
 
 /*
  * These object types were introduced later than our support cutoff of
@@ -2329,7 +2329,18 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH("TABLES IN SCHEMA", "TABLE");
 	/* ALTER PUBLICATION <name> SET */
 	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET"))
-		COMPLETE_WITH("(", "TABLES IN SCHEMA", "TABLE");
+		COMPLETE_WITH("(", "ALL SEQUENCES", "ALL TABLES", "TABLES IN SCHEMA", "TABLE");
+	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET", "ALL"))
+		COMPLETE_WITH("SEQUENCES", "TABLES");
+	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET", "ALL", "TABLES"))
+		COMPLETE_WITH("EXCEPT TABLE (");
+	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET", "ALL", "TABLES", "EXCEPT"))
+		COMPLETE_WITH("TABLE (");
+	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET", "ALL", "TABLES", "EXCEPT", "TABLE"))
+		COMPLETE_WITH("(");
+	/* Complete "ALTER PUBLICATION <name> FOR TABLE" with "<table>, ..." */
+	else if (Matches("ALTER", "PUBLICATION", MatchAny, "SET", "ALL", "TABLES", "EXCEPT", "TABLE", "("))
+		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables);
 	else if (Matches("ALTER", "PUBLICATION", MatchAny, "ADD|DROP|SET", "TABLES", "IN", "SCHEMA"))
 		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_schemas
 								 " AND nspname NOT LIKE E'pg\\\\_%%'",
@@ -3450,7 +3461,7 @@ match_previous_words(int pattern_id,
 
 			/* Complete COPY <sth> FROM|TO filename WITH (FORMAT */
 			else if (TailMatches("FORMAT"))
-				COMPLETE_WITH("binary", "csv", "text");
+				COMPLETE_WITH("binary", "csv", "text", "json");
 
 			/* Complete COPY <sth> FROM|TO filename WITH (FREEZE */
 			else if (TailMatches("FREEZE"))
