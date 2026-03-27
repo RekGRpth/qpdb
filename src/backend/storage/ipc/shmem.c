@@ -90,11 +90,15 @@
 typedef struct ShmemAllocatorData
 {
 	Size		free_offset;	/* offset to first free space from ShmemBase */
-	HASHHDR    *index;			/* location of ShmemIndex */
 
-	/* protects shared memory and LWLock allocation */
+	/* protects 'free_offset' */
 	slock_t		shmem_lock;
+
+	HASHHDR    *index;			/* location of ShmemIndex */
+	LWLock		index_lock;		/* protects ShmemIndex */
 } ShmemAllocatorData;
+
+#define ShmemIndexLock (&ShmemAllocator->index_lock)
 
 static void *ShmemAllocRaw(Size size, Size *allocated_size);
 
@@ -105,7 +109,6 @@ static void *ShmemBase;			/* start address of shared memory */
 static void *ShmemEnd;			/* end+1 address of shared memory */
 
 static ShmemAllocatorData *ShmemAllocator;
-slock_t    *ShmemLock;			/* points to ShmemAllocator->shmem_lock */
 static HTAB *ShmemIndex = NULL; /* primary index hashtable for shmem */
 
 /* To get reliable results for NUMA inquiry we need to "touch pages" once */
@@ -155,18 +158,18 @@ InitShmemAllocator(PGShmemHeader *seghdr)
 
 	/*
 	 * In postmaster or stand-alone backend, initialize the shared memory
-	 * allocator and the spinlock so that we can allocate shared memory for
-	 * ShmemIndex using ShmemAlloc().  In a regular backend just set up the
-	 * pointers required by ShmemAlloc().
+	 * allocator so that we can allocate shared memory for ShmemIndex using
+	 * ShmemAlloc().  In a regular backend just set up the pointers required
+	 * by ShmemAlloc().
 	 */
 	ShmemAllocator = (ShmemAllocatorData *) ((char *) seghdr + seghdr->content_offset);
 	if (!IsUnderPostmaster)
 	{
 		SpinLockInit(&ShmemAllocator->shmem_lock);
 		ShmemAllocator->free_offset = offset;
+		LWLockInitialize(&ShmemAllocator->index_lock, LWTRANCHE_SHMEM_INDEX);
 	}
 
-	ShmemLock = &ShmemAllocator->shmem_lock;
 	ShmemSegHdr = seghdr;
 	ShmemBase = seghdr;
 	ShmemEnd = (char *) ShmemBase + seghdr->totalsize;
@@ -200,7 +203,7 @@ InitShmemAllocator(PGShmemHeader *seghdr)
  *
  * Throws error if request cannot be satisfied.
  *
- * Assumes ShmemLock and ShmemSegHdr are initialized.
+ * Assumes ShmemSegHdr is initialized.
  */
 void *
 ShmemAlloc(Size size)
@@ -259,7 +262,7 @@ ShmemAllocRaw(Size size, Size *allocated_size)
 
 	Assert(ShmemSegHdr != NULL);
 
-	SpinLockAcquire(ShmemLock);
+	SpinLockAcquire(&ShmemAllocator->shmem_lock);
 
 	newStart = ShmemAllocator->free_offset;
 
@@ -272,7 +275,7 @@ ShmemAllocRaw(Size size, Size *allocated_size)
 	else
 		newSpace = NULL;
 
-	SpinLockRelease(ShmemLock);
+	SpinLockRelease(&ShmemAllocator->shmem_lock);
 
 	/* note this assert is okay with newSpace == NULL */
 	Assert(newSpace == (void *) CACHELINEALIGN(newSpace));
