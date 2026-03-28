@@ -1148,6 +1148,7 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 	BufferDesc *bufHdr;
 	bool		need_to_zero;
 	bool		isLocalBuf = BufferIsLocal(buffer);
+	StartBufferIOResult sbres;
 
 	Assert(mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
 
@@ -1159,24 +1160,30 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 		 */
 		need_to_zero = false;
 	}
-	else if (isLocalBuf)
-	{
-		/* Simple case for non-shared buffers. */
-		bufHdr = GetLocalBufferDescriptor(-buffer - 1);
-		need_to_zero = StartLocalBufferIO(bufHdr, true, false);
-	}
 	else
 	{
-		/*
-		 * Take BM_IO_IN_PROGRESS, or discover that BM_VALID has been set
-		 * concurrently.  Even though we aren't doing I/O, that ensures that
-		 * we don't zero a page that someone else has pinned.  An exclusive
-		 * content lock wouldn't be enough, because readers are allowed to
-		 * drop the content lock after determining that a tuple is visible
-		 * (see buffer access rules in README).
-		 */
-		bufHdr = GetBufferDescriptor(buffer - 1);
-		need_to_zero = StartBufferIO(bufHdr, true, false);
+		if (isLocalBuf)
+		{
+			/* Simple case for non-shared buffers. */
+			bufHdr = GetLocalBufferDescriptor(-buffer - 1);
+			sbres = StartLocalBufferIO(bufHdr, true, true, NULL);
+		}
+		else
+		{
+			/*
+			 * Take BM_IO_IN_PROGRESS, or discover that BM_VALID has been set
+			 * concurrently.  Even though we aren't doing I/O, that ensures
+			 * that we don't zero a page that someone else has pinned.  An
+			 * exclusive content lock wouldn't be enough, because readers are
+			 * allowed to drop the content lock after determining that a tuple
+			 * is visible (see buffer access rules in README).
+			 */
+			bufHdr = GetBufferDescriptor(buffer - 1);
+			sbres = StartSharedBufferIO(bufHdr, true, true, NULL);
+		}
+
+		Assert(sbres != BUFFER_IO_IN_PROGRESS);
+		need_to_zero = sbres == BUFFER_IO_READY_FOR_IO;
 	}
 
 	if (need_to_zero)
@@ -1659,45 +1666,6 @@ CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete)
 #endif
 }
 
-/* helper for ReadBuffersCanStartIO(), to avoid repetition */
-static inline bool
-ReadBuffersCanStartIOOnce(Buffer buffer, bool nowait)
-{
-	if (BufferIsLocal(buffer))
-		return StartLocalBufferIO(GetLocalBufferDescriptor(-buffer - 1),
-								  true, nowait);
-	else
-		return StartBufferIO(GetBufferDescriptor(buffer - 1), true, nowait);
-}
-
-/*
- * Helper for AsyncReadBuffers that tries to get the buffer ready for IO.
- */
-static inline bool
-ReadBuffersCanStartIO(Buffer buffer, bool nowait)
-{
-	/*
-	 * If this backend currently has staged IO, we need to submit the pending
-	 * IO before waiting for the right to issue IO, to avoid the potential for
-	 * deadlocks (and, more commonly, unnecessary delays for other backends).
-	 */
-	if (!nowait && pgaio_have_staged())
-	{
-		if (ReadBuffersCanStartIOOnce(buffer, true))
-			return true;
-
-		/*
-		 * Unfortunately StartBufferIO() returning false doesn't allow to
-		 * distinguish between the buffer already being valid and IO already
-		 * being in progress. Since IO already being in progress is quite
-		 * rare, this approach seems fine.
-		 */
-		pgaio_submit_staged();
-	}
-
-	return ReadBuffersCanStartIOOnce(buffer, nowait);
-}
-
 /*
  * We track various stats related to buffer hits. Because this is done in a
  * few separate places, this helper exists for convenience.
@@ -1832,8 +1800,11 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 			 * b) reports some time as waiting, even if we never waited
 			 *
 			 * we first check if we already know the IO is complete.
+			 *
+			 * Note that operation->io_return is uninitialized for foreign IO,
+			 * so we cannot use the cheaper PGAIO_RS_UNKNOWN pre-check.
 			 */
-			if (aio_ret->result.status == PGAIO_RS_UNKNOWN &&
+			if ((operation->foreign_io || aio_ret->result.status == PGAIO_RS_UNKNOWN) &&
 				!pgaio_wref_check_done(&operation->io_wref))
 			{
 				instr_time	io_start = pgstat_prepare_io_time(track_io_timing);
@@ -1852,11 +1823,45 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 				Assert(pgaio_wref_check_done(&operation->io_wref));
 			}
 
-			/*
-			 * We now are sure the IO completed. Check the results. This
-			 * includes reporting on errors if there were any.
-			 */
-			ProcessReadBuffersResult(operation);
+			if (unlikely(operation->foreign_io))
+			{
+				Buffer		buffer = operation->buffers[operation->nblocks_done];
+				BufferDesc *desc = BufferIsLocal(buffer) ?
+					GetLocalBufferDescriptor(-buffer - 1) :
+					GetBufferDescriptor(buffer - 1);
+				uint64		buf_state = pg_atomic_read_u64(&desc->state);
+
+				if (buf_state & BM_VALID)
+				{
+					BlockNumber blocknum = operation->blocknum + operation->nblocks_done;
+
+					operation->nblocks_done += 1;
+					Assert(operation->nblocks_done <= operation->nblocks);
+
+					/*
+					 * Track this as a 'hit' for this backend. The backend
+					 * performing the IO will track it as a 'read'.
+					 */
+					TrackBufferHit(io_object, io_context,
+								   operation->rel, operation->persistence,
+								   operation->smgr, operation->forknum,
+								   blocknum);
+				}
+
+				/*
+				 * If the foreign IO failed and left the buffer invalid,
+				 * nblocks_done is not incremented. The retry loop below will
+				 * call AsyncReadBuffers() which will attempt the IO itself.
+				 */
+			}
+			else
+			{
+				/*
+				 * We now are sure the IO completed. Check the results. This
+				 * includes reporting on errors if there were any.
+				 */
+				ProcessReadBuffersResult(operation);
+			}
 		}
 
 		/*
@@ -1902,7 +1907,8 @@ WaitReadBuffers(ReadBuffersOperation *operation)
  * affected by the call. If the first buffer is valid, *nblocks_progress is
  * set to 1 and operation->nblocks_done is incremented.
  *
- * Returns true if IO was initiated, false if no IO was necessary.
+ * Returns true if IO was initiated or is already in progress (foreign IO),
+ * false if the buffer was already valid.
  */
 static bool
 AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
@@ -1921,6 +1927,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	IOContext	io_context;
 	IOObject	io_object;
 	instr_time	io_start;
+	StartBufferIOResult status;
 
 	if (persistence == RELPERSISTENCE_TEMP)
 	{
@@ -1974,8 +1981,9 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	pgstat_prepare_report_checksum_failure(operation->smgr->smgr_rlocator.locator.dbOid);
 
 	/*
-	 * Get IO handle before ReadBuffersCanStartIO(), as pgaio_io_acquire()
-	 * might block, which we don't want after setting IO_IN_PROGRESS.
+	 * We must get an IO handle before StartBufferIO(), as pgaio_io_acquire()
+	 * might block, which we don't want after setting IO_IN_PROGRESS. If we
+	 * don't need to do the IO, we'll release the handle.
 	 *
 	 * If we need to wait for IO before we can get a handle, submit
 	 * already-staged IO first, so that other backends don't need to wait.
@@ -1997,38 +2005,70 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 		ioh = pgaio_io_acquire(CurrentResourceOwner, &operation->io_return);
 	}
 
+	operation->foreign_io = false;
+	pgaio_wref_clear(&operation->io_wref);
+
 	/*
-	 * Check if we can start IO on the first to-be-read buffer.
+	 * Try to start IO on the first buffer in a new run of blocks. If AIO is
+	 * in progress, be it in this backend or another backend, we just
+	 * associate the wait reference with the operation and wait in
+	 * WaitReadBuffers(). This turns out to be important for performance in
+	 * two workloads:
 	 *
-	 * If an I/O is already in progress in another backend, we want to wait
-	 * for the outcome: either done, or something went wrong and we will
-	 * retry.
+	 * 1) A read stream that has to read the same block multiple times within
+	 * the readahead distance. This can happen e.g. for the table accesses of
+	 * an index scan.
+	 *
+	 * 2) Concurrent scans by multiple backends on the same relation.
+	 *
+	 * If we were to synchronously wait for the in-progress IO, we'd not be
+	 * able to keep enough I/O in flight.
+	 *
+	 * If we do find there is ongoing I/O for the buffer, we set up a 1-block
+	 * ReadBuffersOperation that WaitReadBuffers then can wait on.
+	 *
+	 * It's possible that another backend has started IO on the buffer but not
+	 * yet set its wait reference. In this case, we have no choice but to wait
+	 * for either the wait reference to be valid or the IO to be done.
 	 */
-	if (!ReadBuffersCanStartIO(buffers[nblocks_done], false))
+	status = StartBufferIO(buffers[nblocks_done], true, true,
+						   &operation->io_wref);
+	if (status != BUFFER_IO_READY_FOR_IO)
 	{
-		/*
-		 * Someone else has already completed this block, we're done.
-		 *
-		 * When IO is necessary, ->nblocks_done is updated in
-		 * ProcessReadBuffersResult(), but that is not called if no IO is
-		 * necessary. Thus update here.
-		 */
-		operation->nblocks_done += 1;
-		*nblocks_progress = 1;
-
 		pgaio_io_release(ioh);
-		pgaio_wref_clear(&operation->io_wref);
+		*nblocks_progress = 1;
+		if (status == BUFFER_IO_ALREADY_DONE)
+		{
+			/*
+			 * Someone has already completed this block, we're done.
+			 *
+			 * When IO is necessary, ->nblocks_done is updated in
+			 * ProcessReadBuffersResult(), but that is not called if no IO is
+			 * necessary. Thus update here.
+			 */
+			operation->nblocks_done += 1;
+			Assert(operation->nblocks_done <= operation->nblocks);
 
-		/*
-		 * Report and track this as a 'hit' for this backend, even though it
-		 * must have started out as a miss in PinBufferForBlock(). The other
-		 * backend will track this as a 'read'.
-		 */
-		TrackBufferHit(io_object, io_context,
-					   operation->rel, operation->persistence,
-					   operation->smgr, operation->forknum,
-					   blocknum);
-		return false;
+			Assert(!pgaio_wref_valid(&operation->io_wref));
+
+			/*
+			 * Report and track this as a 'hit' for this backend, even though
+			 * it must have started out as a miss in PinBufferForBlock(). The
+			 * other backend will track this as a 'read'.
+			 */
+			TrackBufferHit(io_object, io_context,
+						   operation->rel, operation->persistence,
+						   operation->smgr, operation->forknum,
+						   blocknum);
+			return false;
+		}
+
+		/* The IO is already in-progress */
+		Assert(status == BUFFER_IO_IN_PROGRESS);
+		Assert(pgaio_wref_valid(&operation->io_wref));
+		operation->foreign_io = true;
+
+		return true;
 	}
 
 	Assert(io_buffers[0] == buffers[nblocks_done]);
@@ -2037,9 +2077,9 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 
 	/*
 	 * NB: As little code as possible should be added between the
-	 * ReadBuffersCanStartIO() above, the further ReadBuffersCanStartIO()s
-	 * below and the smgrstartreadv(), as some of the buffers are now marked
-	 * as IO_IN_PROGRESS and will thus cause other backends to wait.
+	 * StartBufferIO() above, the further StartBufferIO()s below and the
+	 * smgrstartreadv(), as some of the buffers are now marked as
+	 * IO_IN_PROGRESS and will thus cause other backends to wait.
 	 */
 
 	/*
@@ -2053,7 +2093,8 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 		Assert(BufferGetBlockNumber(buffers[i - 1]) ==
 			   BufferGetBlockNumber(buffers[i]) - 1);
 
-		if (!ReadBuffersCanStartIO(buffers[i], true))
+		status = StartBufferIO(buffers[i], true, false, NULL);
+		if (status != BUFFER_IO_READY_FOR_IO)
 			break;
 
 		Assert(io_buffers[io_buffers_len] == buffers[i]);
@@ -2561,8 +2602,7 @@ again:
 			XLogNeedsFlush(BufferGetLSN(buf_hdr)) &&
 			StrategyRejectBuffer(strategy, buf_hdr, from_ring))
 		{
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			UnpinBuffer(buf_hdr);
+			UnlockReleaseBuffer(buf);
 			goto again;
 		}
 
@@ -2893,16 +2933,23 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 * We *must* do smgr[zero]extend before succeeding, else the page
 			 * will not be reserved by the kernel, and the next P_NEW call
 			 * will decide to return the same page.  Clear the BM_VALID bit,
-			 * do StartBufferIO() and proceed.
+			 * do StartSharedBufferIO() and proceed.
 			 *
 			 * Loop to handle the very small possibility that someone re-sets
-			 * BM_VALID between our clearing it and StartBufferIO inspecting
-			 * it.
+			 * BM_VALID between our clearing it and StartSharedBufferIO
+			 * inspecting it.
 			 */
-			do
+			while (true)
 			{
+				StartBufferIOResult sbres;
+
 				pg_atomic_fetch_and_u64(&existing_hdr->state, ~BM_VALID);
-			} while (!StartBufferIO(existing_hdr, true, false));
+
+				sbres = StartSharedBufferIO(existing_hdr, true, true, NULL);
+
+				if (sbres != BUFFER_IO_ALREADY_DONE)
+					break;
+			}
 		}
 		else
 		{
@@ -2928,7 +2975,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			LWLockRelease(partition_lock);
 
 			/* XXX: could combine the locked operations in it with the above */
-			StartBufferIO(victim_buf_hdr, true, false);
+			StartSharedBufferIO(victim_buf_hdr, true, true, NULL);
 		}
 	}
 
@@ -4440,7 +4487,6 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
 	Block		bufBlock;
-	char	   *bufToWrite;
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
 		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
@@ -4450,7 +4496,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * someone else flushed the buffer before we could, so we need not do
 	 * anything.
 	 */
-	if (!StartBufferIO(buf, false, false))
+	if (StartSharedBufferIO(buf, false, true, NULL) == BUFFER_IO_ALREADY_DONE)
 		return;
 
 	/* Setup error traceback support for ereport() */
@@ -4503,22 +4549,15 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	bufBlock = BufHdrGetBlock(buf);
 
-	/*
-	 * Update page checksum if desired.  Since we have only shared lock on the
-	 * buffer, other processes might be updating hint bits in it, so we must
-	 * copy the page to private storage if we do checksumming.
-	 */
-	bufToWrite = PageSetChecksumCopy((Page) bufBlock, buf->tag.blockNum);
+	/* Update page checksum if desired. */
+	PageSetChecksum((Page) bufBlock, buf->tag.blockNum);
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
-	/*
-	 * bufToWrite is either the shared buffer or a copy, as appropriate.
-	 */
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
-			  bufToWrite,
+			  bufBlock,
 			  false);
 
 	/*
@@ -5538,13 +5577,65 @@ ReleaseBuffer(Buffer buffer)
 /*
  * UnlockReleaseBuffer -- release the content lock and pin on a buffer
  *
- * This is just a shorthand for a common combination.
+ * This is just a, more efficient, shorthand for a common combination.
  */
 void
 UnlockReleaseBuffer(Buffer buffer)
 {
-	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	ReleaseBuffer(buffer);
+	int			mode;
+	BufferDesc *buf;
+	PrivateRefCountEntry *ref;
+	uint64		sub;
+	uint64		lockstate;
+
+	Assert(BufferIsPinned(buffer));
+
+	if (BufferIsLocal(buffer))
+	{
+		UnpinLocalBuffer(buffer);
+		return;
+	}
+
+	ResourceOwnerForgetBuffer(CurrentResourceOwner, buffer);
+
+	buf = GetBufferDescriptor(buffer - 1);
+
+	mode = BufferLockDisownInternal(buffer, buf);
+
+	/* compute state modification for lock release */
+	sub = BufferLockReleaseSub(mode);
+
+	/* compute state modification for pin release */
+	ref = GetPrivateRefCountEntry(buffer, false);
+	Assert(ref != NULL);
+	Assert(ref->data.refcount > 0);
+	ref->data.refcount--;
+
+	/* no more backend local pins, reduce shared pin count */
+	if (likely(ref->data.refcount == 0))
+	{
+		/* See comment in UnpinBufferNoOwner() */
+		VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
+
+		sub |= BUF_REFCOUNT_ONE;
+		ForgetPrivateRefCountEntry(ref);
+	}
+
+	/* perform the lock and pin release in one atomic op */
+	lockstate = pg_atomic_sub_fetch_u64(&buf->state, sub);
+
+	/* wake up waiters for the lock */
+	BufferLockProcessRelease(buf, mode, lockstate);
+
+	/* wake up waiter for the pin release */
+	if (lockstate & BM_PIN_COUNT_WAITER)
+		WakePinCountWaiter(buf);
+
+	/*
+	 * Now okay to allow cancel/die interrupts again, which were held when the
+	 * lock was acquired.
+	 */
+	RESUME_INTERRUPTS();
 }
 
 /*
@@ -7029,6 +7120,13 @@ WaitIO(BufferDesc *buf)
 {
 	ConditionVariable *cv = BufferDescriptorGetIOCV(buf);
 
+	/*
+	 * Should never end up here with unsubmitted IO, as no AIO unaware code
+	 * may be used while in batch mode and AIO aware code needs to have
+	 * submitted all staged IO to avoid deadlocks & slowness.
+	 */
+	Assert(!pgaio_have_staged());
+
 	ConditionVariablePrepareToSleep(cv);
 	for (;;)
 	{
@@ -7081,30 +7179,46 @@ WaitIO(BufferDesc *buf)
 }
 
 /*
- * StartBufferIO: begin I/O on this buffer
+ * StartSharedBufferIO: begin I/O on this buffer
  *	(Assumptions)
- *	My process is executing no IO on this buffer
  *	The buffer is Pinned
  *
- * In some scenarios multiple backends could attempt the same I/O operation
- * concurrently.  If someone else has already started I/O on this buffer then
- * we will wait for completion of the IO using WaitIO().
+ * In several scenarios the buffer may already be undergoing I/O in this or
+ * another backend. How to best handle that depends on the caller's
+ * situation. It might be appropriate to wait synchronously (e.g., because the
+ * buffer is about to be invalidated); wait asynchronously, using the buffer's
+ * IO wait reference (e.g., because the caller is doing readahead and doesn't
+ * need the buffer to be ready immediately); or to not wait at all (e.g.,
+ * because the caller is trying to combine IO for this buffer with another
+ * buffer).
  *
- * Input operations are only attempted on buffers that are not BM_VALID,
- * and output operations only on buffers that are BM_VALID and BM_DIRTY,
- * so we can always tell if the work is already done.
+ * How and whether to wait is controlled by the wait and io_wref
+ * parameters. In detail:
  *
- * Returns true if we successfully marked the buffer as I/O busy,
- * false if someone else already did the work.
+ * - If the caller passes a non-NULL io_wref and the buffer has an I/O wait
+ *   reference, the *io_wref is set to the buffer's io_wref and
+ *   BUFFER_IO_IN_PROGRESS is returned. This is done regardless of the wait
+ *   parameter.
  *
- * If nowait is true, then we don't wait for an I/O to be finished by another
- * backend.  In that case, false indicates either that the I/O was already
- * finished, or is still in progress.  This is useful for callers that want to
- * find out if they can perform the I/O as part of a larger operation, without
- * waiting for the answer or distinguishing the reasons why not.
+ * - If the caller passes a NULL io_wref (i.e. the caller does not want to
+ *   asynchronously wait for the completion of the IO), wait = false and the
+ *   buffer is undergoing IO, BUFFER_IO_IN_PROGRESS is returned.
+ *
+ * - If wait = true and either the buffer does not have a wait reference,
+ *   or the caller passes io_wref = NULL, WaitIO() is used to wait for the IO
+ *   to complete.  To avoid the potential of deadlocks and unnecessary delays,
+ *   all staged I/O is submitted before waiting.
+ *
+ * Input operations are only attempted on buffers that are not BM_VALID, and
+ * output operations only on buffers that are BM_VALID and BM_DIRTY, so we can
+ * always tell if the work is already done.  If no I/O is necessary,
+ * BUFFER_IO_ALREADY_DONE is returned.
+ *
+ * If we successfully marked the buffer as BM_IO_IN_PROGRESS,
+ * BUFFER_IO_READY_FOR_IO is returned.
  */
-bool
-StartBufferIO(BufferDesc *buf, bool forInput, bool nowait)
+StartBufferIOResult
+StartSharedBufferIO(BufferDesc *buf, bool forInput, bool wait, PgAioWaitRef *io_wref)
 {
 	uint64		buf_state;
 
@@ -7116,10 +7230,42 @@ StartBufferIO(BufferDesc *buf, bool forInput, bool nowait)
 
 		if (!(buf_state & BM_IO_IN_PROGRESS))
 			break;
-		UnlockBufHdr(buf);
-		if (nowait)
-			return false;
-		WaitIO(buf);
+
+		/* Join the existing IO */
+		if (io_wref != NULL && pgaio_wref_valid(&buf->io_wref))
+		{
+			*io_wref = buf->io_wref;
+			UnlockBufHdr(buf);
+
+			return BUFFER_IO_IN_PROGRESS;
+		}
+		else if (!wait)
+		{
+			UnlockBufHdr(buf);
+			return BUFFER_IO_IN_PROGRESS;
+		}
+		else
+		{
+			/*
+			 * With wait = true, we always have to wait if the caller has
+			 * passed io_wref = NULL.
+			 *
+			 * Even with io_wref != NULL, we have to wait if the buffer's wait
+			 * ref is not valid but the IO is in progress, someone else
+			 * started IO but hasn't set the wait ref yet. We have no choice
+			 * but to wait until the IO completes.
+			 */
+			UnlockBufHdr(buf);
+
+			/*
+			 * If this backend currently has staged IO, submit it before
+			 * waiting for in-progress IO, to avoid potential deadlocks and
+			 * unnecessary delays.
+			 */
+			pgaio_submit_staged();
+
+			WaitIO(buf);
+		}
 	}
 
 	/* Once we get here, there is definitely no I/O active on this buffer */
@@ -7128,9 +7274,14 @@ StartBufferIO(BufferDesc *buf, bool forInput, bool nowait)
 	if (forInput ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY))
 	{
 		UnlockBufHdr(buf);
-		return false;
+		return BUFFER_IO_ALREADY_DONE;
 	}
 
+	/*
+	 * No IO in progress and not already done; we will start IO. It's possible
+	 * that the IO was in progress but we're not done, because the IO errored
+	 * out. We'll do the IO ourselves.
+	 */
 	UnlockBufHdrExt(buf, buf_state,
 					BM_IO_IN_PROGRESS, 0,
 					0);
@@ -7138,7 +7289,31 @@ StartBufferIO(BufferDesc *buf, bool forInput, bool nowait)
 	ResourceOwnerRememberBufferIO(CurrentResourceOwner,
 								  BufferDescriptorGetBuffer(buf));
 
-	return true;
+	return BUFFER_IO_READY_FOR_IO;
+}
+
+/*
+ * Wrapper around StartSharedBufferIO / StartLocalBufferIO. Only to be used
+ * when the caller doesn't otherwise need to care about local vs shared. See
+ * StartSharedBufferIO() for details.
+ */
+StartBufferIOResult
+StartBufferIO(Buffer buffer, bool forInput, bool wait, PgAioWaitRef *io_wref)
+{
+	BufferDesc *buf_hdr;
+
+	if (BufferIsLocal(buffer))
+	{
+		buf_hdr = GetLocalBufferDescriptor(-buffer - 1);
+
+		return StartLocalBufferIO(buf_hdr, forInput, wait, io_wref);
+	}
+	else
+	{
+		buf_hdr = GetBufferDescriptor(buffer - 1);
+
+		return StartSharedBufferIO(buf_hdr, forInput, wait, io_wref);
+	}
 }
 
 /*
