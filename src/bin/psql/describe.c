@@ -3676,21 +3676,18 @@ describeOneTableDetails(const char *schemaname,
 		else
 		{
 			const char *s = _("Inherits");
-			int			sw = pg_wcswidth(s, strlen(s), pset.encoding);
 
 			tuples = PQntuples(result);
 
+			if (tuples > 0)
+			{
+				printfPQExpBuffer(&buf, "%s:", s);
+				printTableAddFooter(&cont, buf.data);
+			}
+
 			for (i = 0; i < tuples; i++)
 			{
-				if (i == 0)
-					printfPQExpBuffer(&buf, "%s: %s",
-									  s, PQgetvalue(result, i, 0));
-				else
-					printfPQExpBuffer(&buf, "%*s  %s",
-									  sw, "", PQgetvalue(result, i, 0));
-				if (i < tuples - 1)
-					appendPQExpBufferChar(&buf, ',');
-
+				printfPQExpBuffer(&buf, "    %s", PQgetvalue(result, i, 0));
 				printTableAddFooter(&cont, buf.data);
 			}
 
@@ -3760,18 +3757,18 @@ describeOneTableDetails(const char *schemaname,
 		{
 			/* display the list of child tables */
 			const char *ct = is_partitioned ? _("Partitions") : _("Child tables");
-			int			ctw = pg_wcswidth(ct, strlen(ct), pset.encoding);
+
+			if (tuples > 0)
+			{
+				printfPQExpBuffer(&buf, "%s:", ct);
+				printTableAddFooter(&cont, buf.data);
+			}
 
 			for (i = 0; i < tuples; i++)
 			{
 				char		child_relkind = *PQgetvalue(result, i, 1);
 
-				if (i == 0)
-					printfPQExpBuffer(&buf, "%s: %s",
-									  ct, PQgetvalue(result, i, 0));
-				else
-					printfPQExpBuffer(&buf, "%*s  %s",
-									  ctw, "", PQgetvalue(result, i, 0));
+				printfPQExpBuffer(&buf, "    %s", PQgetvalue(result, i, 0));
 				if (!PQgetisnull(result, i, 3))
 					appendPQExpBuffer(&buf, " %s", PQgetvalue(result, i, 3));
 				if (child_relkind == RELKIND_PARTITIONED_TABLE ||
@@ -3781,8 +3778,6 @@ describeOneTableDetails(const char *schemaname,
 					appendPQExpBufferStr(&buf, ", FOREIGN");
 				if (strcmp(PQgetvalue(result, i, 2), "t") == 0)
 					appendPQExpBufferStr(&buf, " (DETACH PENDING)");
-				if (i < tuples - 1)
-					appendPQExpBufferChar(&buf, ',');
 
 				printTableAddFooter(&cont, buf.data);
 			}

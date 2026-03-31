@@ -43,6 +43,7 @@
 #define HEAP_PAGE_PRUNE_MARK_UNUSED_NOW		(1 << 0)
 #define HEAP_PAGE_PRUNE_FREEZE				(1 << 1)
 #define HEAP_PAGE_PRUNE_ALLOW_FAST_PATH		(1 << 2)
+#define HEAP_PAGE_PRUNE_SET_VM				(1 << 3)
 
 typedef struct BulkInsertStateData *BulkInsertState;
 typedef struct GlobalVisState GlobalVisState;
@@ -95,10 +96,7 @@ typedef struct HeapScanDescData
 	 */
 	ParallelBlockTableScanWorkerData *rs_parallelworkerdata;
 
-	/*
-	 * For sequential scans and bitmap heap scans. The current heap block's
-	 * corresponding page in the visibility map.
-	 */
+	/* Current heap block's corresponding page in the visibility map */
 	Buffer		rs_vmbuffer;
 
 	/* these fields only used in page-at-a-time mode and for bitmap scans */
@@ -379,9 +377,9 @@ extern void FreeBulkInsertState(BulkInsertState);
 extern void ReleaseBulkInsertStatePin(BulkInsertState bistate);
 
 extern void heap_insert(Relation relation, HeapTuple tup, CommandId cid,
-						int options, BulkInsertState bistate);
+						uint32 options, BulkInsertState bistate);
 extern void heap_multi_insert(Relation relation, TupleTableSlot **slots,
-							  int ntuples, CommandId cid, int options,
+							  int ntuples, CommandId cid, uint32 options,
 							  BulkInsertState bistate);
 extern TM_Result heap_delete(Relation relation, const ItemPointerData *tid,
 							 CommandId cid, Snapshot crosscheck, bool wait,
@@ -434,7 +432,7 @@ extern TransactionId heap_index_delete_tuples(Relation rel,
 
 /* in heap/pruneheap.c */
 extern void heap_page_prune_opt(Relation relation, Buffer buffer,
-								Buffer *vmbuffer);
+								Buffer *vmbuffer, bool rel_read_only);
 extern void heap_page_prune_and_freeze(PruneFreezeParams *params,
 									   PruneFreezeResult *presult,
 									   OffsetNumber *off_loc,

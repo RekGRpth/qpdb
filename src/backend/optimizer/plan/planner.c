@@ -341,7 +341,8 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	Path	   *best_path;
 	Plan	   *top_plan;
 	ListCell   *lp,
-			   *lr;
+			   *lr,
+			   *lc;
 
 	/*
 	 * Set up global state for this planner invocation.  This data is needed
@@ -656,11 +657,22 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 											  glob->prunableRelids);
 	result->permInfos = glob->finalrteperminfos;
 	result->subrtinfos = glob->subrtinfos;
-	result->resultRelations = glob->resultRelations;
 	result->appendRelations = glob->appendRelations;
 	result->subplans = glob->subplans;
 	result->rewindPlanIDs = glob->rewindPlanIDs;
 	result->rowMarks = glob->finalrowmarks;
+
+	/*
+	 * Compute resultRelationRelids and rowMarkRelids from resultRelations and
+	 * rowMarks. These can be used for cheap membership checks.
+	 */
+	foreach(lc, glob->resultRelations)
+		result->resultRelationRelids = bms_add_member(result->resultRelationRelids,
+													  lfirst_int(lc));
+	foreach(lc, glob->finalrowmarks)
+		result->rowMarkRelids = bms_add_member(result->rowMarkRelids,
+											   ((PlanRowMark *) lfirst(lc))->rti);
+
 	result->relationOids = glob->relationOids;
 	result->invalItems = glob->invalItems;
 	result->paramExecTypes = glob->paramExecTypes;
