@@ -150,7 +150,8 @@ typedef struct RI_CompareHashEntry RI_CompareHashEntry;
 /* Fast-path metadata for RI checks on foreign key referencing tables */
 typedef struct FastPathMeta
 {
-	RI_CompareHashEntry *compare_entries[RI_MAX_NUMKEYS];
+	FmgrInfo	eq_opr_finfo[RI_MAX_NUMKEYS];
+	FmgrInfo	cast_func_finfo[RI_MAX_NUMKEYS];
 	RegProcedure regops[RI_MAX_NUMKEYS];
 	Oid			subtypes[RI_MAX_NUMKEYS];
 	int			strats[RI_MAX_NUMKEYS];
@@ -2488,6 +2489,11 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 			riinfo->rootHashValue == hashvalue)
 		{
 			riinfo->valid = false;
+			if (riinfo->fpmeta)
+			{
+				pfree(riinfo->fpmeta);
+				riinfo->fpmeta = NULL;
+			}
 			/* Remove invalidated entries from the list, too */
 			dclist_delete_from(&ri_constraint_cache_valid_list, iter.cur);
 		}
@@ -2722,11 +2728,6 @@ ri_FastPathCheck(const RI_ConstraintInfo *riinfo,
 							   riinfo->nkeys, 0,
 							   SO_NONE);
 
-	if (riinfo->fpmeta == NULL)
-		ri_populate_fastpath_metadata((RI_ConstraintInfo *) riinfo,
-									  fk_rel, idx_rel);
-	Assert(riinfo->fpmeta);
-
 	GetUserIdAndSecContext(&saved_userid, &saved_sec_context);
 	SetUserIdAndSecContext(RelationGetForm(pk_rel)->relowner,
 						   saved_sec_context |
@@ -2734,6 +2735,14 @@ ri_FastPathCheck(const RI_ConstraintInfo *riinfo,
 						   SECURITY_NOFORCE_RLS);
 	ri_CheckPermissions(pk_rel);
 
+	if (riinfo->fpmeta == NULL)
+	{
+		/* Reload to ensure it's valid. */
+		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
+		ri_populate_fastpath_metadata((RI_ConstraintInfo *) riinfo,
+									  fk_rel, idx_rel);
+	}
+	Assert(riinfo->fpmeta);
 	ri_ExtractValues(fk_rel, newslot, riinfo, false, pk_vals, pk_nulls);
 	build_index_scankeys(riinfo, idx_rel, pk_vals, pk_nulls, skey);
 	found = ri_FastPathProbeOne(pk_rel, idx_rel, scandesc, slot,
@@ -2988,16 +2997,12 @@ build_index_scankeys(const RI_ConstraintInfo *riinfo,
 	 */
 	for (int i = 0; i < riinfo->nkeys; i++)
 	{
-		if (pk_nulls[i] != 'n')
-		{
-			RI_CompareHashEntry *entry = fpmeta->compare_entries[i];
-
-			if (OidIsValid(entry->cast_func_finfo.fn_oid))
-				pk_vals[i] = FunctionCall3(&entry->cast_func_finfo,
-										   pk_vals[i],
-										   Int32GetDatum(-1),	/* typmod */
-										   BoolGetDatum(false));	/* implicit coercion */
-		}
+		if (pk_nulls[i] != 'n' &&
+			OidIsValid(fpmeta->cast_func_finfo[i].fn_oid))
+			pk_vals[i] = FunctionCall3(&fpmeta->cast_func_finfo[i],
+									   pk_vals[i],
+									   Int32GetDatum(-1),	/* typmod */
+									   BoolGetDatum(false));	/* implicit coercion */
 	}
 
 	/*
@@ -3040,7 +3045,10 @@ ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
 		Oid			lefttype;
 		RI_CompareHashEntry *entry = ri_HashCompareOp(eq_opr, typeid);
 
-		fpmeta->compare_entries[i] = entry;
+		fmgr_info_copy(&fpmeta->cast_func_finfo[i], &entry->cast_func_finfo,
+					   CurrentMemoryContext);
+		fmgr_info_copy(&fpmeta->eq_opr_finfo[i], &entry->eq_opr_finfo,
+					   CurrentMemoryContext);
 		fpmeta->regops[i] = get_opcode(eq_opr);
 
 		get_op_opfamily_properties(eq_opr,
