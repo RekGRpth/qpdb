@@ -464,7 +464,6 @@ LockManagerShmemInit(void)
 
 	LockMethodLockHash = ShmemInitHash("LOCK hash",
 									   max_table_size,
-									   max_table_size,
 									   &info,
 									   HASH_ELEM | HASH_BLOBS |
 									   HASH_PARTITION | HASH_FIXED_SIZE);
@@ -482,7 +481,6 @@ LockManagerShmemInit(void)
 	info.num_partitions = NUM_LOCK_PARTITIONS;
 
 	LockMethodProcLockHash = ShmemInitHash("PROCLOCK hash",
-										   max_table_size,
 										   max_table_size,
 										   &info,
 										   HASH_ELEM | HASH_FUNCTION |
@@ -3776,6 +3774,9 @@ LockManagerShmemSize(void)
 	/* proclock hash table */
 	max_table_size *= 2;
 	size = add_size(size, hash_estimate_size(max_table_size, sizeof(PROCLOCK)));
+
+	/* fast-path structures */
+	size = add_size(size, sizeof(FastPathStrongRelationLockData));
 
 	return size;
 }

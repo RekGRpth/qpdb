@@ -21,7 +21,6 @@
 #ifndef SHMEM_H
 #define SHMEM_H
 
-#include "storage/spin.h"
 #include "utils/hsearch.h"
 
 
@@ -32,7 +31,7 @@ extern void InitShmemAllocator(PGShmemHeader *seghdr);
 extern void *ShmemAlloc(Size size);
 extern void *ShmemAllocNoError(Size size);
 extern bool ShmemAddrIsValid(const void *addr);
-extern HTAB *ShmemInitHash(const char *name, int64 init_size, int64 max_size,
+extern HTAB *ShmemInitHash(const char *name, int64 nelems,
 						   HASHCTL *infoP, int hash_flags);
 extern void *ShmemInitStruct(const char *name, Size size, bool *foundPtr);
 extern Size add_size(Size s1, Size s2);
@@ -46,8 +45,8 @@ extern void RequestAddinShmemSpace(Size size);
 /* size constants for the shmem index table */
  /* max size of data structure string name */
 #define SHMEM_INDEX_KEYSIZE		 (48)
- /* estimated size of the shmem index table (not a hard limit) */
-#define SHMEM_INDEX_SIZE		 (64)
+ /* max number of named shmem structures and hash tables */
+#define SHMEM_INDEX_SIZE		 (256)
 
 /* this is a hash bucket in the shmem index table */
 typedef struct

@@ -115,10 +115,12 @@
  * a whole lot of records per bucket or performance goes down.
  *
  * In a hash table allocated in shared memory, the directory cannot be
- * expanded because it must stay at a fixed address.  The directory size
- * should be selected using hash_select_dirsize (and you'd better have
- * a good idea of the maximum number of entries!).  For non-shared hash
- * tables, the initial directory size can be left at the default.
+ * expanded because it must stay at a fixed address.  The directory size is
+ * chosen at creation based on the initial number of elements, so even though
+ * we support allocating more elements later, performance will suffer if the
+ * table grows much beyond the initial size.  (Currently, shared memory hash
+ * tables are only created by ShmemInitHash() though, which doesn't support
+ * growing at all.)
  */
 #define HASH_SEGSIZE			   256
 #define HASH_SEGSIZE_SHIFT	   8	/* must be log2(HASH_SEGSIZE) */
@@ -194,6 +196,9 @@ struct HASHHDR
 	int64		max_dsize;		/* 'dsize' limit if directory is fixed size */
 	int			nelem_alloc;	/* number of entries to allocate at once */
 	bool		isfixed;		/* if true, don't enlarge */
+
+	/* Current directory.  In shared tables, this doesn't change */
+	HASHSEGMENT *dir;
 
 #ifdef HASH_STATISTICS
 
@@ -374,6 +379,8 @@ hash_create(const char *tabname, int64 nelem, const HASHCTL *info, int flags)
 	 * hash_destroy very simple.  The memory context is made a child of either
 	 * a context specified by the caller, or TopMemoryContext if nothing is
 	 * specified.
+	 *
+	 * Note that HASH_ALLOC had better be set as well.
 	 */
 	if (flags & HASH_SHARED_MEM)
 	{
@@ -485,22 +492,19 @@ hash_create(const char *tabname, int64 nelem, const HASHCTL *info, int flags)
 
 	if (flags & HASH_SHARED_MEM)
 	{
-		/*
-		 * ctl structure and directory are preallocated for shared memory
-		 * tables.  Note that HASH_DIRSIZE and HASH_ALLOC had better be set as
-		 * well.
-		 */
-		hashp->hctl = info->hctl;
-		hashp->dir = (HASHSEGMENT *) (((char *) info->hctl) + sizeof(HASHHDR));
 		hashp->hcxt = NULL;
 		hashp->isshared = true;
 
 		/* hash table already exists, we're just attaching to it */
 		if (flags & HASH_ATTACH)
 		{
+			/* Caller must pass the pointer to the shared header */
+			Assert(info->hctl);
+			hashp->hctl = info->hctl;
+
 			/* make local copies of some heavily-used values */
-			hctl = hashp->hctl;
-			hashp->keysize = hctl->keysize;
+			hashp->dir = info->hctl->dir;
+			hashp->keysize = info->hctl->keysize;
 
 			return hashp;
 		}
@@ -514,14 +518,20 @@ hash_create(const char *tabname, int64 nelem, const HASHCTL *info, int flags)
 		hashp->isshared = false;
 	}
 
+	/*
+	 * Allocate the header structure.
+	 *
+	 * XXX: In case of a shared memory hash table, other processes need the
+	 * pointer to the header to re-find the hash table.  There is currently no
+	 * explicit way to pass it back from here, the caller relies on the fact
+	 * that this is the first allocation made with the alloc function.  That's
+	 * a little ugly, but works for now.
+	 */
+	hashp->hctl = (HASHHDR *) hashp->alloc(sizeof(HASHHDR), hashp->alloc_arg);
 	if (!hashp->hctl)
-	{
-		hashp->hctl = (HASHHDR *) hashp->alloc(sizeof(HASHHDR), hashp->alloc_arg);
-		if (!hashp->hctl)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-	}
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
 
 	hashp->frozen = false;
 
@@ -542,15 +552,6 @@ hash_create(const char *tabname, int64 nelem, const HASHCTL *info, int flags)
 		Assert(info->num_partitions == next_pow2_int(info->num_partitions));
 
 		hctl->num_partitions = info->num_partitions;
-	}
-
-	/*
-	 * SHM hash tables have fixed directory size passed by the caller.
-	 */
-	if (flags & HASH_DIRSIZE)
-	{
-		hctl->max_dsize = info->max_dsize;
-		hctl->dsize = info->dsize;
 	}
 
 	/* remember the entry sizes, too */
@@ -630,9 +631,6 @@ hdefault(HTAB *hashp)
 	HASHHDR    *hctl = hashp->hctl;
 
 	MemSet(hctl, 0, sizeof(HASHHDR));
-
-	hctl->dsize = DEF_DIRSIZE;
-	hctl->nsegs = 0;
 
 	hctl->num_partitions = 0;	/* not partitioned */
 
@@ -724,25 +722,20 @@ init_htab(HTAB *hashp, int64 nelem)
 	nsegs = next_pow2_int(nsegs);
 
 	/*
-	 * Make sure directory is big enough. If pre-allocated directory is too
-	 * small, choke (caller screwed up).
+	 * Make sure directory is big enough.
 	 */
-	if (nsegs > hctl->dsize)
-	{
-		if (!(hashp->dir))
-			hctl->dsize = nsegs;
-		else
-			return false;
-	}
+	hctl->dsize = Max(DEF_DIRSIZE, nsegs);
+
+	/* SHM hash tables have a fixed directory. */
+	if (hashp->isshared)
+		hctl->max_dsize = hctl->dsize;
 
 	/* Allocate a directory */
-	if (!(hashp->dir))
-	{
-		hashp->dir = (HASHSEGMENT *)
-			hashp->alloc(hctl->dsize * sizeof(HASHSEGMENT), hashp->alloc_arg);
-		if (!hashp->dir)
-			return false;
-	}
+	hctl->dir = (HASHSEGMENT *)
+		hashp->alloc(hctl->dsize * sizeof(HASHSEGMENT), hashp->alloc_arg);
+	if (!hctl->dir)
+		return false;
+	hashp->dir = hctl->dir;
 
 	/* Allocate initial segments */
 	for (segp = hashp->dir; hctl->nsegs < nsegs; hctl->nsegs++, segp++)
@@ -781,9 +774,7 @@ hash_estimate_size(int64 num_entries, Size entrysize)
 	/* # of segments needed for nBuckets */
 	nSegments = next_pow2_int64((nBuckets - 1) / HASH_SEGSIZE + 1);
 	/* directory entries */
-	nDirEntries = DEF_DIRSIZE;
-	while (nDirEntries < nSegments)
-		nDirEntries <<= 1;		/* dir_alloc doubles dsize at each call */
+	nDirEntries = Max(DEF_DIRSIZE, nSegments);
 
 	/* fixed control info */
 	size = MAXALIGN(sizeof(HASHHDR));	/* but not HTAB, per above */
@@ -801,47 +792,6 @@ hash_estimate_size(int64 num_entries, Size entrysize)
 							 mul_size(elementAllocCnt, elementSize)));
 
 	return size;
-}
-
-/*
- * Select an appropriate directory size for a hashtable with the given
- * maximum number of entries.
- * This is only needed for hashtables in shared memory, whose directories
- * cannot be expanded dynamically.
- * NB: assumes that all hash structure parameters have default values!
- *
- * XXX this had better agree with the behavior of init_htab()...
- */
-int64
-hash_select_dirsize(int64 num_entries)
-{
-	int64		nBuckets,
-				nSegments,
-				nDirEntries;
-
-	/* estimate number of buckets wanted */
-	nBuckets = next_pow2_int64(num_entries);
-	/* # of segments needed for nBuckets */
-	nSegments = next_pow2_int64((nBuckets - 1) / HASH_SEGSIZE + 1);
-	/* directory entries */
-	nDirEntries = DEF_DIRSIZE;
-	while (nDirEntries < nSegments)
-		nDirEntries <<= 1;		/* dir_alloc doubles dsize at each call */
-
-	return nDirEntries;
-}
-
-/*
- * Compute the required initial memory allocation for a shared-memory
- * hashtable with the given parameters.  We need space for the HASHHDR
- * and for the (non expansible) directory.
- */
-Size
-hash_get_shared_size(HASHCTL *info, int flags)
-{
-	Assert(flags & HASH_DIRSIZE);
-	Assert(info->dsize == info->max_dsize);
-	return sizeof(HASHHDR) + info->dsize * sizeof(HASHSEGMENT);
 }
 
 
@@ -1647,6 +1597,7 @@ dir_realloc(HTAB *hashp)
 	{
 		memcpy(p, old_p, old_dirsize);
 		MemSet(((char *) p) + old_dirsize, 0, new_dirsize - old_dirsize);
+		hashp->hctl->dir = p;
 		hashp->dir = p;
 		hashp->hctl->dsize = new_dsize;
 

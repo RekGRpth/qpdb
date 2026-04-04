@@ -2495,6 +2495,33 @@ endif
 
 
 ###############################################################
+# Check if the compiler supports AVX2 as a target
+# There is deliberately not a guard for __has_attribute here
+###############################################################
+
+if host_cpu == 'x86_64'
+
+  prog = '''
+__attribute__((target("avx2")))
+static int avx2_test(void)
+{
+    return 0;
+}
+
+int main(void)
+{
+    return avx2_test();
+}
+'''
+
+  if cc.links(prog, name: 'AVX2 support', args: test_c_args)
+    cdata.set('USE_AVX2_WITH_RUNTIME_CHECK', 1)
+  endif
+
+endif
+
+
+###############################################################
 # Check for the availability of AVX-512 popcount intrinsics.
 ###############################################################
 
@@ -2718,6 +2745,39 @@ int main(void)
     cdata.set('USE_ARMV8_CRC32C', false)
     cdata.set('USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK', 1)
     have_optimized_crc = true
+  endif
+
+    # Check if the compiler supports Arm CRYPTO PMULL (carryless multiplication)
+    # instructions used for vectorized CRC.
+    prog = '''
+#include <arm_acle.h>
+#include <arm_neon.h>
+uint64x2_t	a;
+uint64x2_t	b;
+uint64x2_t	c;
+
+#if defined(__has_attribute) && __has_attribute (target)
+__attribute__((target("+crypto")))
+#endif
+int main(void)
+{
+    uint64x2_t	r1;
+    uint64x2_t	r2;
+
+	__asm("pmull  %0.1q, %2.1d, %3.1d\neor %0.16b, %0.16b, %1.16b\n":"=w"(r1), "+w"(c):"w"(a), "w"(b));
+	__asm("pmull2 %0.1q, %2.2d, %3.2d\neor %0.16b, %0.16b, %1.16b\n":"=w"(r2), "+w"(c):"w"(a), "w"(b));
+
+	r1 = veorq_u64(r1, r2);
+	/* return computed value, to prevent the above being optimized away */
+	return (int) vgetq_lane_u64(r1, 0);
+}
+'''
+
+  if cc.links(prog,
+      name: 'CRYPTO CRC32C',
+      args: test_c_args)
+    # Use ARM CRYPTO Extension, with runtime check
+    cdata.set('USE_PMULL_CRC32C_WITH_RUNTIME_CHECK', 1)
   endif
 
 elif host_cpu == 'loongarch64'
