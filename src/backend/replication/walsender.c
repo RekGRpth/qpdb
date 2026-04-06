@@ -35,6 +35,8 @@
  * checkpoint finishes, the postmaster sends us SIGUSR2. This instructs
  * walsender to send any outstanding WAL, including the shutdown checkpoint
  * record, wait for it to be replicated to the standby, and then exit.
+ * This waiting time can be limited by the wal_sender_shutdown_timeout
+ * parameter.
  *
  *
  * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
@@ -86,6 +88,7 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/subsystems.h"
 #include "tcop/dest.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
@@ -117,6 +120,14 @@
 /* Array of WalSnds in shared memory */
 WalSndCtlData *WalSndCtl = NULL;
 
+static void WalSndShmemRequest(void *arg);
+static void WalSndShmemInit(void *arg);
+
+const ShmemCallbacks WalSndShmemCallbacks = {
+	.request_fn = WalSndShmemRequest,
+	.init_fn = WalSndShmemInit,
+};
+
 /* My slot in the shared memory array */
 WalSnd	   *MyWalSnd = NULL;
 
@@ -131,6 +142,11 @@ int			max_wal_senders = 10;	/* the maximum number of concurrent
 									 * walsenders */
 int			wal_sender_timeout = 60 * 1000; /* maximum time to send one WAL
 											 * data message */
+
+int			wal_sender_shutdown_timeout = -1;	/* maximum time to wait during
+												 * shutdown for WAL
+												 * replication */
+
 bool		log_replication_commands = false;
 
 /*
@@ -189,6 +205,9 @@ static TimestampTz last_reply_timestamp = 0;
 
 /* Have we sent a heartbeat message asking for reply, since last reply? */
 static bool waiting_for_ping_response = false;
+
+/* Timestamp when walsender received the shutdown request */
+static TimestampTz shutdown_request_timestamp = 0;
 
 /*
  * While streaming WAL in Copy mode, streamingDoneSending is set to true
@@ -263,6 +282,7 @@ static void WalSndKill(int code, Datum arg);
 pg_noreturn static void WalSndShutdown(void);
 static void XLogSendPhysical(void);
 static void XLogSendLogical(void);
+pg_noreturn static void WalSndDoneImmediate(void);
 static void WalSndDone(WalSndSendDataCallback send_data);
 static void IdentifySystem(void);
 static void UploadManifest(void);
@@ -282,6 +302,7 @@ static void ProcessPendingWrites(void);
 static void WalSndKeepalive(bool requestReply, XLogRecPtr writePtr);
 static void WalSndKeepaliveIfNecessary(void);
 static void WalSndCheckTimeOut(void);
+static void WalSndCheckShutdownTimeout(void);
 static long WalSndComputeSleeptime(TimestampTz now);
 static void WalSndWait(uint32 socket_events, long timeout, uint32 wait_event);
 static void WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
@@ -1660,6 +1681,13 @@ ProcessPendingWrites(void)
 		/* die if timeout was reached */
 		WalSndCheckTimeOut();
 
+		/*
+		 * During shutdown, die if the shutdown timeout expires. Call this
+		 * before WalSndComputeSleeptime() so the timeout is considered when
+		 * computing sleep time.
+		 */
+		WalSndCheckShutdownTimeout();
+
 		/* Send keepalive if the time has come */
 		WalSndKeepaliveIfNecessary();
 
@@ -1974,6 +2002,13 @@ WalSndWaitForWal(XLogRecPtr loc)
 
 		/* die if timeout was reached */
 		WalSndCheckTimeOut();
+
+		/*
+		 * During shutdown, die if the shutdown timeout expires. Call this
+		 * before WalSndComputeSleeptime() so the timeout is considered when
+		 * computing sleep time.
+		 */
+		WalSndCheckShutdownTimeout();
 
 		/* Send keepalive if the time has come */
 		WalSndKeepaliveIfNecessary();
@@ -2834,16 +2869,18 @@ ProcessStandbyPSRequestMessage(void)
  * If wal_sender_timeout is enabled we want to wake up in time to send
  * keepalives and to abort the connection if wal_sender_timeout has been
  * reached.
+ *
+ * If wal_sender_shutdown_timeout is enabled, during shutdown, we want to
+ * wake up in time to exit when it expires.
  */
 static long
 WalSndComputeSleeptime(TimestampTz now)
 {
+	TimestampTz wakeup_time;
 	long		sleeptime = 10000;	/* 10 s */
 
 	if (wal_sender_timeout > 0 && last_reply_timestamp > 0)
 	{
-		TimestampTz wakeup_time;
-
 		/*
 		 * At the latest stop sleeping once wal_sender_timeout has been
 		 * reached.
@@ -2862,6 +2899,20 @@ WalSndComputeSleeptime(TimestampTz now)
 
 		/* Compute relative time until wakeup. */
 		sleeptime = TimestampDifferenceMilliseconds(now, wakeup_time);
+	}
+
+	if (shutdown_request_timestamp != 0 && wal_sender_shutdown_timeout > 0)
+	{
+		long		shutdown_sleeptime;
+
+		wakeup_time = TimestampTzPlusMilliseconds(shutdown_request_timestamp,
+												  wal_sender_shutdown_timeout);
+
+		shutdown_sleeptime = TimestampDifferenceMilliseconds(now, wakeup_time);
+
+		/* Choose the earliest wakeup. */
+		if (shutdown_sleeptime < sleeptime)
+			sleeptime = shutdown_sleeptime;
 	}
 
 	return sleeptime;
@@ -2903,6 +2954,45 @@ WalSndCheckTimeOut(void)
 
 		WalSndShutdown();
 	}
+}
+
+/*
+ * Check whether the walsender process should terminate due to the expiration
+ * of wal_sender_shutdown_timeout after the receipt of a shutdown request.
+ */
+static void
+WalSndCheckShutdownTimeout(void)
+{
+	TimestampTz now;
+
+	/* Do nothing if shutdown has not been requested yet */
+	if (!(got_STOPPING || got_SIGUSR2))
+		return;
+
+	/* Terminate immediately if the timeout is set to 0 */
+	if (wal_sender_shutdown_timeout == 0)
+		WalSndDoneImmediate();
+
+	/*
+	 * Record the shutdown request timestamp even if
+	 * wal_sender_shutdown_timeout is disabled (-1), since the setting may
+	 * change during shutdown and the timestamp will be needed in that case.
+	 */
+	if (shutdown_request_timestamp == 0)
+	{
+		shutdown_request_timestamp = GetCurrentTimestamp();
+		return;
+	}
+
+	/* Do not check the timeout if it's disabled */
+	if (wal_sender_shutdown_timeout == -1)
+		return;
+
+	/* Terminate immediately if the timeout expires */
+	now = GetCurrentTimestamp();
+	if (TimestampDifferenceExceeds(shutdown_request_timestamp, now,
+								   wal_sender_shutdown_timeout))
+		WalSndDoneImmediate();
 }
 
 /* Main loop of walsender process that streams the WAL over Copy messages. */
@@ -2991,6 +3081,13 @@ WalSndLoop(WalSndSendDataCallback send_data)
 
 		/* Check for replication timeout. */
 		WalSndCheckTimeOut();
+
+		/*
+		 * During shutdown, die if the shutdown timeout expires. Call this
+		 * before WalSndComputeSleeptime() so the timeout is considered when
+		 * computing sleep time.
+		 */
+		WalSndCheckShutdownTimeout();
 
 		/* Send keepalive if the time has come */
 		WalSndKeepaliveIfNecessary();
@@ -3608,6 +3705,49 @@ XLogSendLogical(void)
 }
 
 /*
+ * Forced shutdown of walsender if wal_sender_shutdown_timeout has expired.
+ */
+static void
+WalSndDoneImmediate(void)
+{
+	WalSndState state = MyWalSnd->state;
+
+	if (state == WALSNDSTATE_CATCHUP ||
+		state == WALSNDSTATE_STREAMING ||
+		state == WALSNDSTATE_STOPPING)
+	{
+		QueryCompletion qc;
+
+		/* Try to inform receiver that XLOG streaming is done */
+		SetQueryCompletion(&qc, CMDTAG_COPY, 0);
+		EndCommand(&qc, DestRemote, false);
+
+		/*
+		 * Note that the output buffer may be full during the forced shutdown
+		 * of walsender. If pq_flush() is called at that time, the walsender
+		 * process will be stuck. Therefore, call pq_flush_if_writable()
+		 * instead. Successful reception of the done message with the
+		 * walsender forced into a shutdown is not guaranteed.
+		 */
+		pq_flush_if_writable();
+	}
+
+	/*
+	 * Prevent ereport from attempting to send any more messages to the
+	 * standby. Otherwise, it can cause the process to get stuck if the output
+	 * buffers are full.
+	 */
+	if (whereToSendOutput == DestRemote)
+		whereToSendOutput = DestNone;
+
+	ereport(WARNING,
+			(errmsg("terminating walsender process due to replication shutdown timeout"),
+			 errdetail("Walsender process might have been terminated before all WAL data was replicated to the receiver.")));
+
+	proc_exit(0);
+}
+
+/*
  * Shutdown if the sender is caught up.
  *
  * NB: This should only be called when the shutdown signal has been received
@@ -3765,47 +3905,37 @@ WalSndSignals(void)
 	pqsignal(SIGCHLD, SIG_DFL);
 }
 
-/* Report shared-memory space needed by WalSndShmemInit */
-Size
-WalSndShmemSize(void)
+/* Register shared-memory space needed by walsender */
+static void
+WalSndShmemRequest(void *arg)
 {
-	Size		size = 0;
+	Size		size;
 
 	size = offsetof(WalSndCtlData, walsnds);
 	size = add_size(size, mul_size(max_wal_senders, sizeof(WalSnd)));
-
-	return size;
+	ShmemRequestStruct(.name = "Wal Sender Ctl",
+					   .size = size,
+					   .ptr = (void **) &WalSndCtl,
+		);
 }
 
-/* Allocate and initialize walsender-related shared memory */
-void
-WalSndShmemInit(void)
+/* Initialize walsender-related shared memory */
+static void
+WalSndShmemInit(void *arg)
 {
-	bool		found;
-	int			i;
+	for (int i = 0; i < NUM_SYNC_REP_WAIT_MODE; i++)
+		dlist_init(&(WalSndCtl->SyncRepQueue[i]));
 
-	WalSndCtl = (WalSndCtlData *)
-		ShmemInitStruct("Wal Sender Ctl", WalSndShmemSize(), &found);
-
-	if (!found)
+	for (int i = 0; i < max_wal_senders; i++)
 	{
-		/* First time through, so initialize */
-		MemSet(WalSndCtl, 0, WalSndShmemSize());
+		WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
 
-		for (i = 0; i < NUM_SYNC_REP_WAIT_MODE; i++)
-			dlist_init(&(WalSndCtl->SyncRepQueue[i]));
-
-		for (i = 0; i < max_wal_senders; i++)
-		{
-			WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
-
-			SpinLockInit(&walsnd->mutex);
-		}
-
-		ConditionVariableInit(&WalSndCtl->wal_flush_cv);
-		ConditionVariableInit(&WalSndCtl->wal_replay_cv);
-		ConditionVariableInit(&WalSndCtl->wal_confirm_rcv_cv);
+		SpinLockInit(&walsnd->mutex);
 	}
+
+	ConditionVariableInit(&WalSndCtl->wal_flush_cv);
+	ConditionVariableInit(&WalSndCtl->wal_replay_cv);
+	ConditionVariableInit(&WalSndCtl->wal_confirm_rcv_cv);
 }
 
 /*

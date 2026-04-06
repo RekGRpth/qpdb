@@ -585,7 +585,6 @@ CreateRangeStmt
 CreateReplicationSlotCmd
 CreateRoleStmt
 CreateSchemaStmt
-CreateSchemaStmtContext
 CreateSeqStmt
 CreateStatsStmt
 CreateStmt
@@ -1824,6 +1823,7 @@ NextSampleBlock_function
 NextSampleTuple_function
 NextValueExpr
 Node
+NodeInstrumentation
 NodeTag
 NonEmptyRange
 NoneCompressorState
@@ -2111,6 +2111,7 @@ PVIndStats
 PVIndVacStatus
 PVOID
 PVShared
+PVSharedCostParams
 PVWorkerUsage
 PVWorkerStats
 PX_Alias
@@ -2865,9 +2866,14 @@ SharedTypmodTableEntry
 Sharedsort
 ShellTypeInfo
 ShippableCacheEntry
-ShmemAllocatorData
 ShippableCacheKey
+ShmemAllocatorData
+ShmemCallbacks
 ShmemIndexEnt
+ShmemHashOpts
+ShmemRequest
+ShmemRequestKind
+ShmemStructOpts
 ShutdownForeignScan_function
 ShutdownInformation
 ShutdownMode
@@ -2896,9 +2902,9 @@ SlotInvalidationCauseMap
 SlotNumber
 SlotSyncCtxStruct
 SlotSyncSkipReason
-SlruCtl
-SlruCtlData
+SlruDesc
 SlruErrorCause
+SlruOpts
 SlruPageStatus
 SlruScanCallback
 SlruSegState
@@ -3141,6 +3147,7 @@ TestDSMRegistryHashEntry
 TestDSMRegistryStruct
 TestDecodingData
 TestDecodingTxnData
+TestShmemData
 TestSpec
 TestValueType
 TextFreq
@@ -3215,6 +3222,7 @@ TriggerDesc
 TriggerEvent
 TriggerFlags
 TriggerInfo
+TriggerInstrumentation
 TriggerTransition
 TruncateStmt
 TsmRoutine
@@ -3437,9 +3445,9 @@ WorkTableScan
 WorkTableScanState
 WorkerInfo
 WorkerInfoData
-WorkerInstrumentation
 WorkerJobDumpPtrType
 WorkerJobRestorePtrType
+WorkerNodeInstrumentation
 Working_State
 WriteBufPtrType
 WriteBytePtrType
@@ -3577,6 +3585,8 @@ astreamer_verify
 astreamer_waldump
 astreamer_zstd_frame
 auth_password_hook_typ
+auto_explain_extension_options
+auto_explain_option
 autovac_table
 av_relation
 avc_cache
@@ -4069,6 +4079,12 @@ pgpa_trove_lookup_type
 pgpa_trove_result
 pgpa_trove_slice
 pgpa_unrolled_join
+pgsa_entry
+pgsa_entry_key
+pgsa_shared_state
+pgsa_stash
+pgsa_stash_count
+pgsa_stash_name
 pgsocket
 pgsql_thing_t
 pgssEntry

@@ -1101,18 +1101,15 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 	for (nt = 0; nt < rInfo->ri_TrigDesc->numtriggers; nt++)
 	{
 		Trigger    *trig = rInfo->ri_TrigDesc->triggers + nt;
-		Instrumentation *instr = rInfo->ri_TrigInstrument + nt;
+		TriggerInstrumentation *tginstr = rInfo->ri_TrigInstrument + nt;
 		char	   *relname;
 		char	   *conname = NULL;
-
-		/* Must clean up instrumentation state */
-		InstrEndLoop(instr);
 
 		/*
 		 * We ignore triggers that were never invoked; they likely aren't
 		 * relevant to the current query type.
 		 */
-		if (instr->ntuples == 0)
+		if (tginstr->firings == 0)
 			continue;
 
 		ExplainOpenGroup("Trigger", NULL, true, es);
@@ -1137,11 +1134,12 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 			if (show_relname)
 				appendStringInfo(es->str, " on %s", relname);
 			if (es->timing)
-				appendStringInfo(es->str, ": time=%.3f calls=%.0f\n",
-								 INSTR_TIME_GET_MILLISEC(instr->total),
-								 instr->ntuples);
+				appendStringInfo(es->str, ": time=%.3f calls=%" PRId64 "\n",
+								 INSTR_TIME_GET_MILLISEC(tginstr->instr.total),
+								 tginstr->firings);
 			else
-				appendStringInfo(es->str, ": calls=%.0f\n", instr->ntuples);
+				appendStringInfo(es->str, ": calls=%" PRId64 "\n",
+								 tginstr->firings);
 		}
 		else
 		{
@@ -1151,9 +1149,9 @@ report_triggers(ResultRelInfo *rInfo, bool show_relname, ExplainState *es)
 			ExplainPropertyText("Relation", relname, es);
 			if (es->timing)
 				ExplainPropertyFloat("Time", "ms",
-									 INSTR_TIME_GET_MILLISEC(instr->total), 3,
+									 INSTR_TIME_GET_MILLISEC(tginstr->instr.total), 3,
 									 es);
-			ExplainPropertyFloat("Calls", NULL, instr->ntuples, 0, es);
+			ExplainPropertyInteger("Calls", NULL, tginstr->firings, es);
 		}
 
 		if (conname)
@@ -1838,10 +1836,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (es->analyze &&
 		planstate->instrument && planstate->instrument->nloops > 0)
 	{
-		double		nloops = planstate->instrument->nloops;
-		double		startup_ms = INSTR_TIME_GET_MILLISEC(planstate->instrument->startup) / nloops;
-		double		total_ms = INSTR_TIME_GET_MILLISEC(planstate->instrument->total) / nloops;
-		double		rows = planstate->instrument->ntuples / nloops;
+		NodeInstrumentation *instr = planstate->instrument;
+		double		nloops = instr->nloops;
+		double		startup_ms = INSTR_TIME_GET_MILLISEC(instr->startup) / nloops;
+		double		total_ms = INSTR_TIME_GET_MILLISEC(instr->instr.total) / nloops;
+		double		rows = instr->ntuples / nloops;
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
@@ -1893,11 +1892,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	/* prepare per-worker general execution details */
 	if (es->workers_state && es->verbose)
 	{
-		WorkerInstrumentation *w = planstate->worker_instrument;
+		WorkerNodeInstrumentation *w = planstate->worker_instrument;
 
 		for (int n = 0; n < w->num_workers; n++)
 		{
-			Instrumentation *instrument = &w->instrument[n];
+			NodeInstrumentation *instrument = &w->instrument[n];
 			double		nloops = instrument->nloops;
 			double		startup_ms;
 			double		total_ms;
@@ -1906,7 +1905,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (nloops <= 0)
 				continue;
 			startup_ms = INSTR_TIME_GET_MILLISEC(instrument->startup) / nloops;
-			total_ms = INSTR_TIME_GET_MILLISEC(instrument->total) / nloops;
+			total_ms = INSTR_TIME_GET_MILLISEC(instrument->instr.total) / nloops;
 			rows = instrument->ntuples / nloops;
 
 			ExplainOpenWorker(n, es);
@@ -2293,18 +2292,18 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 	/* Show buffer/WAL usage */
 	if (es->buffers && planstate->instrument)
-		show_buffer_usage(es, &planstate->instrument->bufusage);
+		show_buffer_usage(es, &planstate->instrument->instr.bufusage);
 	if (es->wal && planstate->instrument)
-		show_wal_usage(es, &planstate->instrument->walusage);
+		show_wal_usage(es, &planstate->instrument->instr.walusage);
 
 	/* Prepare per-worker buffer/WAL usage */
 	if (es->workers_state && (es->buffers || es->wal) && es->verbose)
 	{
-		WorkerInstrumentation *w = planstate->worker_instrument;
+		WorkerNodeInstrumentation *w = planstate->worker_instrument;
 
 		for (int n = 0; n < w->num_workers; n++)
 		{
-			Instrumentation *instrument = &w->instrument[n];
+			NodeInstrumentation *instrument = &w->instrument[n];
 			double		nloops = instrument->nloops;
 
 			if (nloops <= 0)
@@ -2312,9 +2311,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 			ExplainOpenWorker(n, es);
 			if (es->buffers)
-				show_buffer_usage(es, &instrument->bufusage);
+				show_buffer_usage(es, &instrument->instr.bufusage);
 			if (es->wal)
-				show_wal_usage(es, &instrument->walusage);
+				show_wal_usage(es, &instrument->instr.walusage);
 			ExplainCloseWorker(n, es);
 		}
 	}

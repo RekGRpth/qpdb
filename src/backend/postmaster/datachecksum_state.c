@@ -211,6 +211,7 @@
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "storage/subsystems.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -346,6 +347,7 @@ static volatile sig_atomic_t launcher_running = false;
 static DataChecksumsWorkerOperation operation;
 
 /* Prototypes */
+static void DataChecksumsShmemRequest(void *arg);
 static bool DatabaseExists(Oid dboid);
 static List *BuildDatabaseList(void);
 static List *BuildRelationList(bool temp_relations, bool include_shared);
@@ -355,6 +357,10 @@ static bool ProcessAllDatabases(void);
 static bool ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrategy strategy);
 static void launcher_cancel_handler(SIGNAL_ARGS);
 static void WaitForAllTransactionsToFinish(void);
+
+const ShmemCallbacks DataChecksumsShmemCallbacks = {
+	.request_fn = DataChecksumsShmemRequest,
+};
 
 /*****************************************************************************
  * Functionality for manipulating the data checksum state in the cluster
@@ -791,6 +797,19 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 	status = WaitForBackgroundWorkerStartup(bgw_handle, &pid);
 	if (status == BGWH_STOPPED)
 	{
+		/*
+		 * If the worker managed to start, and stop, before we got to waiting
+		 * for it we can se a STOPPED status here without it being a failure.
+		 */
+		if (DataChecksumState->success == DATACHECKSUMSWORKER_SUCCESSFUL)
+		{
+			pgstat_report_activity(STATE_IDLE, NULL);
+			LWLockAcquire(DataChecksumsWorkerLock, LW_EXCLUSIVE);
+			DataChecksumState->worker_pid = InvalidPid;
+			LWLockRelease(DataChecksumsWorkerLock);
+			return DataChecksumState->success;
+		}
+
 		ereport(WARNING,
 				errmsg("could not start background worker for enabling data checksums in database \"%s\"",
 					   db->dbname),
@@ -1197,8 +1216,15 @@ ProcessAllDatabases(void)
 
 		result = ProcessDatabase(db);
 
+#ifdef USE_INJECTION_POINTS
 		/* Allow a test process to alter the result of the operation */
-		INJECTION_POINT("datachecksumsworker-modify-db-result", &result);
+		if (IS_INJECTION_POINT_ATTACHED("datachecksumsworker-fail-db-result"))
+		{
+			result = DATACHECKSUMSWORKER_FAILED;
+			INJECTION_POINT_CACHED("datachecksumsworker-fail-db-result",
+								   db->dbname);
+		}
+#endif
 
 		pgstat_progress_update_param(PROGRESS_DATACHECKSUMS_DBS_DONE,
 									 ++cumulative_total);
@@ -1236,35 +1262,16 @@ ProcessAllDatabases(void)
 }
 
 /*
- * DataChecksumStateSize
- *		Compute required space for datachecksumsworker-related shared memory
+ * DataChecksumShmemRequest
+ *		Request datachecksumsworker-related shared memory
  */
-Size
-DataChecksumsShmemSize(void)
+static void
+DataChecksumsShmemRequest(void *arg)
 {
-	Size		size;
-
-	size = sizeof(DataChecksumsStateStruct);
-	size = MAXALIGN(size);
-
-	return size;
-}
-
-/*
- * DataChecksumStateInit
- *		Allocate and initialize datachecksumsworker-related shared memory
- */
-void
-DataChecksumsShmemInit(void)
-{
-	bool		found;
-
-	DataChecksumState = (DataChecksumsStateStruct *)
-		ShmemInitStruct("DataChecksumsWorker Data",
-						DataChecksumsShmemSize(),
-						&found);
-	if (!found)
-		MemSet(DataChecksumState, 0, DataChecksumsShmemSize());
+	ShmemRequestStruct(.name = "DataChecksumsWorker Data",
+					   .size = sizeof(DataChecksumsStateStruct),
+					   .ptr = (void **) &DataChecksumState,
+		);
 }
 
 /*
@@ -1451,6 +1458,9 @@ DataChecksumsWorkerMain(Datum arg)
 	BufferAccessStrategy strategy;
 	bool		aborted = false;
 	int64		rels_done;
+#ifdef USE_INJECTION_POINTS
+	bool		retried = false;
+#endif
 
 	operation = ENABLE_DATACHECKSUMS;
 
@@ -1566,7 +1576,19 @@ DataChecksumsWorkerMain(Datum arg)
 		}
 		list_free(CurrentTempTables);
 
-		INJECTION_POINT("datachecksumsworker-fake-temptable-wait", &numleft);
+#ifdef USE_INJECTION_POINTS
+		if (IS_INJECTION_POINT_ATTACHED("datachecksumsworker-fake-temptable-wait"))
+		{
+			/* Make sure to just cause one retry */
+			if (!retried && numleft == 0)
+			{
+				numleft = 1;
+				retried = true;
+
+				INJECTION_POINT_CACHED("datachecksumsworker-fake-temptable-wait", NULL);
+			}
+		}
+#endif
 
 		if (numleft == 0)
 			break;
@@ -1608,5 +1630,7 @@ DataChecksumsWorkerMain(Datum arg)
 	/* worker done */
 	pgstat_progress_end_command();
 
+	LWLockAcquire(DataChecksumsWorkerLock, LW_EXCLUSIVE);
 	DataChecksumState->success = DATACHECKSUMSWORKER_SUCCESSFUL;
+	LWLockRelease(DataChecksumsWorkerLock);
 }

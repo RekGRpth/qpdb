@@ -119,8 +119,8 @@
  * chosen at creation based on the initial number of elements, so even though
  * we support allocating more elements later, performance will suffer if the
  * table grows much beyond the initial size.  (Currently, shared memory hash
- * tables are only created by ShmemInitHash() though, which doesn't support
- * growing at all.)
+ * tables are only created by ShmemRequestHash()/ShmemInitHash() though, which
+ * doesn't support growing at all.)
  */
 #define HASH_SEGSIZE			   256
 #define HASH_SEGSIZE_SHIFT	   8	/* must be log2(HASH_SEGSIZE) */
@@ -338,7 +338,8 @@ string_compare(const char *key1, const char *key2, Size keysize)
  * under info->hcxt rather than under TopMemoryContext; the default
  * behavior is only suitable for session-lifespan hash tables.
  * Other flags bits are special-purpose and seldom used, except for those
- * associated with shared-memory hash tables, for which see ShmemInitHash().
+ * associated with shared-memory hash tables, for which see
+ * ShmemRequestHash().
  *
  * Fields in *info are read only when the associated flags bit is set.
  * It is not necessary to initialize other fields of *info.

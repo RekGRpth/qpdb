@@ -115,6 +115,7 @@
 #include "storage/ipc.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/shmem_internal.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/datetime.h"
@@ -933,6 +934,11 @@ PostmasterMain(int argc, char *argv[])
 	ApplyLauncherRegister();
 
 	/*
+	 * Register the shared memory needs of all core subsystems.
+	 */
+	RegisterBuiltinShmemCallbacks();
+
+	/*
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
@@ -962,9 +968,20 @@ PostmasterMain(int argc, char *argv[])
 	InitializeFastPathLocks();
 
 	/*
-	 * Give preloaded libraries a chance to request additional shared memory.
+	 * Also call any legacy shmem request hooks that might've been installed
+	 * by preloaded libraries.
+	 *
+	 * Note: this must be done before ShmemCallRequestCallbacks(), because the
+	 * hooks may request LWLocks with RequestNamedLWLockTranche(), which in
+	 * turn affects the size of the LWLock array calculated in lwlock.c.
 	 */
 	process_shmem_requests();
+
+	/*
+	 * Ask all subsystems, including preloaded libraries, to register their
+	 * shared memory needs.
+	 */
+	ShmemCallRequestCallbacks();
 
 	/*
 	 * Now that loadable modules have had their chance to request additional
@@ -3243,7 +3260,14 @@ PostmasterStateMachine(void)
 		/* re-read control file into local memory */
 		LocalProcessControlFile(true);
 
-		/* re-create shared memory and semaphores */
+		/*
+		 * Re-initialize shared memory and semaphores.  Note: We don't call
+		 * RegisterBuiltinShmemCallbacks(), we keep the old registrations.  In
+		 * order to re-register structs in extensions, we'd need to reload
+		 * shared preload libraries, and we don't want to do that.
+		 */
+		ResetShmemAllocator();
+		ShmemCallRequestCallbacks();
 		CreateSharedMemoryAndSemaphores();
 
 		UpdatePMState(PM_STARTUP);

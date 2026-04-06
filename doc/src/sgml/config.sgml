@@ -2918,6 +2918,7 @@ include_dir 'conf.d'
         <para>
          When changing this value, consider also adjusting
          <xref linkend="guc-max-parallel-workers"/>,
+         <xref linkend="guc-autovacuum-max-parallel-workers"/>,
          <xref linkend="guc-max-parallel-maintenance-workers"/>, and
          <xref linkend="guc-max-parallel-workers-per-gather"/>.
         </para>
@@ -4787,6 +4788,48 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
         connection, and a larger value helps in judging better the health
         of a standby if located on a remote location, with a high-latency
         network connection.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-wal-sender-shutdown-timeout" xreflabel="wal_sender_shutdown_timeout">
+      <term><varname>wal_sender_shutdown_timeout</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>wal_sender_shutdown_timeout</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Specifies the maximum time the server waits during shutdown for all
+        WAL data to be replicated to the receiver.  If this value is specified
+        without units, it is taken as milliseconds.  A value of
+        <literal>-1</literal> (the default) disables the timeout mechanism.
+       </para>
+       <para>
+       When replication is in use, the sending server normally waits until
+       all WAL data has been transferred to the receiver before completing
+       shutdown.  This helps keep sender and receiver in sync after shutdown,
+       which is especially important for physical replication switchovers,
+       but it can delay shutdown.
+       </para>
+       <para>
+        If this parameter is set, the server stops waiting and completes
+        shutdown when the timeout expires.  This can shorten shutdown time,
+        for example, when replication is slow on high-latency networks or
+        when a logical replication apply worker is blocked waiting for locks.
+        However, in this case the sender and receiver may be out of sync after
+        shutdown.
+       </para>
+       <para>
+        This parameter can be set in <varname>primary_conninfo</varname> and
+        in the <literal>CONNECTION</literal> clause of
+        <command>CREATE SUBSCRIPTION</command> (for example, include
+        <literal>options=-cwal_sender_shutdown_timeout=10s</literal> in the
+        connection string), allowing different timeouts per replication
+        connection.  For example, when both physical and logical replication
+        are used, it can be disabled for physical replication (e.g., for
+        switchovers) while enabled for logical replication to limit shutdown
+        time.
        </para>
       </listitem>
      </varlistentry>
@@ -9485,6 +9528,29 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         </para>
        </listitem>
       </varlistentry>
+
+      <varlistentry id="guc-autovacuum-max-parallel-workers" xreflabel="autovacuum_max_parallel_workers">
+       <term><varname>autovacuum_max_parallel_workers</varname> (<type>integer</type>)
+       <indexterm>
+        <primary><varname>autovacuum_max_parallel_workers</varname></primary>
+        <secondary>configuration parameter</secondary>
+       </indexterm>
+       </term>
+       <listitem>
+        <para>
+         Sets the maximum number of parallel workers that can be used by a
+         single autovacuum worker to process indexes. This limit applies
+         specifically to the index vacuuming and index cleanup phases (for the
+         details of each autovacuum phase, please refer to <xref linkend="vacuum-phases"/>).
+         The actual number of parallel workers is further limited by
+         <xref linkend="guc-max-parallel-workers"/>. This is the
+         per-autovacuum worker equivalent of the <literal>PARALLEL</literal>
+         option of the <link linkend="sql-vacuum"><command>VACUUM</command></link>
+         command. Setting this value to 0 disables parallel vacuum during autovacuum.
+         The default is 0.
+        </para>
+       </listitem>
+     </varlistentry>
 
      </variablelist>
     </sect2>
