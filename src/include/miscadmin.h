@@ -90,6 +90,8 @@
 extern PGDLLIMPORT volatile sig_atomic_t InterruptPending;
 extern PGDLLIMPORT volatile sig_atomic_t QueryCancelPending;
 extern PGDLLIMPORT volatile sig_atomic_t ProcDiePending;
+extern PGDLLIMPORT volatile int ProcDieSenderPid;
+extern PGDLLIMPORT volatile int ProcDieSenderUid;
 extern PGDLLIMPORT volatile sig_atomic_t IdleInTransactionSessionTimeoutPending;
 extern PGDLLIMPORT volatile sig_atomic_t TransactionTimeoutPending;
 extern PGDLLIMPORT volatile sig_atomic_t IdleSessionTimeoutPending;
@@ -309,6 +311,15 @@ extern ssize_t get_stack_depth_rlimit(void);
 extern void PreventCommandIfReadOnly(const char *cmdname);
 extern void PreventCommandIfParallelMode(const char *cmdname);
 extern void PreventCommandDuringRecovery(const char *cmdname);
+
+/* in replication/snapbuild.c */
+
+/*
+ * Keep track of whether logical decoding in this backend promised not to
+ * access shared catalogs, as a safety check.  This is checked by genam.c when
+ * a catalog scan takes place to verify that no shared catalogs are accessed.
+ */
+extern bool accessSharedCatalogsInDecoding;
 
 /*****************************************************************************
  *	  pdir.h --																 *

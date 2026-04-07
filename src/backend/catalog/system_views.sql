@@ -795,6 +795,24 @@ CREATE VIEW pg_stat_xact_user_tables AS
     WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND
           schemaname !~ '^pg_toast';
 
+CREATE VIEW pg_stat_autovacuum_scores AS
+    SELECT
+        s.oid AS relid,
+        n.nspname AS schemaname,
+        c.relname AS relname,
+        s.score,
+        s.xid_score,
+        s.mxid_score,
+        s.vacuum_score,
+        s.vacuum_insert_score,
+        s.analyze_score,
+        s.do_vacuum,
+        s.do_analyze,
+        s.for_wraparound
+    FROM pg_stat_get_autovacuum_scores() s
+    JOIN pg_class c on c.oid = s.oid
+    LEFT JOIN pg_namespace n ON n.oid = c.relnamespace;
+
 CREATE VIEW pg_statio_all_tables AS
     SELECT
             C.oid AS relid,
@@ -1343,16 +1361,19 @@ CREATE VIEW pg_stat_progress_repack AS
                       WHEN 2 THEN 'index scanning heap'
                       WHEN 3 THEN 'sorting tuples'
                       WHEN 4 THEN 'writing new heap'
-                      WHEN 5 THEN 'swapping relation files'
-                      WHEN 6 THEN 'rebuilding index'
-                      WHEN 7 THEN 'performing final cleanup'
+                      WHEN 5 THEN 'catch-up'
+                      WHEN 6 THEN 'swapping relation files'
+                      WHEN 7 THEN 'rebuilding index'
+                      WHEN 8 THEN 'performing final cleanup'
                       END AS phase,
         CAST(S.param3 AS oid) AS repack_index_relid,
         S.param4 AS heap_tuples_scanned,
-        S.param5 AS heap_tuples_written,
-        S.param6 AS heap_blks_total,
-        S.param7 AS heap_blks_scanned,
-        S.param8 AS index_rebuild_count
+        S.param5 AS heap_tuples_inserted,
+        S.param6 AS heap_tuples_updated,
+        S.param7 AS heap_tuples_deleted,
+        S.param8 AS heap_blks_total,
+        S.param9 AS heap_blks_scanned,
+        S.param10 AS index_rebuild_count
     FROM pg_stat_get_progress_info('REPACK') AS S
         LEFT JOIN pg_database D ON S.datid = D.oid;
 
@@ -1370,7 +1391,7 @@ CREATE VIEW pg_stat_progress_cluster AS
         phase,
         repack_index_relid AS cluster_index_relid,
         heap_tuples_scanned,
-        heap_tuples_written,
+        heap_tuples_inserted + heap_tuples_updated AS heap_tuples_written,
         heap_blks_total,
         heap_blks_scanned,
         index_rebuild_count

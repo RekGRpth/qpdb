@@ -196,6 +196,10 @@
 #max_files_per_process = 1000           # min 64
                                         # (change requires restart)
 
+# - Time -
+
+#timing_clock_source = auto             # auto, system, tsc (if supported)
+
 # - Background Writer -
 
 #bgwriter_delay = 200ms                 # 10-10000ms between rounds
@@ -347,6 +351,8 @@
 #max_wal_senders = 10           # max number of walsender processes
                                 # (change requires restart)
 #max_replication_slots = 10     # max number of replication slots
+                                # (change requires restart)
+#max_repack_replication_slots = 5 # max number of replication slots for REPACK
                                 # (change requires restart)
 #wal_keep_size = 0              # in megabytes; 0 disables
 #max_slot_wal_keep_size = -1    # in megabytes; -1 disables
