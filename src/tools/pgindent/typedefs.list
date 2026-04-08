@@ -7,6 +7,7 @@ ASN1_OBJECT
 ASN1_OCTET_STRING
 ASN1_STRING
 ATAlterConstraint
+AttrResultArgMap
 AV
 A_ArrayExpr
 A_Const
@@ -1279,6 +1280,7 @@ IOContext
 IOFuncSelector
 IOObject
 IOOp
+IOStats
 IO_STATUS_BLOCK
 IPCompareMethod
 ITEM
@@ -2270,6 +2272,7 @@ PgAioUringCaps
 PgAioUringContext
 PgAioWaitRef
 PgAioWorkerControl
+PgAioWorkerSet
 PgAioWorkerSlot
 PgAioWorkerSubmissionQueue
 PgArchData
@@ -2799,6 +2802,7 @@ SelfJoinCandidate
 SemTPadded
 SemiAntiJoinFactors
 SeqScan
+SeqScanInstrumentation
 SeqScanState
 SeqTable
 SeqTableData
@@ -2863,7 +2867,9 @@ SharedMemoizeInfo
 SharedRecordTableEntry
 SharedRecordTableKey
 SharedRecordTypmodRegistry
+SharedSeqScanInstrumentation
 SharedSortInfo
+SharedTidRangeScanInstrumentation
 SharedTuplestore
 SharedTuplestoreAccessor
 SharedTuplestoreChunk
@@ -3127,6 +3133,7 @@ TableLikeClause
 TableSampleClause
 TableScanDesc
 TableScanDescData
+TableScanInstrumentation
 TableSpaceCacheEntry
 TableSpaceOpts
 TableToProcess
@@ -3167,6 +3174,7 @@ TidOpExpr
 TidPath
 TidRangePath
 TidRangeScan
+TidRangeScanInstrumentation
 TidRangeScanState
 TidScan
 TidScanState
@@ -4177,8 +4185,6 @@ qc_hash_func
 qsort_arg_comparator
 qsort_comparator
 query_pathkeys_callback
-radius_attribute
-radius_packet
 RadixSortInfo
 rangeTableEntry_used_context
 rank_context
@@ -4211,9 +4217,11 @@ relopt_ternary
 relopt_type
 relopt_value
 relopts_validator
+RemoteAttributeMapping
 remoteConn
 remoteConnHashEnt
 remoteDep
+RemoteStatsResults
 remove_nulling_relids_context
 rendezvousHashEntry
 rep
