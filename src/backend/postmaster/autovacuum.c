@@ -3080,6 +3080,7 @@ relation_needs_vacanalyze(Oid relid,
 	PgStat_StatTabEntry *tabentry;
 	bool		force_vacuum;
 	bool		av_enabled;
+	bool		may_free = false;
 
 	/* constants from reloptions or GUC variables */
 	int			vac_base_thresh,
@@ -3246,7 +3247,7 @@ relation_needs_vacanalyze(Oid relid,
 	 * forced.
 	 */
 	tabentry = pgstat_fetch_stat_tabentry_ext(classForm->relisshared,
-											  relid);
+											  relid, &may_free);
 	if (!tabentry)
 		return;
 
@@ -3327,7 +3328,9 @@ relation_needs_vacanalyze(Oid relid,
 			 anltuples, anlthresh, scores->anl,
 			 scores->xid, scores->mxid);
 
-	pfree(tabentry);
+	/* Avoid leaking pgstat entries until the end of autovacuum. */
+	if (may_free)
+		pfree(tabentry);
 }
 
 /*
@@ -3676,7 +3679,8 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 
 		avopts = extract_autovac_opts(tup, RelationGetDescr(rel));
 		relation_needs_vacanalyze(form->oid, avopts, form,
-								  effective_multixact_freeze_max_age, 0,
+								  effective_multixact_freeze_max_age,
+								  LOG_NEVER,
 								  &dovacuum, &doanalyze, &wraparound,
 								  &scores);
 		if (avopts)
