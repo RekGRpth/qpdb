@@ -23,6 +23,7 @@
  */
 #include "postgres.h"
 
+#include "pg_plan_advice.h"
 #include "pgpa_trove.h"
 
 #include "common/hashfn_unstable.h"
@@ -298,7 +299,7 @@ pgpa_cstring_trove_entry(pgpa_trove_entry *entry)
 	StringInfoData buf;
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "%s", pgpa_cstring_advice_tag(entry->tag));
+	appendStringInfoString(&buf, pgpa_cstring_advice_tag(entry->tag));
 
 	/* JOIN_ORDER tags are transformed by pgpa_build_trove; undo that here */
 	if (entry->tag != PGPA_TAG_JOIN_ORDER)
@@ -321,7 +322,7 @@ pgpa_cstring_trove_entry(pgpa_trove_entry *entry)
 }
 
 /*
- * Set PGPA_TE_* flags on a set of trove entries.
+ * Set PGPA_FB_* flags on a set of trove entries.
  */
 void
 pgpa_trove_set_flags(pgpa_trove_entry *entries, Bitmapset *indexes, int flags)
@@ -337,27 +338,27 @@ pgpa_trove_set_flags(pgpa_trove_entry *entries, Bitmapset *indexes, int flags)
 }
 
 /*
- * Append a string representation of the specified PGPA_TE_* flags to the
+ * Append a string representation of the specified PGPA_FB_* flags to the
  * given StringInfo.
  */
 void
 pgpa_trove_append_flags(StringInfo buf, int flags)
 {
-	if ((flags & PGPA_TE_MATCH_FULL) != 0)
+	if ((flags & PGPA_FB_MATCH_FULL) != 0)
 	{
-		Assert((flags & PGPA_TE_MATCH_PARTIAL) != 0);
-		appendStringInfo(buf, "matched");
+		Assert((flags & PGPA_FB_MATCH_PARTIAL) != 0);
+		appendStringInfoString(buf, "matched");
 	}
-	else if ((flags & PGPA_TE_MATCH_PARTIAL) != 0)
-		appendStringInfo(buf, "partially matched");
+	else if ((flags & PGPA_FB_MATCH_PARTIAL) != 0)
+		appendStringInfoString(buf, "partially matched");
 	else
-		appendStringInfo(buf, "not matched");
-	if ((flags & PGPA_TE_INAPPLICABLE) != 0)
-		appendStringInfo(buf, ", inapplicable");
-	if ((flags & PGPA_TE_CONFLICTING) != 0)
-		appendStringInfo(buf, ", conflicting");
-	if ((flags & PGPA_TE_FAILED) != 0)
-		appendStringInfo(buf, ", failed");
+		appendStringInfoString(buf, "not matched");
+	if ((flags & PGPA_FB_INAPPLICABLE) != 0)
+		appendStringInfoString(buf, ", inapplicable");
+	if ((flags & PGPA_FB_CONFLICTING) != 0)
+		appendStringInfoString(buf, ", conflicting");
+	if ((flags & PGPA_FB_FAILED) != 0)
+		appendStringInfoString(buf, ", failed");
 }
 
 /*
