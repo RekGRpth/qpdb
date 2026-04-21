@@ -304,7 +304,7 @@ tfunc_title(char *dst, size_t dstsize, const char *src,
 {
 	struct WordBoundaryState wbstate = {
 		.str = src,
-		.len = srclen,
+		.len = (srclen < 0) ? strlen(src) : srclen,
 		.offset = 0,
 		.init = false,
 		.prev_alnum = false,
@@ -329,7 +329,7 @@ tfunc_fold(char *dst, size_t dstsize, const char *src,
 }
 
 static void
-test_convert_case()
+test_convert_case(void)
 {
 	/* test string with no case changes */
 	test_convert(tfunc_lower, "√∞", "√∞");
