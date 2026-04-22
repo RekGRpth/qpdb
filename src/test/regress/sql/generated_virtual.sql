@@ -929,3 +929,43 @@ select * from gtest33 where b is null;
 
 reset constraint_exclusion;
 drop table gtest33;
+
+-- Ensure that EXCLUDED.<virtual-generated-column> in INSERT ... ON CONFLICT
+-- DO UPDATE is expanded to the generation expression, both for plain and
+-- partitioned target relations.
+create table gtest34 (id int primary key, a int,
+                      c int generated always as (a * 10) virtual);
+insert into gtest34 values (1, 5);
+insert into gtest34 values (1, 7)
+    on conflict (id) do update set a = excluded.c returning *;
+insert into gtest34 values (1, 2)
+    on conflict (id) do update set a = gtest34.c + excluded.c returning *;
+insert into gtest34 values (1, 3)
+    on conflict (id) do update set a = 999 where excluded.c > 20 returning *;
+drop table gtest34;
+
+create table gtest34p (id int primary key, a int,
+                       c int generated always as (a * 10) virtual)
+    partition by range (id);
+create table gtest34p_1 partition of gtest34p for values from (1) to (100);
+insert into gtest34p values (1, 5);
+insert into gtest34p values (1, 7)
+    on conflict (id) do update set a = excluded.c returning *;
+insert into gtest34p values (1, 2)
+    on conflict (id) do update set a = gtest34p.c + excluded.c returning *;
+drop table gtest34p;
+
+-- Ensure that virtual generated columns work with WHERE CURRENT OF
+create table gtest_cursor (id int primary key, a int, b int generated always as (a * 2) virtual);
+insert into gtest_cursor values (1, 10), (2, 20), (3, 30);
+
+begin;
+declare curs cursor for select * from gtest_cursor order by id for update;
+fetch 1 from curs;
+update gtest_cursor set a = 99 where current of curs;
+select * from gtest_cursor order by id;
+delete from gtest_cursor where current of curs;
+select * from gtest_cursor order by id;
+commit;
+
+drop table gtest_cursor;
