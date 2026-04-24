@@ -264,7 +264,6 @@ SELECT x1.a, g.* FROM x1, GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.addr
 ERROR:  non-local element variable reference is not supported
 LINE 1: ...tomers WHERE c.address = 'US' AND c.customer_id = x1.a)-[IS ...
                                                              ^
-DROP TABLE x1;
 CREATE TABLE v1 (
     id int PRIMARY KEY,
     vname varchar(10),
@@ -652,13 +651,13 @@ SELECT * FROM GRAPH_TABLE (g1 MATCH (a)-(a) COLUMNS (a.vname AS self));
  v33
 (1 row)
 
--- test collation specified in the expression
+-- test explicit and implicit collation assignment
 INSERT INTO e3_3 VALUES (2003, 2003, 'E331', 10011);
-SELECT * FROM GRAPH_TABLE (g1 MATCH (a)-[b]->(a)-[b]->(a) COLUMNS (a.vname AS self, b.ename AS loop_name)) ORDER BY loop_name COLLATE "C" ASC;
+SELECT * FROM GRAPH_TABLE (g1 MATCH (a)-[b]->(a)-[b]->(a) COLUMNS (upper(a.vname) AS self, b.ename AS loop_name)) ORDER BY loop_name COLLATE "C" ASC;
  self | loop_name 
 ------+-----------
- v33  | E331
- v33  | e331
+ V33  | E331
+ V33  | e331
 (2 rows)
 
 SELECT * FROM GRAPH_TABLE (g1 MATCH (a)-[b IS el2 WHERE b.ename > 'E331' COLLATE "C"]->(a)-[b]->(a) COLUMNS (a.vname AS self, b.ename AS loop_name));
@@ -922,14 +921,25 @@ SELECT * FROM GRAPH_TABLE (g4 MATCH (s WHERE s.id = 3)-[e]-(d) COLUMNS (s.val, e
 (2 rows)
 
 -- ruleutils reverse parsing
-CREATE VIEW customers_us AS SELECT * FROM GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.address = 'US')-[IS customer_orders | customer_wishlists ]->(l IS orders | wishlists)-[ IS list_items]->(p IS products) COLUMNS (c.name AS customer_name, p.name AS product_name)) ORDER BY customer_name, product_name;
+-- The query in the view definition is intentionally complex to test one view with many
+-- features like label disjunction, lateral references, WHERE clauses in graph
+-- patterns.
+CREATE VIEW customers_us AS
+SELECT g.* FROM x1,
+                GRAPH_TABLE (myshop MATCH (c IS customers WHERE c.address = 'US' AND c.customer_id = x1.a)
+                                          -[IS customer_orders | customer_wishlists ]->
+                                          (l IS orders | wishlists)-[ IS list_items]->(p IS products)
+                                    COLUMNS (c.name AS customer_name, p.name AS product_name, x1.a AS a)) g
+           ORDER BY customer_name, product_name;
 SELECT pg_get_viewdef('customers_us'::regclass);
-                                                                                                                     pg_get_viewdef                                                                                                                     
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  SELECT customer_name,                                                                                                                                                                                                                                +
-     product_name                                                                                                                                                                                                                                      +
-    FROM GRAPH_TABLE (myshop MATCH (c IS customers WHERE ((c.address)::text = 'US'::text))-[IS customer_orders|customer_wishlists]->(l IS orders|wishlists)-[IS list_items]->(p IS products) COLUMNS (c.name AS customer_name, p.name AS product_name))+
-   ORDER BY customer_name, product_name;
+                                                                                                                                        pg_get_viewdef                                                                                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT g.customer_name,                                                                                                                                                                                                                                                                    +
+     g.product_name,                                                                                                                                                                                                                                                                         +
+     g.a                                                                                                                                                                                                                                                                                     +
+    FROM x1,                                                                                                                                                                                                                                                                                 +
+     GRAPH_TABLE (myshop MATCH (c IS customers WHERE (((c.address)::text = 'US'::text) AND (c.customer_id = x1.a)))-[IS customer_orders|customer_wishlists]->(l IS orders|wishlists)-[IS list_items]->(p IS products) COLUMNS (c.name AS customer_name, p.name AS product_name, x1.a AS a)) g+
+   ORDER BY g.customer_name, g.product_name;
 (1 row)
 
 -- test view/graph nesting

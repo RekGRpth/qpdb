@@ -23,6 +23,7 @@
 #include "catalog/pg_propgraph_label.h"
 #include "catalog/pg_propgraph_label_property.h"
 #include "catalog/pg_propgraph_property.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -162,10 +163,10 @@ rewriteGraphTable(Query *parsetree, int rt_index)
  * done by generate_queries_for_path_pattern_recurse().
  * generate_query_for_graph_path() constructs a query for a given path.
  *
- * A path pattern may result into no path if any of the element pattern yields no
- * elements or edge patterns yield no edges connecting adjacent vertex patterns.
- * In such a case a dummy query which returns no result is returned
- * (generate_query_for_empty_path_pattern()).
+ * A path pattern may end up producing no path if any of the element patterns
+ * yields no elements or the edge patterns yield no edges connecting adjacent
+ * vertex patterns.  In such a case a dummy query which returns no result is
+ * returned (generate_query_for_empty_path_pattern()).
  *
  * 'path_pattern' is given path pattern to be applied on the property graph in
  * the GRAPH_TABLE clause represented by given 'rte'.
@@ -361,6 +362,9 @@ generate_queries_for_path_pattern_recurse(RangeTblEntry *rte, List *pathqueries,
 {
 	List	   *path_elems = list_nth_node(List, path_elem_lists, elempos);
 
+	/* Guard against stack overflow due to complex path patterns. */
+	check_stack_depth();
+
 	foreach_ptr(struct path_element, pe, path_elems)
 	{
 		/* Update current path being built with current element. */
@@ -499,9 +503,9 @@ generate_query_for_graph_path(RangeTblEntry *rte, List *graph_path)
 		 * SQL/PGQ standard (Ref. Section 11.19, Access rule 2 and General
 		 * rule 4) does not specify whose access privileges to use when
 		 * accessing the element tables: property graph owner's or current
-		 * user's. It is safer to use current user's privileges so as not to
-		 * make property graphs as a hole for unpriviledged data access. This
-		 * is inline with the views being security_invoker by default.
+		 * user's. It is safer to use current user's privileges to avoid
+		 * unprivileged data access through a property graph. This is inline
+		 * with the views being security_invoker by default.
 		 */
 		rel = table_open(pe->reloid, AccessShareLock);
 		pni = addRangeTableEntryForRelation(make_parsestate(NULL), rel, AccessShareLock,
@@ -697,6 +701,9 @@ generate_setop_from_pathqueries(List *pathqueries, List **rtable, List **targetl
 	RangeTblRef *lrtr = makeNode(RangeTblRef);
 	List	   *rtargetlist;
 	ParseNamespaceItem *pni;
+
+	/* Guard against stack overflow due to many path queries. */
+	check_stack_depth();
 
 	/* Recursion termination condition. */
 	if (list_length(pathqueries) == 0)
