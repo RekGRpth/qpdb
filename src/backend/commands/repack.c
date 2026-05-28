@@ -40,6 +40,7 @@
 #include "access/toast_internals.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
@@ -897,12 +898,20 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 				replident;
 	Oid			ident_idx;
 
+	if (wal_level < WAL_LEVEL_REPLICA)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("cannot execute %s in this configuration",
+					   "REPACK (CONCURRENTLY)"),
+				errdetail("%s requires \"wal_level\" to be set to \"replica\" or higher.",
+						  "REPACK (CONCURRENTLY)"));
+
 	/* Data changes in system relations are not logically decoded. */
 	if (IsCatalogRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is not supported for catalog relations.",
 						"REPACK (CONCURRENTLY)"));
 
@@ -913,8 +922,8 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	if (IsToastRelation(rel))
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is not supported for TOAST relations.",
 						"REPACK (CONCURRENTLY)"));
 
@@ -922,20 +931,26 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	if (relpersistence != RELPERSISTENCE_PERMANENT)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is only allowed for permanent relations.",
 						"REPACK (CONCURRENTLY)"));
 
-	/* With NOTHING, WAL does not contain the old tuple. */
+	/*
+	 * With NOTHING, WAL does not contain the old tuple; FULL is not yet
+	 * supported.
+	 */
 	replident = rel->rd_rel->relreplident;
-	if (replident == REPLICA_IDENTITY_NOTHING)
+	if (replident == REPLICA_IDENTITY_NOTHING ||
+		replident == REPLICA_IDENTITY_FULL)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot repack relation \"%s\"",
-					   RelationGetRelationName(rel)),
-				errhint("Relation \"%s\" has insufficient replication identity.",
-						RelationGetRelationName(rel)));
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errdetail("%s does not support tables with %s.",
+						  "REPACK (CONCURRENTLY)",
+						  replident == REPLICA_IDENTITY_NOTHING ?
+						  "REPLICA IDENTITY NOTHING" : "REPLICA IDENTITY FULL"));
 
 	/*
 	 * Obtain the replica identity index -- either one that has been set
@@ -946,12 +961,25 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 	 */
 	ident_idx = GetRelationIdentityOrPK(rel);
 	if (!OidIsValid(ident_idx))
+	{
+		/* This special case warrants its own error message */
+		if (OidIsValid(rel->rd_pkindex) && rel->rd_ispkdeferrable)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute %s on relation \"%s\"",
+						   "REPACK (CONCURRENTLY)",
+						   RelationGetRelationName(rel)),
+					errdetail("%s does not support deferrable primary keys.",
+							  "REPACK (CONCURRENTLY)"),
+					errhint("Use ALTER TABLE ... REPLICA IDENTITY USING INDEX to designate another index as replica identity."));
+
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("cannot process relation \"%s\"",
-					   RelationGetRelationName(rel)),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("Relation \"%s\" has no identity index.",
 						RelationGetRelationName(rel)));
+	}
 
 	*ident_idx_p = ident_idx;
 }
@@ -2572,7 +2600,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be deleted */
 			found = find_target_tuple(rel, chgcxt, spilled_tuple, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 			apply_concurrent_delete(rel, ondisk_tuple);
 		}
 		else if (kind == CHANGE_UPDATE_NEW)
@@ -2588,7 +2616,7 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 			/* Find the tuple to be updated or deleted. */
 			found = find_target_tuple(rel, chgcxt, key, ondisk_tuple);
 			if (!found)
-				elog(ERROR, "failed to find target tuple");
+				elog(ERROR, "could not find target tuple");
 
 			/*
 			 * If 'tup' contains TOAST pointers, they point to the old
@@ -2665,7 +2693,9 @@ apply_concurrent_update(Relation rel, TupleTableSlot *spilled_tuple,
 							 &tmfd, &lockmode, &update_indexes);
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent UPDATE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "UPDATE", RelationGetRelationName(rel)));
 
 	if (update_indexes != TU_None)
 	{
@@ -2701,7 +2731,9 @@ apply_concurrent_delete(Relation rel, TupleTableSlot *slot)
 
 	if (res != TM_Ok)
 		ereport(ERROR,
-				errmsg("failed to apply concurrent DELETE"));
+				errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("could not apply concurrent %s on relation \"%s\"",
+					   "DELETE", RelationGetRelationName(rel)));
 
 	pgstat_progress_incr_param(PROGRESS_REPACK_HEAP_TUPLES_DELETED, 1);
 }
@@ -2996,7 +3028,7 @@ initialize_change_context(ChangeContext *chgcxt,
 		}
 	}
 	if (chgcxt->cc_ident_index == NULL)
-		elog(ERROR, "failed to find identity index");
+		elog(ERROR, "could not find identity index");
 
 	/* Set up for scanning said identity index */
 	{
