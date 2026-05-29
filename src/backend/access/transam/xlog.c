@@ -4807,9 +4807,8 @@ SetDataChecksumsOn(void)
 
 	/*
 	 * The only allowed state transition to "on" is from "inprogress-on" since
-	 * that state ensures that all pages will have data checksums written.  No
-	 * such state transition exists, if it does happen it's likely due to a
-	 * programmer error.
+	 * that state ensures that all pages will have data checksums written. Any
+	 * other attempted state transition is likely due to a programmer error.
 	 */
 	if (XLogCtl->data_checksum_version != PG_DATA_CHECKSUM_INPROGRESS_ON)
 	{
@@ -6610,6 +6609,7 @@ StartupXLOG(void)
 		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
 		SpinLockRelease(&XLogCtl->info_lck);
 
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
 		ereport(WARNING,
 				errmsg("enabling data checksums was interrupted"),
 				errhint("Data checksum processing must be manually restarted for checksums to be enabled."));
@@ -6621,7 +6621,7 @@ StartupXLOG(void)
 	 * checksums and we can move to off instead of prompting the user to
 	 * perform any action.
 	 */
-	if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+	else if (XLogCtl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
 	{
 		XLogChecksums(PG_DATA_CHECKSUM_OFF);
 
@@ -6629,6 +6629,8 @@ StartupXLOG(void)
 		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
 		SetLocalDataChecksumState(XLogCtl->data_checksum_version);
 		SpinLockRelease(&XLogCtl->info_lck);
+
+		EmitAndWaitDataChecksumsBarrier(PG_DATA_CHECKSUM_OFF);
 	}
 
 	/*
