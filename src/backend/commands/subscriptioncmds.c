@@ -356,6 +356,11 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_MAX_RETENTION_DURATION;
 			opts->maxretention = defGetInt32(defel);
+
+			if (opts->maxretention < 0)
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("max_retention_duration cannot be negative"));
 		}
 		else if (IsSet(supported_opts, SUBOPT_ORIGIN) &&
 				 strcmp(defel->defname, "origin") == 0)
@@ -1748,9 +1753,11 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					/*
 					 * Check if changes from different origins may be received
 					 * from the publisher when the origin is changed to ANY
-					 * and retain_dead_tuples is enabled.
+					 * and retain_dead_tuples is enabled. Use |= so that we
+					 * don't clear the flag already set when
+					 * retain_dead_tuples was changed in the same command.
 					 */
-					check_pub_rdt = retain_dead_tuples &&
+					check_pub_rdt |= retain_dead_tuples &&
 						pg_strcasecmp(opts.origin, LOGICALREP_ORIGIN_ANY) == 0;
 
 					origin = opts.origin;

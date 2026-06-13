@@ -42,6 +42,17 @@ CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUB
 COMMENT ON SUBSCRIPTION regress_testsub IS 'test subscription';
 SELECT obj_description(s.oid, 'pg_subscription') FROM pg_subscription s;
 
+-- Check that only subconninfo is not publicly readable in pg_subscription.
+SELECT count(*) = 0 AS ok
+    FROM pg_attribute
+    WHERE attrelid = 'pg_catalog.pg_subscription'::regclass AND attnum > 0 AND NOT attisdropped
+        AND ((attname = 'subconninfo'
+	        AND has_column_privilege('regress_subscription_user_dummy',
+		    'pg_catalog.pg_subscription', attname, 'SELECT'))
+            OR (attname <> 'subconninfo'
+	        AND NOT has_column_privilege('regress_subscription_user_dummy',
+		    'pg_catalog.pg_subscription', attname, 'SELECT')));
+
 -- Check if the subscription stats are created and stats_reset is updated
 -- by pg_stat_reset_subscription_stats().
 SELECT subname, stats_reset IS NULL stats_reset_is_null FROM pg_stat_subscription_stats WHERE subname = 'regress_testsub';
@@ -367,10 +378,16 @@ DROP SUBSCRIPTION regress_testsub;
 -- fail - max_retention_duration must be integer
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, max_retention_duration = foo);
 
+-- fail - max_retention_duration must be non-negative
+CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, max_retention_duration = -1);
+
 -- ok
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, max_retention_duration = 1000);
 
 \dRs+
+
+-- fail - max_retention_duration must be non-negative
+ALTER SUBSCRIPTION regress_testsub SET (max_retention_duration = -1);
 
 -- ok
 ALTER SUBSCRIPTION regress_testsub SET (max_retention_duration = 0);
