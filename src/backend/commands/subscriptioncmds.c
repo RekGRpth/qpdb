@@ -1451,6 +1451,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	Datum		values[Natts_pg_subscription];
 	HeapTuple	tup;
 	Oid			subid;
+	bool		orig_conninfo_needed = true;
 	bool		update_tuple = false;
 	bool		update_failover = false;
 	bool		update_two_phase = false;
@@ -1485,14 +1486,89 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SUBSCRIPTION,
 					   stmt->subname);
 
+	/* parse and check options */
+	switch (stmt->kind)
+	{
+		case ALTER_SUBSCRIPTION_OPTIONS:
+			supported_opts = (SUBOPT_SLOT_NAME |
+							  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
+							  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
+							  SUBOPT_DISABLE_ON_ERR |
+							  SUBOPT_PASSWORD_REQUIRED |
+							  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
+							  SUBOPT_RETAIN_DEAD_TUPLES |
+							  SUBOPT_MAX_RETENTION_DURATION |
+							  SUBOPT_WAL_RECEIVER_TIMEOUT |
+							  SUBOPT_ORIGIN);
+			break;
+
+		case ALTER_SUBSCRIPTION_ENABLED:
+			supported_opts = SUBOPT_ENABLED;
+			break;
+
+		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
+			supported_opts = SUBOPT_COPY_DATA | SUBOPT_REFRESH;
+			break;
+
+		case ALTER_SUBSCRIPTION_ADD_PUBLICATION:
+		case ALTER_SUBSCRIPTION_DROP_PUBLICATION:
+			supported_opts = SUBOPT_REFRESH | SUBOPT_COPY_DATA;
+			break;
+
+		case ALTER_SUBSCRIPTION_REFRESH_PUBLICATION:
+			supported_opts = SUBOPT_COPY_DATA;
+			break;
+
+		case ALTER_SUBSCRIPTION_SKIP:
+			supported_opts = SUBOPT_LSN;
+			break;
+
+		default:
+			supported_opts = 0;
+			break;
+	}
+
+	if (supported_opts > 0)
+		parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
+
+	/*
+	 * Ensure that ALTER SUBSCRIPTION commands that could be used to fix a
+	 * broken connection or prepare to drop a broken subscription don't
+	 * attempt to construct the conninfo. Otherwise, we might encounter the
+	 * error the user is trying to fix.
+	 *
+	 * Specifically, ALTER SUBSCRIPTION DISABLE, ALTER SUBSCRIPTION SERVER,
+	 * ALTER SUBSCRIPTION CONNECTION, or ALTER SUBSCRIPTION SET
+	 * (slot_name=NONE).
+	 *
+	 * NB: if the user specifies multiple SET options, then we may still need
+	 * to construct conninfo even if slot_name is set to NONE.
+	 */
+	if (stmt->kind == ALTER_SUBSCRIPTION_ENABLED)
+	{
+		if (opts.specified_opts == SUBOPT_ENABLED && !opts.enabled)
+			orig_conninfo_needed = false;
+	}
+	else if (stmt->kind == ALTER_SUBSCRIPTION_SERVER ||
+			 stmt->kind == ALTER_SUBSCRIPTION_CONNECTION)
+	{
+		orig_conninfo_needed = false;
+	}
+	else if (stmt->kind == ALTER_SUBSCRIPTION_OPTIONS)
+	{
+		/* ... SET (slot_name = NONE) with no other options */
+		if (opts.specified_opts == SUBOPT_SLOT_NAME && !opts.slot_name)
+			orig_conninfo_needed = false;
+	}
+
 	/*
 	 * Skip ACL checks on the subscription's foreign server, if any. If
 	 * changing the server (or replacing it with a raw connection), then the
 	 * old one will be removed anyway. If changing something unrelated,
 	 * there's no need to do an additional ACL check here; that will be done
-	 * by the subscription worker anyway.
+	 * by the subscription worker.
 	 */
-	sub = GetSubscription(subid, false, false);
+	sub = GetSubscription(subid, false, orig_conninfo_needed, false);
 
 	retain_dead_tuples = sub->retaindeadtuples;
 	origin = sub->origin;
@@ -1523,20 +1599,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	{
 		case ALTER_SUBSCRIPTION_OPTIONS:
 			{
-				supported_opts = (SUBOPT_SLOT_NAME |
-								  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
-								  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
-								  SUBOPT_DISABLE_ON_ERR |
-								  SUBOPT_PASSWORD_REQUIRED |
-								  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
-								  SUBOPT_RETAIN_DEAD_TUPLES |
-								  SUBOPT_MAX_RETENTION_DURATION |
-								  SUBOPT_WAL_RECEIVER_TIMEOUT |
-								  SUBOPT_ORIGIN);
-
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
-
 				if (IsSet(opts.specified_opts, SUBOPT_SLOT_NAME))
 				{
 					/*
@@ -1802,8 +1864,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_ENABLED:
 			{
-				parse_subscription_options(pstate, stmt->options,
-										   SUBOPT_ENABLED, &opts);
 				Assert(IsSet(opts.specified_opts, SUBOPT_ENABLED));
 
 				if (!sub->slotname && opts.enabled)
@@ -1940,10 +2000,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
 			{
-				supported_opts = SUBOPT_COPY_DATA | SUBOPT_REFRESH;
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
-
 				values[Anum_pg_subscription_subpublications - 1] =
 					publicationListToArray(stmt->publication);
 				replaces[Anum_pg_subscription_subpublications - 1] = true;
@@ -1986,10 +2042,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 			{
 				List	   *publist;
 				bool		isadd = stmt->kind == ALTER_SUBSCRIPTION_ADD_PUBLICATION;
-
-				supported_opts = SUBOPT_REFRESH | SUBOPT_COPY_DATA;
-				parse_subscription_options(pstate, stmt->options,
-										   supported_opts, &opts);
 
 				publist = merge_publications(sub->publications, stmt->publication, isadd, stmt->subname);
 				values[Anum_pg_subscription_subpublications - 1] =
@@ -2048,9 +2100,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 							 errmsg("%s is not allowed for disabled subscriptions",
 									"ALTER SUBSCRIPTION ... REFRESH PUBLICATION")));
 
-				parse_subscription_options(pstate, stmt->options,
-										   SUBOPT_COPY_DATA, &opts);
-
 				/*
 				 * The subscription option "two_phase" requires that
 				 * replication has passed the initial table synchronization
@@ -2096,8 +2145,6 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 		case ALTER_SUBSCRIPTION_SKIP:
 			{
-				parse_subscription_options(pstate, stmt->options, SUBOPT_LSN, &opts);
-
 				/* ALTER SUBSCRIPTION ... SKIP supports only LSN option */
 				Assert(IsSet(opts.specified_opts, SUBOPT_LSN));
 
@@ -2163,6 +2210,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		char	   *err;
 		WalReceiverConn *wrconn;
 
+		Assert(new_conninfo || orig_conninfo_needed);
+
 		/* Load the library providing us libpq calls. */
 		load_file("libpqwalreceiver", false);
 
@@ -2212,6 +2261,43 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 }
 
 /*
+ * Construct conninfo from a subscription's server. Like libpqrcv_connect(),
+ * if an error occurs, set *err to the error message and return NULL.
+ *
+ * However, failures in ForeignServerConnectionString() may ereport(ERROR),
+ * and (also like libpqrcv_connect) it's not worth adding the machinery to
+ * pass all of those back to the caller just to cover this one case.
+ */
+static char *
+construct_subserver_conninfo(Oid subserver, Oid subowner, char **err)
+{
+	AclResult	aclresult;
+	ForeignServer *server;
+
+	*err = NULL;
+
+	server = GetForeignServer(subserver);
+
+	aclresult = object_aclcheck(ForeignServerRelationId, subserver,
+								subowner, ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+	{
+		/*
+		 * Unable to generate connection string because permissions on the
+		 * foreign server have been removed. Follow the same logic as an
+		 * unusable subconninfo (which will result in an ERROR later unless
+		 * slot_name = NONE).
+		 */
+		*err = psprintf(_("subscription owner \"%s\" does not have permission on foreign server \"%s\""),
+						GetUserNameFromId(subowner, false),
+						server->servername);
+		return NULL;
+	}
+
+	return ForeignServerConnectionString(subowner, server);
+}
+
+/*
  * Drop a subscription
  */
 void
@@ -2222,10 +2308,12 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	HeapTuple	tup;
 	Oid			subid;
 	Oid			subowner;
+	Oid			subserver;
+	char	   *subconninfo = NULL;
 	Datum		datum;
 	bool		isnull;
 	char	   *subname;
-	char	   *conninfo;
+	char	   *conninfo = NULL;
 	char	   *slotname;
 	List	   *subworkers;
 	ListCell   *lc;
@@ -2264,9 +2352,15 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 		return;
 	}
 
+	datum = SysCacheGetAttr(SUBSCRIPTIONOID, tup,
+							Anum_pg_subscription_subconninfo, &isnull);
+	if (!isnull)
+		subconninfo = TextDatumGetCString(datum);
+
 	form = (Form_pg_subscription) GETSTRUCT(tup);
 	subid = form->oid;
 	subowner = form->subowner;
+	subserver = form->subserver;
 	must_use_password = !superuser_arg(subowner) && form->subpasswordrequired;
 
 	/* must be owner */
@@ -2287,39 +2381,6 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID, tup,
 								   Anum_pg_subscription_subname);
 	subname = pstrdup(NameStr(*DatumGetName(datum)));
-
-	/* Get conninfo */
-	if (OidIsValid(form->subserver))
-	{
-		AclResult	aclresult;
-		ForeignServer *server;
-
-		server = GetForeignServer(form->subserver);
-		aclresult = object_aclcheck(ForeignServerRelationId, form->subserver,
-									form->subowner, ACL_USAGE);
-		if (aclresult != ACLCHECK_OK)
-		{
-			/*
-			 * Unable to generate connection string because permissions on the
-			 * foreign server have been removed. Follow the same logic as an
-			 * unusable subconninfo (which will result in an ERROR later
-			 * unless slot_name = NONE).
-			 */
-			err = psprintf(_("subscription owner \"%s\" does not have permission on foreign server \"%s\""),
-						   GetUserNameFromId(form->subowner, false),
-						   server->servername);
-			conninfo = NULL;
-		}
-		else
-			conninfo = ForeignServerConnectionString(form->subowner,
-													 server);
-	}
-	else
-	{
-		datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID, tup,
-									   Anum_pg_subscription_subconninfo);
-		conninfo = TextDatumGetCString(datum);
-	}
 
 	/* Get slotname */
 	datum = SysCacheGetAttr(SUBSCRIPTIONOID, tup,
@@ -2456,6 +2517,11 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	 * slot.
 	 */
 	load_file("libpqwalreceiver", false);
+
+	if (OidIsValid(subserver))
+		conninfo = construct_subserver_conninfo(subserver, subowner, &err);
+	else
+		conninfo = subconninfo;
 
 	if (conninfo)
 		wrconn = walrcv_connect(conninfo, true, true, must_use_password,

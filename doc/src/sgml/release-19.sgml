@@ -6,7 +6,7 @@
 
  <formalpara>
   <title>Release date:</title>
-  <para>2026-??-??, AS OF 2026-06-16</para>
+  <para>2026-??-??, AS OF 2026-06-17</para>
  </formalpara>
 
   <sect2 id="release-19-highlights">
@@ -109,7 +109,14 @@ Force <link linkend="guc-standard-conforming-strings"><varname>standard_conformi
 </para>
 
 <para>
-Server variable <varname>escape_string_warning</varname> has been removed as unnecessary.  Client applications still support <literal>escape_string_warning = off</literal> for compatibility with old servers.
+Dumps created using pre-<productname>PostgreSQL</productname> 19 versions of <link linkend="app-pgdump"><application>pg_dump</application></link>
+or <link linkend="app-pg-dumpall"><application>pg_dumpall</application></link>, and using <literal>standard_conforming_strings = off</literal>,
+will not properly load into <productname>PostgreSQL</productname> 19 and later servers.  Users should create dumps using <productname>PostgreSQL</productname> 19
+or later versions of these applications, or use <literal>standard_conforming_strings = on</literal>.
+</para>
+
+<para>
+Client applications still support operations with servers having <literal>standard_conforming_strings = off</literal>, for compatibility with old servers.  The server variable <varname>escape_string_warning</varname> has been removed as unnecessary.
 </para>
 </listitem>
 
@@ -1929,18 +1936,6 @@ This was previously prohibited.
 </para>
 </listitem>
 
-<!--
-Author: Peter Eisentraut <peter@eisentraut.org>
-2025-08-22 [16a0039dc] Reduce lock level for ALTER DOMAIN ... VALIDATE CONSTRAI
--->
-
-<listitem>
-<para>
-Reduce lock level of <link linkend="sql-alterdomain"><command>ALTER DOMAIN ... VALIDATE CONSTRAINT</command></link> to match <link linkend="sql-altertable"><command>ALTER TABLE ... VALIDATE CONSTRAINT</command></link> (Jian He)
-<ulink url="&commit_baseurl;16a0039dc">&sect;</ulink>
-</para>
-</listitem>
-
      </itemizedlist>
     </sect4>
 
@@ -2693,25 +2688,6 @@ Report nanoseconds instead of microseconds.  In addition to histogram output, ou
      linkend="app-pgrestore"><application>pg_restore</application></link></title>
 
      <itemizedlist>
-<!--
-Author: Andrew Dunstan <andrew@dunslane.net>
-2026-02-26 [763aaa06f] Add non-text output formats to pg_dumpall
-Author: Andrew Dunstan <andrew@dunslane.net>
-2026-03-04 [3c19983cc] pg_restore: add - -no-globals option to skip globals
--->
-
-<listitem>
-<para>
-Allow <link linkend="app-pg-dumpall"><application>pg_dumpall</application></link> to produce output in non-text formats (Mahendra Singh Thalor, Andrew Dunstan)
-<ulink url="&commit_baseurl;763aaa06f">&sect;</ulink>
-<ulink url="&commit_baseurl;3c19983cc">&sect;</ulink>
-</para>
-
-<para>
-The new output formats are <literal>custom</literal>, <literal>directory</literal>, or <literal>tar</literal>.
-</para>
-</listitem>
-
 <!--
 Author: Michael Paquier <michael@paquier.xyz>
 2026-01-27 [c32fb29e9] Include extended statistics data in pg_dump
