@@ -63,11 +63,11 @@
  * compiler barrier.
  *
  */
-#if defined(__arm__) || defined(__arm) || defined(__aarch64__)
+#if defined(__arm__) || defined(__aarch64__)
 #include "port/atomics/arch-arm.h"
-#elif defined(__i386__) || defined(__i386) || defined(__x86_64__)
+#elif defined(__i386__) || defined(__x86_64__)
 #include "port/atomics/arch-x86.h"
-#elif defined(__ppc__) || defined(__powerpc__) || defined(__ppc64__) || defined(__powerpc64__)
+#elif defined(__powerpc__) || defined(__powerpc64__)
 #include "port/atomics/arch-ppc.h"
 #endif
 
@@ -153,11 +153,6 @@
  */
 #define pg_read_barrier()	pg_read_barrier_impl()
 #define pg_write_barrier()	pg_write_barrier_impl()
-
-/*
- * Spinloop delay - Allow CPU to relax in busy loops
- */
-#define pg_spin_delay() pg_spin_delay_impl()
 
 /*
  * pg_atomic_init_flag - initialize atomic flag.

@@ -349,7 +349,7 @@ typedef struct PgStat_IO
 typedef struct PgStat_LockEntry
 {
 	PgStat_Counter waits;
-	PgStat_Counter wait_time;	/* time in milliseconds */
+	PgStat_Counter wait_time;	/* time in microseconds */
 	PgStat_Counter fastpath_exceeded;
 } PgStat_LockEntry;
 
@@ -523,6 +523,7 @@ typedef struct PgStat_Backend
 	TimestampTz stat_reset_timestamp;
 	PgStat_BktypeIO io_stats;
 	PgStat_WalCounters wal_counters;
+	PgStat_PendingLock lock_stats;
 } PgStat_Backend;
 
 /* ---------
@@ -535,6 +536,12 @@ typedef struct PgStat_BackendPending
 	 * Backend statistics store the same amount of IO data as PGSTAT_KIND_IO.
 	 */
 	PgStat_PendingIO pending_io;
+
+	/*
+	 * Backend statistics store the same amount of lock data as
+	 * PGSTAT_KIND_LOCK.
+	 */
+	PgStat_PendingLock pending_lock;
 } PgStat_BackendPending;
 
 /*
@@ -586,6 +593,11 @@ extern void pgstat_count_backend_io_op(IOObject io_object,
 									   IOContext io_context,
 									   IOOp io_op, uint32 cnt,
 									   uint64 bytes);
+
+/* used by pgstat_lock.c for lock stats tracked in backends */
+extern void pgstat_count_backend_lock_waits(uint8 locktag_type, PgStat_Counter usecs);
+extern void pgstat_count_backend_lock_fastpath_exceeded(uint8 locktag_type);
+
 extern PgStat_Backend *pgstat_fetch_stat_backend(ProcNumber procNumber);
 extern PgStat_Backend *pgstat_fetch_stat_backend_by_pid(int pid,
 														BackendType *bktype);
@@ -638,7 +650,8 @@ extern bool pgstat_tracks_io_op(BackendType bktype, IOObject io_object,
 
 extern void pgstat_lock_flush(bool nowait);
 extern void pgstat_count_lock_fastpath_exceeded(uint8 locktag_type);
-extern void pgstat_count_lock_waits(uint8 locktag_type, long msecs);
+extern void pgstat_count_lock_waits(uint8 locktag_type,
+									PgStat_Counter usecs);
 extern PgStat_Lock *pgstat_fetch_stat_lock(void);
 
 /*

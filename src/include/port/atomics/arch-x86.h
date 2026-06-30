@@ -32,7 +32,7 @@
  */
 
 #if defined(__GNUC__) || defined(__INTEL_COMPILER)
-#if defined(__i386__) || defined(__i386)
+#if defined(__i386__)
 #define pg_memory_barrier_impl()		\
 	__asm__ __volatile__ ("lock; addl $0,0(%%esp)" : : : "memory", "cc")
 #elif defined(__x86_64__)
@@ -75,60 +75,6 @@ typedef struct pg_atomic_uint64
 	volatile uint64 value;
 } pg_atomic_uint64;
 #endif	/* __x86_64__ */
-
-#endif /* defined(__GNUC__) || defined(__INTEL_COMPILER) */
-
-#if !defined(PG_HAVE_SPIN_DELAY)
-/*
- * This sequence is equivalent to the PAUSE instruction ("rep" is
- * ignored by old IA32 processors if the following instruction is
- * not a string operation); the IA-32 Architecture Software
- * Developer's Manual, Vol. 3, Section 7.7.2 describes why using
- * PAUSE in the inner loop of a spin lock is necessary for good
- * performance:
- *
- *     The PAUSE instruction improves the performance of IA-32
- *     processors supporting Hyper-Threading Technology when
- *     executing spin-wait loops and other routines where one
- *     thread is accessing a shared lock or semaphore in a tight
- *     polling loop. When executing a spin-wait loop, the
- *     processor can suffer a severe performance penalty when
- *     exiting the loop because it detects a possible memory order
- *     violation and flushes the core processor's pipeline. The
- *     PAUSE instruction provides a hint to the processor that the
- *     code sequence is a spin-wait loop. The processor uses this
- *     hint to avoid the memory order violation and prevent the
- *     pipeline flush. In addition, the PAUSE instruction
- *     de-pipelines the spin-wait loop to prevent it from
- *     consuming execution resources excessively.
- */
-#if defined(__GNUC__) || defined(__INTEL_COMPILER)
-#define PG_HAVE_SPIN_DELAY
-static inline void
-pg_spin_delay_impl(void)
-{
-	__asm__ __volatile__(" rep; nop			\n");
-}
-#elif defined(_MSC_VER) && defined(__x86_64__)
-#define PG_HAVE_SPIN_DELAY
-static __forceinline void
-pg_spin_delay_impl(void)
-{
-	_mm_pause();
-}
-#elif defined(_MSC_VER)
-#define PG_HAVE_SPIN_DELAY
-static __forceinline void
-pg_spin_delay_impl(void)
-{
-	/* See comment for gcc code. Same code, MASM syntax */
-	__asm rep nop;
-}
-#endif
-#endif /* !defined(PG_HAVE_SPIN_DELAY) */
-
-
-#if defined(__GNUC__) || defined(__INTEL_COMPILER)
 
 #define PG_HAVE_ATOMIC_TEST_SET_FLAG
 static inline bool
@@ -238,6 +184,6 @@ pg_atomic_fetch_add_u64_impl(volatile pg_atomic_uint64 *ptr, int64 add_)
 /*
  * 8 byte reads / writes have single-copy atomicity on all x86-64 cpus.
  */
-#if defined(__x86_64__) || defined(__x86_64) || defined(_M_X64) /* gcc, msvc */
+#if defined(__x86_64__)
 #define PG_HAVE_8BYTE_SINGLE_COPY_ATOMICITY
 #endif /* 8 byte single-copy atomicity */
