@@ -1206,7 +1206,8 @@ include_dir 'conf.d'
       <listitem>
        <para>
         Controls whether a <literal>WARNING</literal> about MD5 password
-        deprecation is produced upon successful MD5 password authentication or
+        deprecation is produced upon successful authentication using an
+        MD5-encrypted password or
         when a <command>CREATE ROLE</command> or
         <command>ALTER ROLE</command> statement sets an MD5-encrypted password.
         The default value is <literal>on</literal>.
@@ -3671,6 +3672,7 @@ include_dir 'conf.d'
         was compiled with <option>--with-lz4</option>) and
         <literal>zstd</literal> (if <productname>PostgreSQL</productname>
         was compiled with <option>--with-zstd</option>).
+        The value <literal>on</literal> is a historical spelling of <literal>pglz</literal>.
         The default value is <literal>off</literal>.
         Only superusers and users with the appropriate <literal>SET</literal>
         privilege can change this setting.
@@ -11724,6 +11726,12 @@ dynamic_library_path = '/usr/local/lib/postgresql:$libdir'
         raise this value if you have queries that touch many different
         tables in a single transaction, e.g., query of a parent table with
         many children.  This parameter can only be set at server start.
+       </para>
+
+       <para>
+        This parameter also determines the number of per-backend slots
+        available for <link linkend="locking-tables-fast-path">fast-path
+        locking</link>.
        </para>
 
        <para>
