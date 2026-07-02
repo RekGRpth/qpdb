@@ -90,7 +90,9 @@ bool
 IsSystemClass(Oid relid, Form_pg_class reltuple)
 {
 	/* IsCatalogRelationOid is a bit faster, so test that first */
-	return (IsCatalogRelationOid(relid) || IsToastClass(reltuple));
+	return (IsCatalogRelationOid(relid) ||
+			IsToastClass(reltuple) ||
+			IsConflictLogTableClass(reltuple));
 }
 
 /*
@@ -235,6 +237,20 @@ IsToastClass(Form_pg_class reltuple)
 }
 
 /*
+ * IsConflictLogTableClass
+ *		True iff pg_class tuple represents a Conflict Log Table.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableClass(Form_pg_class reltuple)
+{
+	Oid			relnamespace = reltuple->relnamespace;
+
+	return IsConflictLogTableNamespace(relnamespace);
+}
+
+/*
  * IsCatalogNamespace
  *		True iff namespace is pg_catalog.
  *
@@ -268,6 +284,17 @@ IsToastNamespace(Oid namespaceId)
 		isTempToastNamespace(namespaceId);
 }
 
+/*
+ * IsConflictLogTableNamespace
+ *		True iff namespace is pg_conflict.
+ *
+ *		Does not perform any catalog accesses.
+ */
+bool
+IsConflictLogTableNamespace(Oid namespaceId)
+{
+	return namespaceId == PG_CONFLICT_NAMESPACE;
+}
 
 /*
  * IsReservedName

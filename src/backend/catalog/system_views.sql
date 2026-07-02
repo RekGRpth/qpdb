@@ -1282,6 +1282,17 @@ SELECT
        b.stats_reset
 FROM pg_stat_get_io() b;
 
+CREATE VIEW pg_stat_kind_info AS
+    SELECT
+        k.id,
+        k.name,
+        k.builtin,
+        k.fixed_amount,
+        k.accessed_across_databases,
+        k.write_to_file,
+        k.entry_count
+    FROM pg_stat_get_kind_info() k;
+
 CREATE VIEW pg_stat_wal AS
     SELECT
         w.wal_records,
@@ -1527,8 +1538,8 @@ GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subbinary, substream, subtwophasestate, subdisableonerr,
 			  subpasswordrequired, subrunasowner, subfailover,
               subretaindeadtuples, submaxretention, subretentionactive,
-              subserver, subslotname, subsynccommit, subwalrcvtimeout,
-              subpublications, suborigin)
+              subserver, subconflictlogrelid, subconflictlogdest, subslotname,
+              subsynccommit, subwalrcvtimeout, subpublications, suborigin)
     ON pg_subscription TO public;
 
 CREATE VIEW pg_stat_subscription_stats AS
