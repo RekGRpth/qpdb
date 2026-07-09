@@ -1508,7 +1508,10 @@ JsonTablePathScan
 JsonTablePathSpec
 JsonTablePlan
 JsonTablePlanRowSource
+JsonTablePlanSpec
 JsonTablePlanState
+JsonTablePlanJoinType
+JsonTablePlanType
 JsonTableSiblingJoin
 JsonTokenType
 JsonTransformStringValuesAction
@@ -3418,7 +3421,6 @@ WaitEvent
 WaitEventActivity
 WaitEventBuffer
 WaitEventClient
-WaitEventCustomCounterData
 WaitEventCustomEntryByInfo
 WaitEventCustomEntryByName
 WaitEventIO
