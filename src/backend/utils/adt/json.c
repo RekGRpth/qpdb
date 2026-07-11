@@ -1528,7 +1528,7 @@ json_object_two_arg(PG_FUNCTION_ARGS)
  * escape_json_char
  *		Inline helper function for escape_json* functions
  */
-static pg_attribute_always_inline void
+static pg_always_inline void
 escape_json_char(StringInfo buf, char c)
 {
 	switch (c)
@@ -1676,7 +1676,7 @@ escape_json_with_len(StringInfo buf, const char *str, int len)
 		 * Per-byte loop for Vector8s containing special chars and for
 		 * processing the tail of the string.
 		 */
-		for (int b = 0; b < sizeof(Vector8); b++)
+		for (size_t b = 0; b < sizeof(Vector8); b++)
 		{
 			/* check if we've finished */
 			if (i == len)

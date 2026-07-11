@@ -519,7 +519,7 @@ heap_setscanlimits(TableScanDesc sscan, BlockNumber startBlk, BlockNumber numBlk
  * multiple times, with constant arguments for all_visible,
  * check_serializable.
  */
-pg_attribute_always_inline
+pg_always_inline
 static int
 page_collect_tuples(HeapScanDesc scan, Snapshot snapshot,
 					Page page, Buffer buffer,
@@ -8458,7 +8458,7 @@ index_delete_sort(TM_IndexDeleteOp *delstate)
 	StaticAssertDecl(sizeof(TM_IndexDelete) <= 8,
 					 "element size exceeds 8 bytes");
 
-	for (int g = 0; g < lengthof(gaps); g++)
+	for (size_t g = 0; g < lengthof(gaps); g++)
 	{
 		for (int hi = gaps[g], i = hi; i < ndeltids; i++)
 		{
