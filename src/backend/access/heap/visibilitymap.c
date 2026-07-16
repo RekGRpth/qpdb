@@ -139,21 +139,26 @@
 static Buffer vm_readbuf(Relation rel, BlockNumber blkno, bool extend);
 static Buffer vm_extend(Relation rel, BlockNumber vm_nblocks);
 
-
 /*
  *	visibilitymap_clear - clear specified bits for one page in visibility map
  *
- * You must pass a buffer containing the correct map page to this function.
- * Call visibilitymap_pin first to pin the right one. This function doesn't do
- * any I/O.  Returns true if any bits have been cleared and false otherwise.
+ * You must pass a buffer containing the correct map page to this function,
+ * which already needs to be pinned and locked exclusively.
+ *
+ * This function doesn't do any I/O. Returns true if any bits have been
+ * cleared and false otherwise.
  */
 bool
-visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
+visibilitymap_clear(RelFileLocator rlocator, BlockNumber heapBlk,
+					Buffer vmbuf, uint8 flags)
 {
-	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
+#ifdef USE_ASSERT_CHECKING
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+#endif
 	uint8		mask = flags << mapOffset;
+	Page		page;
 	char	   *map;
 	bool		cleared = false;
 
@@ -162,14 +167,16 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
 
 #ifdef TRACE_VISIBILITYMAP
-	elog(DEBUG1, "vm_clear %s %d", RelationGetRelationName(rel), heapBlk);
+	elog(DEBUG1, "vm_clear %s %d",
+		 relpathbackend(rlocator, MyProcNumber, MAIN_FORKNUM).str,
+		 heapBlk);
 #endif
 
-	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
-		elog(ERROR, "wrong buffer passed to visibilitymap_clear");
+	Assert(BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock);
+	Assert(BufferIsLockedByMeInMode(vmbuf, BUFFER_LOCK_EXCLUSIVE));
 
-	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
-	map = PageGetContents(BufferGetPage(vmbuf));
+	page = BufferGetPage(vmbuf);
+	map = PageGetContents(page);
 
 	if (map[mapByte] & mask)
 	{
@@ -178,8 +185,6 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 		MarkBufferDirty(vmbuf);
 		cleared = true;
 	}
-
-	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
 }
@@ -254,7 +259,7 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 void
 visibilitymap_set(BlockNumber heapBlk,
 				  Buffer vmBuf, uint8 flags,
-				  const RelFileLocator rlocator)
+				  RelFileLocator rlocator)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
