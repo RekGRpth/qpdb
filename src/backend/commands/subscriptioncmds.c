@@ -1363,33 +1363,6 @@ AlterSubscription_refresh_seq(Subscription *sub)
 	WalReceiverConn *wrconn;
 	bool		must_use_password;
 
-	/*
-	 * Disallow a concurrent REFRESH SEQUENCES while a sequence sync worker
-	 * for this subscription is still running. This avoids a race where the
-	 * publisher's sequence advances after the current worker has fetched its
-	 * value but before it marks the sequence READY. A user may then issue
-	 * another REFRESH SEQUENCES to synchronize the updated value. Since the
-	 * affected sequences are already in the INIT state, the running worker
-	 * has no indication that a new synchronization has been requested. It
-	 * would then apply the stale value it already fetched and mark the
-	 * sequence READY, causing the new synchronization request to be lost and
-	 * preventing the updated publisher values from being synchronized.
-	 */
-	LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
-	if (logicalrep_worker_find(WORKERTYPE_SEQUENCESYNC, sub->oid, InvalidOid,
-							   true))
-	{
-		LWLockRelease(LogicalRepWorkerLock);
-		ereport(ERROR,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-		/* translator: %s is an SQL ALTER command */
-				errmsg("cannot execute %s while a sequence synchronization worker is running",
-					   "ALTER SUBSCRIPTION ... REFRESH SEQUENCES"),
-				errhint("Try again after the current synchronization completes."));
-	}
-
-	LWLockRelease(LogicalRepWorkerLock);
-
 	/* Load the library providing us libpq calls. */
 	load_file("libpqwalreceiver", false);
 
@@ -2895,6 +2868,9 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 
 	form = (Form_pg_subscription) GETSTRUCT(tup);
 
+	/* Must only alter subscriptions belonging to the current database. */
+	Assert(form->subdbid == MyDatabaseId);
+
 	if (form->subowner == newOwnerId)
 		return;
 
@@ -3014,6 +2990,7 @@ AlterSubscriptionOwner_oid(Oid subid, Oid newOwnerId)
 {
 	HeapTuple	tup;
 	Relation	rel;
+	Form_pg_subscription form;
 
 	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
 
@@ -3024,7 +3001,15 @@ AlterSubscriptionOwner_oid(Oid subid, Oid newOwnerId)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("subscription with OID %u does not exist", subid)));
 
-	AlterSubscriptionOwner_internal(rel, tup, newOwnerId);
+	form = (Form_pg_subscription) GETSTRUCT(tup);
+
+	/*
+	 * Don't process subscriptions belonging to other databases. While
+	 * pg_subscription is a shared catalog, subscriptions refer to db-local
+	 * objects which exist only in the database identified by subdbid.
+	 */
+	if (form->subdbid == MyDatabaseId)
+		AlterSubscriptionOwner_internal(rel, tup, newOwnerId);
 
 	heap_freetuple(tup);
 
