@@ -1381,6 +1381,16 @@ AlterSubscription_refresh_seq(Subscription *sub)
 	/* The publisher connection is only needed for the origin check. */
 	PG_TRY();
 	{
+		/*
+		 * Sequence synchronization depends on publisher-side functionality
+		 * introduced in PostgreSQL 19, so it cannot work against an older
+		 * publisher.
+		 */
+		if (walrcv_server_version(wrconn) < 190000)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot synchronize sequences if the publisher is running a version earlier than PostgreSQL 19"));
+
 		check_publications_origin_sequences(wrconn, sub->publications, true,
 											sub->origin, NULL, 0, sub->name);
 	}
@@ -2939,11 +2949,12 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 
 	/*
 	 * If the subscription uses a server, check that the new owner has USAGE
-	 * privileges on the server and that a user mapping exists. Note: does not
-	 * re-check the resulting connection string.
+	 * privileges on the server, that a user mapping exists, and that the
+	 * resulting connection string is valid for the new owner.
 	 */
 	if (OidIsValid(form->subserver))
 	{
+		char	   *conninfo;
 		ForeignServer *server = GetForeignServer(form->subserver);
 
 		aclresult = object_aclcheck(ForeignServerRelationId, server->serverid, newOwnerId, ACL_USAGE);
@@ -2956,6 +2967,15 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 
 		/* make sure a user mapping exists */
 		GetUserMapping(newOwnerId, server->serverid);
+
+		conninfo = ForeignServerConnectionString(newOwnerId, server);
+
+		/* Load the library providing us libpq calls. */
+		load_file("libpqwalreceiver", false);
+		/* Check the connection info string. */
+		walrcv_check_conninfo(conninfo,
+							  form->subpasswordrequired &&
+							  !superuser_arg(newOwnerId));
 	}
 
 	form->subowner = newOwnerId;
