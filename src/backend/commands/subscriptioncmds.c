@@ -1087,7 +1087,7 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 
 static void
 AlterSubscription_refresh(Subscription *sub, bool copy_data,
-						  List *validate_publications)
+						  List *validate_publications, char *conninfo)
 {
 	char	   *err;
 	List	   *pubrels = NIL;
@@ -1111,12 +1111,19 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 	WalReceiverConn *wrconn;
 	bool		must_use_password;
 
+	/*
+	 * Should not happen: CREATE/ALTER/DROP SUBSCRIPTION did not call
+	 * SubscriptionConninfo() in a path where it's required.
+	 */
+	if (!conninfo)
+		elog(ERROR, "no connection string provided for subscription");
+
 	/* Load the library providing us libpq calls. */
 	load_file("libpqwalreceiver", false);
 
 	/* Try to connect to the publisher. */
 	must_use_password = sub->passwordrequired && !sub->ownersuperuser;
-	wrconn = walrcv_connect(sub->conninfo, true, true, must_use_password,
+	wrconn = walrcv_connect(conninfo, true, true, must_use_password,
 							sub->name, &err);
 	if (!wrconn)
 		ereport(ERROR,
@@ -1357,19 +1364,26 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
  * Marks all sequences with INIT state.
  */
 static void
-AlterSubscription_refresh_seq(Subscription *sub)
+AlterSubscription_refresh_seq(Subscription *sub, char *conninfo)
 {
 	char	   *err = NULL;
 	WalReceiverConn *wrconn;
 	bool		must_use_password;
 	List	   *subrel_states;
 
+	/*
+	 * Should not happen: CREATE/ALTER/DROP SUBSCRIPTION did not call
+	 * SubscriptionConninfo() in a path where it's required.
+	 */
+	if (!conninfo)
+		elog(ERROR, "no connection string provided for subscription");
+
 	/* Load the library providing us libpq calls. */
 	load_file("libpqwalreceiver", false);
 
 	/* Try to connect to the publisher. */
 	must_use_password = sub->passwordrequired && !sub->ownersuperuser;
-	wrconn = walrcv_connect(sub->conninfo, true, true, must_use_password,
+	wrconn = walrcv_connect(conninfo, true, true, must_use_password,
 							sub->name, &err);
 	if (!wrconn)
 		ereport(ERROR,
@@ -1617,7 +1631,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	Datum		values[Natts_pg_subscription];
 	HeapTuple	tup;
 	Oid			subid;
-	bool		orig_conninfo_needed = true;
+	bool		orig_conninfo_needed = false;
 	bool		update_tuple = false;
 	bool		update_failover = false;
 	bool		update_two_phase = false;
@@ -1626,6 +1640,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	int			max_retention;
 	bool		retention_active;
 	char	   *new_conninfo = NULL;
+	char	   *orig_conninfo = NULL;
 	char	   *origin;
 	Subscription *sub;
 	Form_pg_subscription form;
@@ -1698,34 +1713,59 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	if (supported_opts > 0)
 		parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
+	sub = GetSubscription(subid, false);
+
 	/*
-	 * Ensure that ALTER SUBSCRIPTION commands that could be used to fix a
-	 * broken connection or prepare to drop a broken subscription don't
-	 * attempt to construct the conninfo. Otherwise, we might encounter the
-	 * error the user is trying to fix.
-	 *
-	 * Specifically, ALTER SUBSCRIPTION DISABLE, ALTER SUBSCRIPTION SERVER,
-	 * ALTER SUBSCRIPTION CONNECTION, or ALTER SUBSCRIPTION SET
-	 * (slot_name=NONE).
-	 *
-	 * NB: if the user specifies multiple SET options, then we may still need
-	 * to construct conninfo even if slot_name is set to NONE.
+	 * Determine in advance whether we need the original conninfo or not, so
+	 * that errors are generated consistently in cases where we do need it;
+	 * and not generated at all if we don't.
 	 */
-	if (stmt->kind == ALTER_SUBSCRIPTION_ENABLED)
+
+	/* conninfo needed when refreshing */
+	switch (stmt->kind)
 	{
-		if (opts.specified_opts == SUBOPT_ENABLED && !opts.enabled)
-			orig_conninfo_needed = false;
-	}
-	else if (stmt->kind == ALTER_SUBSCRIPTION_SERVER ||
-			 stmt->kind == ALTER_SUBSCRIPTION_CONNECTION)
-	{
-		orig_conninfo_needed = false;
-	}
-	else if (stmt->kind == ALTER_SUBSCRIPTION_OPTIONS)
-	{
-		/* ... SET (slot_name = NONE) with no other options */
-		if (opts.specified_opts == SUBOPT_SLOT_NAME && !opts.slot_name)
-			orig_conninfo_needed = false;
+		case ALTER_SUBSCRIPTION_REFRESH_PUBLICATION:
+		case ALTER_SUBSCRIPTION_REFRESH_SEQUENCES:
+			orig_conninfo_needed = true;
+			break;
+
+		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
+		case ALTER_SUBSCRIPTION_ADD_PUBLICATION:
+		case ALTER_SUBSCRIPTION_DROP_PUBLICATION:
+			/* opts.refresh defaults to true when the option is supported */
+			orig_conninfo_needed = opts.refresh;
+			break;
+
+		case ALTER_SUBSCRIPTION_OPTIONS:
+			{
+				if (sub->slotname)
+				{
+					if (IsSet(opts.specified_opts, SUBOPT_FAILOVER))
+						orig_conninfo_needed = true;
+					if (IsSet(opts.specified_opts, SUBOPT_TWOPHASE_COMMIT) &&
+						!opts.twophase)
+						orig_conninfo_needed = true;
+				}
+
+				if (IsSet(opts.specified_opts, SUBOPT_RETAIN_DEAD_TUPLES) &&
+					opts.retaindeadtuples)
+					orig_conninfo_needed = true;
+
+				if (IsSet(opts.specified_opts, SUBOPT_ORIGIN))
+				{
+					bool		rdt;
+
+					rdt = IsSet(opts.specified_opts, SUBOPT_RETAIN_DEAD_TUPLES) ?
+						opts.retaindeadtuples : sub->retaindeadtuples;
+
+					if (rdt && pg_strcasecmp(opts.origin, LOGICALREP_ORIGIN_ANY) == 0)
+						orig_conninfo_needed = true;
+				}
+			}
+			break;
+
+		default:
+			break;
 	}
 
 	/*
@@ -1735,7 +1775,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 	 * there's no need to do an additional ACL check here; that will be done
 	 * by the subscription worker.
 	 */
-	sub = GetSubscription(subid, false, orig_conninfo_needed, false);
+	if (orig_conninfo_needed)
+		orig_conninfo = SubscriptionConninfo(sub, false);
 
 	retain_dead_tuples = sub->retaindeadtuples;
 	origin = sub->origin;
@@ -2218,7 +2259,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					sub->publications = stmt->publication;
 
 					AlterSubscription_refresh(sub, opts.copy_data,
-											  stmt->publication);
+											  stmt->publication,
+											  orig_conninfo);
 				}
 
 				break;
@@ -2273,7 +2315,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					sub->publications = publist;
 
 					AlterSubscription_refresh(sub, opts.copy_data,
-											  validate_publications);
+											  validate_publications,
+											  orig_conninfo);
 				}
 
 				break;
@@ -2312,7 +2355,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 
 				PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION ... REFRESH PUBLICATION");
 
-				AlterSubscription_refresh(sub, opts.copy_data, NULL);
+				AlterSubscription_refresh(sub, opts.copy_data, NULL,
+										  orig_conninfo);
 
 				break;
 			}
@@ -2325,7 +2369,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 							errmsg("%s is not allowed for disabled subscriptions",
 								   "ALTER SUBSCRIPTION ... REFRESH SEQUENCES"));
 
-				AlterSubscription_refresh_seq(sub);
+				AlterSubscription_refresh_seq(sub, orig_conninfo);
 
 				break;
 			}
@@ -2397,7 +2441,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		char	   *err;
 		WalReceiverConn *wrconn;
 
-		Assert(new_conninfo || orig_conninfo_needed);
+		Assert(new_conninfo || orig_conninfo);
 
 		/* Load the library providing us libpq calls. */
 		load_file("libpqwalreceiver", false);
@@ -2407,7 +2451,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 		 * available.
 		 */
 		must_use_password = sub->passwordrequired && !sub->ownersuperuser;
-		wrconn = walrcv_connect(new_conninfo ? new_conninfo : sub->conninfo,
+		wrconn = walrcv_connect(new_conninfo ? new_conninfo : orig_conninfo,
 								true, true, must_use_password, sub->name,
 								&err);
 		if (!wrconn)

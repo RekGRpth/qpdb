@@ -482,6 +482,7 @@ static MemoryContext LogicalStreamingContext = NULL;
 WalReceiverConn *LogRepWorkerWalRcvConn = NULL;
 
 Subscription *MySubscription = NULL;
+char	   *MySubscriptionConninfo = NULL;
 static bool MySubscriptionValid = false;
 
 static List *on_commit_wakeup_workers_subids = NIL;
@@ -5061,6 +5062,8 @@ void
 maybe_reread_subscription(void)
 {
 	Subscription *newsub;
+	char	   *old_conninfo;
+	char	   *new_conninfo;
 	bool		started_tx = false;
 
 	/* When cache state is valid there is nothing to do here. */
@@ -5074,7 +5077,7 @@ maybe_reread_subscription(void)
 		started_tx = true;
 	}
 
-	newsub = GetSubscription(MyLogicalRepWorker->subid, true, true, true);
+	newsub = GetSubscription(MyLogicalRepWorker->subid, true);
 
 	if (newsub)
 	{
@@ -5107,6 +5110,13 @@ maybe_reread_subscription(void)
 		apply_worker_exit();
 	}
 
+	/*
+	 * May raise error, so build conninfo after checking that the subscription
+	 * is enabled. Allocated in transaction context; must be copied to
+	 * ApplyContext when we set MySubscriptionConninfo.
+	 */
+	new_conninfo = SubscriptionConninfo(newsub, true);
+
 	/* !slotname should never happen when enabled is true. */
 	Assert(newsub->slotname);
 
@@ -5120,7 +5130,7 @@ maybe_reread_subscription(void)
 	 * 'parallel' to any other value or the server decides not to stream the
 	 * in-progress transaction.
 	 */
-	if (strcmp(newsub->conninfo, MySubscription->conninfo) != 0 ||
+	if (strcmp(new_conninfo, MySubscriptionConninfo) != 0 ||
 		strcmp(newsub->name, MySubscription->name) != 0 ||
 		strcmp(newsub->slotname, MySubscription->slotname) != 0 ||
 		newsub->binary != MySubscription->binary ||
@@ -5170,6 +5180,11 @@ maybe_reread_subscription(void)
 	/* Clean old subscription info and switch to new one. */
 	MemoryContextDelete(MySubscription->cxt);
 	MySubscription = newsub;
+
+	/* copy to ApplyContext and update MySubscriptionConninfo */
+	old_conninfo = MySubscriptionConninfo;
+	MySubscriptionConninfo = MemoryContextStrdup(ApplyContext, new_conninfo);
+	pfree(old_conninfo);
 
 	/* Change synchronous commit according to the user's wishes */
 	SetConfigOption("synchronous_commit", MySubscription->synccommit,
@@ -5718,7 +5733,7 @@ run_apply_worker(void)
 	must_use_password = MySubscription->passwordrequired &&
 		!MySubscription->ownersuperuser;
 
-	LogRepWorkerWalRcvConn = walrcv_connect(MySubscription->conninfo, true,
+	LogRepWorkerWalRcvConn = walrcv_connect(MySubscriptionConninfo, true,
 											true, must_use_password,
 											MySubscription->name, &err);
 
@@ -5846,7 +5861,7 @@ InitializeLogRepWorker(void)
 	LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid, 0,
 					 AccessShareLock);
 
-	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true, true, true);
+	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true);
 
 	if (MySubscription)
 	{
@@ -5865,8 +5880,6 @@ InitializeLogRepWorker(void)
 		proc_exit(0);
 	}
 
-	MySubscriptionValid = true;
-
 	if (!MySubscription->enabled)
 	{
 		ereport(LOG,
@@ -5875,6 +5888,17 @@ InitializeLogRepWorker(void)
 
 		apply_worker_exit();
 	}
+
+	/*
+	 * May raise error for server-based subscriptions, so build conninfo after
+	 * checking that the subscription is enabled. Build in transaction context
+	 * and copy to ApplyContext.
+	 */
+	MySubscriptionConninfo =
+		MemoryContextStrdup(ApplyContext,
+							SubscriptionConninfo(MySubscription, true));
+
+	MySubscriptionValid = true;
 
 	/*
 	 * Restart the worker if retain_dead_tuples was enabled during startup.
