@@ -676,8 +676,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	Datum		values[Natts_pg_subscription];
 	Oid			owner = GetUserId();
 	HeapTuple	tup;
-	Oid			serverid;
-	char	   *conninfo;
+	Oid			serverid = InvalidOid;
+	char	   *conninfo = NULL;
 	char		originname[NAMEDATALEN];
 	List	   *publications;
 	uint32		supported_opts;
@@ -798,29 +798,46 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 		ForeignServer *server;
 
 		Assert(!stmt->conninfo);
-		conninfo = NULL;
 
 		server = GetForeignServerByName(stmt->servername, false);
-		aclresult = object_aclcheck(ForeignServerRelationId, server->serverid, owner, ACL_USAGE);
+		serverid = server->serverid;
+
+		/* check USAGE privileges on server */
+		aclresult = object_aclcheck(ForeignServerRelationId, serverid, owner, ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, server->servername);
 
-		/* make sure a user mapping exists */
-		GetUserMapping(owner, server->serverid);
+		/* check user mapping */
+		GetUserMappingExtended(owner, server->serverid, WARNING);
 
-		serverid = server->serverid;
-		conninfo = ForeignServerConnectionString(owner, server);
+		/*
+		 * Check conninfo if connecting; otherwise only check that the
+		 * server's FDW supports connections.
+		 */
+		if (opts.connect)
+		{
+			conninfo = ForeignServerConnectionString(owner, server);
+			walrcv_check_conninfo(conninfo, opts.passwordrequired && !superuser());
+		}
+		else
+		{
+			ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+
+			if (!OidIsValid(fdw->fdwconnection))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("foreign-data wrapper \"%s\" does not support subscription connections",
+								fdw->fdwname),
+						 errdetail("Foreign-data wrapper must be defined with CONNECTION specified.")));
+		}
 	}
 	else
 	{
 		Assert(stmt->conninfo);
 
-		serverid = InvalidOid;
 		conninfo = stmt->conninfo;
+		walrcv_check_conninfo(conninfo, opts.passwordrequired && !superuser());
 	}
-
-	/* Check the connection info string. */
-	walrcv_check_conninfo(conninfo, opts.passwordrequired && !superuser());
 
 	publications = stmt->publication;
 
@@ -1768,15 +1785,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 			break;
 	}
 
-	/*
-	 * Skip ACL checks on the subscription's foreign server, if any. If
-	 * changing the server (or replacing it with a raw connection), then the
-	 * old one will be removed anyway. If changing something unrelated,
-	 * there's no need to do an additional ACL check here; that will be done
-	 * by the subscription worker.
-	 */
 	if (orig_conninfo_needed)
-		orig_conninfo = SubscriptionConninfo(sub, false);
+		orig_conninfo = SubscriptionConninfo(sub);
 
 	retain_dead_tuples = sub->retaindeadtuples;
 	origin = sub->origin;
@@ -2164,8 +2174,8 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 								   GetUserNameFromId(form->subowner, false),
 								   new_server->servername));
 
-				/* make sure a user mapping exists */
-				GetUserMapping(form->subowner, new_server->serverid);
+				/* check user mapping */
+				GetUserMappingExtended(form->subowner, new_server->serverid, WARNING);
 
 				new_conninfo = ForeignServerConnectionString(form->subowner,
 															 new_server);
@@ -2983,35 +2993,15 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 					   get_database_name(MyDatabaseId));
 
 	/*
-	 * If the subscription uses a server, check that the new owner has USAGE
-	 * privileges on the server, that a user mapping exists, and that the
-	 * resulting connection string is valid for the new owner.
+	 * The privileges will be checked before the connection is actually used,
+	 * so it does not need to be done here. Avoid unnecessary risk of errors
+	 * here, which could interfere with restore.
+	 *
+	 * However, it is convenient to check if a user mapping exists, and raise
+	 * a WARNING if not.
 	 */
 	if (OidIsValid(form->subserver))
-	{
-		char	   *conninfo;
-		ForeignServer *server = GetForeignServer(form->subserver);
-
-		aclresult = object_aclcheck(ForeignServerRelationId, server->serverid, newOwnerId, ACL_USAGE);
-		if (aclresult != ACLCHECK_OK)
-			ereport(ERROR,
-					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					errmsg("new subscription owner \"%s\" does not have permission on foreign server \"%s\"",
-						   GetUserNameFromId(newOwnerId, false),
-						   server->servername));
-
-		/* make sure a user mapping exists */
-		GetUserMapping(newOwnerId, server->serverid);
-
-		conninfo = ForeignServerConnectionString(newOwnerId, server);
-
-		/* Load the library providing us libpq calls. */
-		load_file("libpqwalreceiver", false);
-		/* Check the connection info string. */
-		walrcv_check_conninfo(conninfo,
-							  form->subpasswordrequired &&
-							  !superuser_arg(newOwnerId));
-	}
+		GetUserMappingExtended(newOwnerId, form->subserver, WARNING);
 
 	form->subowner = newOwnerId;
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
