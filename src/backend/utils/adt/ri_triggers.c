@@ -32,6 +32,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_namespace.h"
@@ -142,6 +143,7 @@ typedef struct RI_ConstraintInfo
 
 	Oid			conindid;
 	bool		pk_is_partitioned;
+	bool		pk_index_is_btree;	/* is conindid a btree index? */
 
 	FastPathMeta *fpmeta;
 } RI_ConstraintInfo;
@@ -2503,6 +2505,8 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	riinfo->conindid = conForm->conindid;
 	riinfo->pk_is_partitioned =
 		(get_rel_relkind(riinfo->pk_relid) == RELKIND_PARTITIONED_TABLE);
+	riinfo->pk_index_is_btree =
+		(get_rel_relam(riinfo->conindid) == BTREE_AM_OID);
 
 	ReleaseSysCache(tup);
 
@@ -2795,9 +2799,6 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
  *
  * If no matching PK row exists, report the violation via ri_ReportViolation(),
  * otherwise, the function returns normally.
- *
- * Note: This is only used by the ALTER TABLE validation path. Other paths use
- * ri_FastPathBatchAdd().
  */
 static void
 ri_FastPathCheck(RI_ConstraintInfo *riinfo,
@@ -2827,10 +2828,6 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	idx_rel = index_open(riinfo->conindid, AccessShareLock);
 
 	slot = table_slot_create(pk_rel, NULL);
-	scandesc = index_beginscan(pk_rel, idx_rel,
-							   snapshot, NULL,
-							   riinfo->nkeys, 0,
-							   SO_NONE);
 
 	GetUserIdAndSecContext(&saved_userid, &saved_sec_context);
 	SetUserIdAndSecContext(RelationGetForm(pk_rel)->relowner,
@@ -2838,6 +2835,17 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 						   SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
 	ri_CheckPermissions(pk_rel);
+
+	/*
+	 * Begin the scan under the switched user id, so that any access method
+	 * code invoked by index_beginscan() runs as the PK relation's owner.  For
+	 * btree this has no functional consequence, but it keeps the ordering
+	 * correct for out-of-tree access methods.
+	 */
+	scandesc = index_beginscan(pk_rel, idx_rel,
+							   snapshot, NULL,
+							   riinfo->nkeys, 0,
+							   SO_NONE);
 
 	if (riinfo->fpmeta == NULL)
 	{
@@ -2964,9 +2972,6 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 */
 	oldcxt = MemoryContextSwitchTo(fpentry->flush_cxt);
 
-	scandesc = index_beginscan(pk_rel, idx_rel, snapshot, NULL,
-							   riinfo->nkeys, 0, SO_NONE);
-
 	GetUserIdAndSecContext(&saved_userid, &saved_sec_context);
 	SetUserIdAndSecContext(RelationGetForm(pk_rel)->relowner,
 						   saved_sec_context |
@@ -2981,6 +2986,15 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 * ri_FastPathCheck().
 	 */
 	ri_CheckPermissions(pk_rel);
+
+	/*
+	 * Begin the scan under the switched user id, so that any access method
+	 * code invoked by index_beginscan() runs as the PK relation's owner.  For
+	 * btree this has no functional consequence, but it keeps the ordering
+	 * correct for out-of-tree access methods.
+	 */
+	scandesc = index_beginscan(pk_rel, idx_rel, snapshot, NULL,
+							   riinfo->nkeys, 0, SO_NONE);
 
 	if (riinfo->fpmeta == NULL)
 	{
@@ -3153,7 +3167,8 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 	 * Build scan key with SK_SEARCHARRAY.  The index AM code will internally
 	 * sort and deduplicate, then walk leaf pages in order.
 	 *
-	 * PK indexes are always btree, which supports SK_SEARCHARRAY.
+	 * ri_fastpath_is_applicable() restricts the fast path to btree indexes,
+	 * which support SK_SEARCHARRAY.
 	 *
 	 * This path handles single-column FKs only, so index_attnos[0] == 1.
 	 */
@@ -3184,9 +3199,19 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 		if (!ri_LockPKTuple(pk_rel, pk_slot, snapshot, &concurrently_updated))
 			continue;
 
-		/* Extract the PK value from the matched and locked tuple */
+		/*
+		 * Extract the PK value from the matched and locked tuple.
+		 *
+		 * A foreign key may reference a nullable unique column, not just a
+		 * NOT NULL primary key.  If ri_LockPKTuple() chased an update chain
+		 * to a version whose referenced key is now NULL, that version cannot
+		 * equal any buffered (non-null) FK value, so skip it.  This mirrors
+		 * the SPI path, where the requalifying "pkatt = $n" yields NULL and
+		 * the row is not returned.
+		 */
 		found_val = slot_getattr(pk_slot, riinfo->pk_attnums[0], &found_null);
-		Assert(!found_null);
+		if (found_null)
+			continue;
 
 		if (concurrently_updated)
 		{
@@ -3362,6 +3387,17 @@ ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
 	if (riinfo->hasperiod)
 		return false;
 
+	/*
+	 * The fast path probes the referenced index directly and, for
+	 * single-column keys, uses SK_SEARCHARRAY.  A foreign key's referenced
+	 * index need not be a primary key; transformFkeyCheckAttrs() accepts any
+	 * unique index, so an out-of-tree amcanunique access method could reach
+	 * here.  Restrict the fast path to btree, which is what the direct probe
+	 * and SK_SEARCHARRAY assume; other access methods fall back to SPI.
+	 */
+	if (!riinfo->pk_index_is_btree)
+		return false;
+
 	return true;
 }
 
@@ -3427,9 +3463,14 @@ recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys, int nkeys,
 	{
 		ScanKeyData *skey = &skeys[i];
 
-		/* A PK column can never be set to NULL. */
-		Assert(!isnull[i]);
-		if (!DatumGetBool(FunctionCall2Coll(&skey->sk_func,
+		/*
+		 * A foreign key may reference a nullable unique column, so the
+		 * version we chased the update chain to may have a NULL in a key
+		 * column.  A NULL never equals the value we searched for, so treat it
+		 * as no match, as the SPI path's requalification would.
+		 */
+		if (isnull[i] ||
+			!DatumGetBool(FunctionCall2Coll(&skey->sk_func,
 											skey->sk_collation,
 											values[i],
 											skey->sk_argument)))

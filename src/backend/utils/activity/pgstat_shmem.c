@@ -404,11 +404,16 @@ pgstat_acquire_entry_ref(PgStat_EntryRef *entry_ref,
 
 	pg_atomic_fetch_add_u32(&shhashent->refcount, 1);
 
-	dshash_release_lock(pgStatLocal.shared_hash, shhashent);
-
 	entry_ref->shared_stats = shheader;
 	entry_ref->shared_entry = shhashent;
 	entry_ref->generation = pg_atomic_read_u32(&shhashent->generation);
+
+	/*
+	 * Complete the local reference before releasing the lock.  Releasing an
+	 * LWLock can process a pending interrupt, and callers may catch the
+	 * resulting error and continue using the backend-local cache.
+	 */
+	dshash_release_lock(pgStatLocal.shared_hash, shhashent);
 }
 
 /*
@@ -553,9 +558,12 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 			if (shheader == NULL)
 			{
 				/*
-				 * Failed the allocation of a new entry, so clean up the
-				 * shared hashtable before giving up.
+				 * Failed the allocation of a new entry, so clean up both the
+				 * local reference and the shared hashtable before giving up.
+				 * Clean the local state first, since releasing the dshash
+				 * lock can process a pending interrupt.
 				 */
+				pgstat_release_entry_ref(key, entry_ref, false);
 				dshash_delete_entry(pgStatLocal.shared_hash, shhashent);
 
 				ereport(ERROR,
