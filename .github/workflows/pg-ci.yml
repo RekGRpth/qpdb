@@ -303,7 +303,7 @@ jobs:
       - &ccache_restore_default_step
         name: "ccache: Restore for default branch ${{github.event.repository.default_branch}}"
         if: ${{ env.ON_DEFAULT_BRANCH == 'false' }}
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache${{env.CACHE_PREFIX_DEFAULT}}${{env.CACHE_SUFFIX}}
@@ -312,7 +312,7 @@ jobs:
       - &ccache_restore_branch_step
         name: "ccache: Restore for branch ${{ github.ref_name }}"
         id: ccache-restore-branch
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache${{env.CACHE_PREFIX_BRANCH}}${{env.CACHE_SUFFIX}}
@@ -372,7 +372,7 @@ jobs:
 
       - &ccache_save_step
         name: "ccache: Upload cache"
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         if: |
           always() &&
           steps.ccache-decide.outputs.should_save == 'true'
@@ -752,7 +752,7 @@ jobs:
 
       - name: "MacPorts: Restore cache"
         id: mp-restore
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.MACPORTS_CACHE }}
           key: ${{ steps.mp-key.outputs.key }}
@@ -786,7 +786,7 @@ jobs:
       # Save macports before running build / tests, creating macports can be
       # quite slow, so we don't want to start from scratch in the next run.
       - name: "MacPorts: Save cache"
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         # Don't save cache if we had an exact match
         if: |
           steps.mp-install.conclusion == 'success' &&
