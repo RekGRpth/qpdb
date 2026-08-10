@@ -32,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -565,7 +566,7 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("relation \"%s\" is already member of publication \"%s\"",
+				 errmsg("relation \"%s\" is already a member of publication \"%s\"",
 						RelationGetRelationName(targetrel), pub->name)));
 	}
 
@@ -619,9 +620,12 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 
 	/* Add dependency on the objects mentioned in the qualifications */
 	if (pri->whereClause)
+	{
+		CheckUsageOnTypesInSingleRelExpr(pri->whereClause, relid, GetUserId());
 		recordDependencyOnSingleRelExpr(&myself, pri->whereClause, relid,
 										DEPENDENCY_NORMAL, DEPENDENCY_NORMAL,
 										false);
+	}
 
 	/* Add dependency on the columns, if any are listed */
 	i = -1;
@@ -826,7 +830,7 @@ publication_add_schema(Oid pubid, Oid schemaid, bool if_not_exists)
 
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("schema \"%s\" is already member of publication \"%s\"",
+				 errmsg("schema \"%s\" is already a member of publication \"%s\"",
 						get_namespace_name(schemaid), pub->name)));
 	}
 

@@ -2587,25 +2587,26 @@ normalize_datum(Datum orig, SortSupport ssup)
 {
 	Datum		norm_datum1;
 
-	if (ssup->comparator == ssup_datum_signed_cmp)
-	{
+	if (ssup->comparator == ssup_datum_int64_cmp)
 		norm_datum1 = orig + (Int64GetDatum(PG_INT64_MAX)) + 1;
-	}
-	else if (ssup->comparator == ssup_datum_int32_cmp)
+	else if (ssup->comparator == ssup_datum_uint64_cmp)
+		norm_datum1 = orig;
+	else
 	{
 		/*
-		 * First truncate to uint32. Technically, we don't need to do this,
+		 * Truncate to uint32. For the int32 case, we don't need to do this,
 		 * but it forces the upper half of the datum to be zero regardless of
 		 * sign.
 		 */
-		uint32		u32 = DatumGetUInt32(orig) + ((uint32) PG_INT32_MAX) + 1;
+		uint32		u32 = DatumGetUInt32(orig);
 
-		norm_datum1 = UInt32GetDatum(u32);
-	}
-	else
-	{
-		Assert(ssup->comparator == ssup_datum_unsigned_cmp);
-		norm_datum1 = orig;
+		if (ssup->comparator == ssup_datum_int32_cmp)
+			norm_datum1 = UInt32GetDatum(u32 + ((uint32) PG_INT32_MAX) + 1);
+		else
+		{
+			norm_datum1 = UInt32GetDatum(u32);
+			Assert(ssup->comparator == ssup_datum_uint32_cmp);
+		}
 	}
 
 	if (ssup->ssup_reverse)
@@ -3009,8 +3010,9 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 
 			/* Does it compare as an integer? */
 			if (state->memtupcount >= QSORT_THRESHOLD &&
-				(ssup->comparator == ssup_datum_unsigned_cmp ||
-				 ssup->comparator == ssup_datum_signed_cmp ||
+				(ssup->comparator == ssup_datum_uint64_cmp ||
+				 ssup->comparator == ssup_datum_int64_cmp ||
+				 ssup->comparator == ssup_datum_uint32_cmp ||
 				 ssup->comparator == ssup_datum_int32_cmp))
 			{
 				radix_sort_tuple(state->memtuples,
@@ -3447,7 +3449,7 @@ free_sort_tuple(Tuplesortstate *state, SortTuple *stup)
 }
 
 int
-ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
+ssup_datum_uint64_cmp(Datum x, Datum y, SortSupport ssup)
 {
 	if (x < y)
 		return -1;
@@ -3458,10 +3460,24 @@ ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
 }
 
 int
-ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
+ssup_datum_int64_cmp(Datum x, Datum y, SortSupport ssup)
 {
 	int64		xx = DatumGetInt64(x);
 	int64		yy = DatumGetInt64(y);
+
+	if (xx < yy)
+		return -1;
+	else if (xx > yy)
+		return 1;
+	else
+		return 0;
+}
+
+int
+ssup_datum_uint32_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	uint32		xx = DatumGetUInt32(x);
+	uint32		yy = DatumGetUInt32(y);
 
 	if (xx < yy)
 		return -1;
