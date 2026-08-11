@@ -30,6 +30,7 @@
 #endif
 
 #include "catalog/pg_type_d.h"
+#include "common/logging.h"
 #include "fe_utils/mbprint.h"
 #include "fe_utils/print.h"
 
@@ -606,7 +607,7 @@ print_unaligned_vertical(const printTableContent *cont, FILE *fout)
 
 /* draw "line" */
 static void
-_print_horizontal_line(const unsigned int ncolumns, const unsigned int *widths,
+_print_horizontal_line(unsigned int ncolumns, const unsigned int *widths,
 					   unsigned short border, printTextRule pos,
 					   const printTextFormat *format,
 					   FILE *fout)
@@ -3206,8 +3207,8 @@ ClosePager(FILE *pagerpipe)
  * table.
  */
 void
-printTableInit(printTableContent *const content, const printTableOpt *opt,
-			   const char *title, const int ncolumns, const int nrows)
+printTableInit(printTableContent *content, const printTableOpt *opt,
+			   const char *title, int ncolumns, int nrows)
 {
 	uint64		total_cells;
 
@@ -3217,28 +3218,25 @@ printTableInit(printTableContent *const content, const printTableOpt *opt,
 	content->nrows = nrows;
 
 	content->headers = pg_malloc0_array(const char *, (ncolumns + 1));
+	content->headersadded = 0;
+	content->headermustfree = NULL;
 
 	total_cells = (uint64) ncolumns * nrows;
+
 	/* Catch possible overflow.  Using >= here allows adding 1 below */
 	if (total_cells >= SIZE_MAX / sizeof(*content->cells))
-	{
-		fprintf(stderr, _("Cannot print table contents: number of cells %" PRIu64 " is equal to or exceeds maximum %zu.\n"),
-				total_cells,
-				SIZE_MAX / sizeof(*content->cells));
-		exit(EXIT_FAILURE);
-	}
-	content->cells = pg_malloc0_array(const char *, (total_cells + 1));
+		pg_fatal("cannot print table contents: number of cells %" PRIu64 " is equal to or exceeds maximum %zu",
+				 total_cells, SIZE_MAX / sizeof(*content->cells));
 
+	content->cells = pg_malloc0_array(const char *, (total_cells + 1));
+	content->cellsadded = 0;
 	content->cellmustfree = NULL;
+
 	content->footers = NULL;
 
 	content->aligns = pg_malloc0_array(char, (ncolumns + 1));
 
-	content->header = content->headers;
-	content->cell = content->cells;
 	content->footer = content->footers;
-	content->align = content->aligns;
-	content->cellsadded = 0;
 }
 
 /*
@@ -3254,31 +3252,45 @@ printTableInit(printTableContent *const content, const printTableOpt *opt,
  * column.
  */
 void
-printTableAddHeader(printTableContent *const content, char *header,
-					const bool translate, const char align)
+printTableAddHeader(printTableContent *content, const char *header,
+					bool translate, char align)
 {
-#ifndef ENABLE_NLS
-	(void) translate;			/* unused parameter */
-#endif
+	bool		mustfree = false;
 
-	if (content->header >= content->headers + content->ncolumns)
+	if (content->headersadded >= content->ncolumns)
+		pg_fatal("cannot add header to table content: column count of %d exceeded",
+				 content->ncolumns);
+
+	if (translate)
+		header = _(header);
+
+	/*
+	 * Note: Translated strings are not checked for encoding validity.  These
+	 * are provided by ourselves, so they had better be ok.  And if they were
+	 * not, running mbvalidate on them could overwrite gettext-owned memory.
+	 */
+	if (!translate && !mb_is_valid((unsigned char *) header, content->opt->encoding))
 	{
-		fprintf(stderr, _("Cannot add header to table content: "
-						  "column count of %d exceeded.\n"),
-				content->ncolumns);
-		exit(EXIT_FAILURE);
+		char	   *header2;
+
+		header2 = pg_strdup(header);
+		header = (char *) mbvalidate((unsigned char *) header2, content->opt->encoding);
+		mustfree = true;
 	}
 
-	*content->header = (char *) mbvalidate((unsigned char *) header,
-										   content->opt->encoding);
-#ifdef ENABLE_NLS
-	if (translate)
-		*content->header = _(*content->header);
-#endif
-	content->header++;
+	content->headers[content->headersadded] = header;
+	content->aligns[content->headersadded] = align;
 
-	*content->align = align;
-	content->align++;
+	if (mustfree)
+	{
+		if (content->headermustfree == NULL)
+			content->headermustfree =
+				pg_malloc0_array(bool, (content->ncolumns + 1));
+
+		content->headermustfree[content->headersadded] = true;
+	}
+
+	content->headersadded++;
 }
 
 /*
@@ -3294,30 +3306,46 @@ printTableAddHeader(printTableContent *const content, char *header,
  * Note: Automatic freeing of translatable strings is not supported.
  */
 void
-printTableAddCell(printTableContent *const content, char *cell,
-				  const bool translate, const bool mustfree)
+printTableAddCell(printTableContent *content, const char *cell,
+				  bool translate, bool mustfree)
 {
 	uint64		total_cells;
 
-#ifndef ENABLE_NLS
-	(void) translate;			/* unused parameter */
-#endif
-
 	total_cells = (uint64) content->ncolumns * content->nrows;
+
 	if (content->cellsadded >= total_cells)
+		pg_fatal("cannot add cell to table content: total cell count of %" PRIu64 " exceeded",
+				 total_cells);
+
+	Assert(!(translate && mustfree));
+
+	if (translate)
+		cell = _(cell);
+
+	/*
+	 * Note: Translated strings are not checked for encoding validity.  These
+	 * are provided by ourselves, so they had better be ok.  And if they were
+	 * not, running mbvalidate on them could overwrite gettext-owned memory.
+	 */
+	if (!translate && !mb_is_valid((unsigned char *) cell, content->opt->encoding))
 	{
-		fprintf(stderr, _("Cannot add cell to table content: total cell count of %" PRIu64 " exceeded.\n"),
-				total_cells);
-		exit(EXIT_FAILURE);
+		char	   *cell2;
+
+		/*
+		 * If mustfree is already true, then we own the memory and can have
+		 * mbvalidate() overwrite it directly.
+		 */
+		if (mustfree)
+			cell2 = unconstify(char *, cell);
+		else
+		{
+			cell2 = pg_strdup(cell);
+			mustfree = true;
+		}
+		cell = (char *) mbvalidate((unsigned char *) cell2, content->opt->encoding);
 	}
 
-	*content->cell = (char *) mbvalidate((unsigned char *) cell,
-										 content->opt->encoding);
-
-#ifdef ENABLE_NLS
-	if (translate)
-		*content->cell = _(*content->cell);
-#endif
+	content->cells[content->cellsadded] = cell;
 
 	if (mustfree)
 	{
@@ -3327,7 +3355,7 @@ printTableAddCell(printTableContent *const content, char *cell,
 
 		content->cellmustfree[content->cellsadded] = true;
 	}
-	content->cell++;
+
 	content->cellsadded++;
 }
 
@@ -3344,7 +3372,7 @@ printTableAddCell(printTableContent *const content, char *cell,
  * translated as a whole.
  */
 void
-printTableAddFooter(printTableContent *const content, const char *footer)
+printTableAddFooter(printTableContent *content, const char *footer)
 {
 	printTableFooter *f;
 
@@ -3369,7 +3397,7 @@ printTableAddFooter(printTableContent *const content, const char *footer)
  * around.
  */
 void
-printTableSetFooter(printTableContent *const content, const char *footer)
+printTableSetFooter(printTableContent *content, const char *footer)
 {
 	if (content->footers != NULL)
 	{
@@ -3387,8 +3415,18 @@ printTableSetFooter(printTableContent *const content, const char *footer)
  * printTableInit() again.
  */
 void
-printTableCleanup(printTableContent *const content)
+printTableCleanup(printTableContent *content)
 {
+	if (content->headermustfree)
+	{
+		for (uint64 i = 0; i < content->ncolumns; i++)
+		{
+			if (content->headermustfree[i])
+				free(unconstify(char *, content->headers[i]));
+		}
+		free(content->headermustfree);
+		content->headermustfree = NULL;
+	}
 	if (content->cellmustfree)
 	{
 		uint64		total_cells;
@@ -3411,9 +3449,8 @@ printTableCleanup(printTableContent *const content)
 	content->headers = NULL;
 	content->cells = NULL;
 	content->aligns = NULL;
-	content->header = NULL;
-	content->cell = NULL;
-	content->align = NULL;
+	content->headersadded = 0;
+	content->cellsadded = 0;
 
 	if (content->footers)
 	{
@@ -3734,9 +3771,8 @@ printTable(const printTableContent *cont,
 				print_troff_ms_text(cont, fout);
 			break;
 		default:
-			fprintf(stderr, _("invalid output format (internal error): %d"),
-					cont->opt->format);
-			exit(EXIT_FAILURE);
+			pg_fatal_internal("invalid output format (internal error): %d",
+							  cont->opt->format);
 	}
 
 	if (is_local_pager)

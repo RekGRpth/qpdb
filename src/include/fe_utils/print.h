@@ -167,17 +167,16 @@ typedef struct printTableContent
 	int			ncolumns;		/* Specified in Init() */
 	int			nrows;			/* Specified in Init() */
 	const char **headers;		/* NULL-terminated array of header strings */
-	const char **header;		/* Pointer to the last added header */
+	uint64		headersadded;	/* Number of headers added this far */
+	bool	   *headermustfree; /* true for headers that need to be free()d */
 	const char **cells;			/* NULL-terminated array of cell content
 								 * strings */
-	const char **cell;			/* Pointer to the last added cell */
 	uint64		cellsadded;		/* Number of cells added this far */
 	bool	   *cellmustfree;	/* true for cells that need to be free()d */
 	printTableFooter *footers;	/* Pointer to the first footer */
 	printTableFooter *footer;	/* Pointer to the last added footer */
 	char	   *aligns;			/* Array of alignment specifiers; 'l' or 'r',
-								 * one per column */
-	char	   *align;			/* Pointer to the last added alignment */
+								 * one per column; counted by headersadded */
 } printTableContent;
 
 typedef struct printQueryOpt
@@ -212,18 +211,18 @@ extern void ClosePager(FILE *pagerpipe);
 
 extern void html_escaped_print(const char *in, FILE *fout);
 
-extern void printTableInit(printTableContent *const content,
+extern void printTableInit(printTableContent *content,
 						   const printTableOpt *opt, const char *title,
-						   const int ncolumns, const int nrows);
-extern void printTableAddHeader(printTableContent *const content,
-								char *header, const bool translate, const char align);
-extern void printTableAddCell(printTableContent *const content,
-							  char *cell, const bool translate, const bool mustfree);
-extern void printTableAddFooter(printTableContent *const content,
+						   int ncolumns, int nrows);
+extern void printTableAddHeader(printTableContent *content,
+								const char *header, bool translate, char align);
+extern void printTableAddCell(printTableContent *content,
+							  const char *cell, bool translate, bool mustfree);
+extern void printTableAddFooter(printTableContent *content,
 								const char *footer);
-extern void printTableSetFooter(printTableContent *const content,
+extern void printTableSetFooter(printTableContent *content,
 								const char *footer);
-extern void printTableCleanup(printTableContent *const content);
+extern void printTableCleanup(printTableContent *content);
 extern void printTable(const printTableContent *cont,
 					   FILE *fout, bool is_pager, FILE *flog);
 extern void printQuery(const PGresult *result, const printQueryOpt *opt,
