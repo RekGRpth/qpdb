@@ -109,15 +109,6 @@ static relopt_bool boolRelOpts[] =
 	},
 	{
 		{
-			"autovacuum_enabled",
-			"Enables autovacuum in this relation",
-			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
-			ShareUpdateExclusiveLock
-		},
-		true
-	},
-	{
-		{
 			"user_catalog_table",
 			"Declare a table as an additional catalog table, e.g. for the purpose of logical replication",
 			RELOPT_KIND_HEAP,
@@ -168,6 +159,14 @@ static relopt_bool boolRelOpts[] =
 
 static relopt_ternary ternaryRelOpts[] =
 {
+	{
+		{
+			"autovacuum_enabled",
+			"Enables autovacuum in this relation",
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			ShareUpdateExclusiveLock
+		}
+	},
 	{
 		{
 			"vacuum_truncate",
@@ -768,13 +767,12 @@ add_reloption(relopt_gen *newoption)
 		if (max_custom_options == 0)
 		{
 			max_custom_options = 8;
-			custom_options = palloc(max_custom_options * sizeof(relopt_gen *));
+			custom_options = palloc_array(relopt_gen *, max_custom_options);
 		}
 		else
 		{
 			max_custom_options *= 2;
-			custom_options = repalloc(custom_options,
-									  max_custom_options * sizeof(relopt_gen *));
+			custom_options = repalloc_array(custom_options, relopt_gen *, max_custom_options);
 		}
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1634,7 +1632,7 @@ parseRelOptions(Datum options, bool validate, relopt_kind kind,
 
 	if (numoptions > 0)
 	{
-		reloptions = palloc(numoptions * sizeof(relopt_value));
+		reloptions = palloc_array(relopt_value, numoptions);
 
 		for (i = 0, j = 0; relOpts[i]; i++)
 		{
@@ -1976,7 +1974,7 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 {
 	static const relopt_parse_elt tab[] = {
 		{"fillfactor", RELOPT_TYPE_INT, offsetof(StdRdOptions, fillfactor)},
-		{"autovacuum_enabled", RELOPT_TYPE_BOOL,
+		{"autovacuum_enabled", RELOPT_TYPE_TERNARY,
 		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, enabled)},
 		{"autovacuum_parallel_workers", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, autovacuum_parallel_workers)},
