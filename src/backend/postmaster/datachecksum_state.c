@@ -383,18 +383,24 @@ static DataChecksumsWorkerOperation operation;
 static void StartDataChecksumsWorkerLauncher(DataChecksumsWorkerOperation op,
 											 int cost_delay,
 											 int cost_limit);
-static void DataChecksumsShmemRequest(void *arg);
-static bool DatabaseExists(Oid dboid);
 static void ErrorOnInvalidDatabases(void);
-static List *BuildDatabaseList(void);
-static List *BuildRelationList(bool temp_relations, bool include_shared);
-static void FreeDatabaseList(List *dblist);
-static DataChecksumsWorkerResult ProcessDatabase(DataChecksumsWorkerDatabase *db);
-static bool ProcessAllDatabases(void);
 static bool ProcessSingleRelationFork(Relation reln, ForkNumber forkNum, BufferAccessStrategy strategy);
 static void ResetDataChecksumsProgressCounters(void);
+static bool ProcessSingleRelationByOid(Oid relationId, BufferAccessStrategy strategy);
+static BgwHandleStatus WaitForDataChecksumsWorkerState(BackgroundWorkerHandle *handle,
+													   bool wait_for_startup,
+													   pid_t *pidp,
+													   uint32 wait_event);
+static DataChecksumsWorkerResult ProcessDatabase(DataChecksumsWorkerDatabase *db);
+static void launcher_exit(int code, Datum arg);
 static void launcher_cancel_handler(SIGNAL_ARGS);
 static void WaitForAllTransactionsToFinish(void);
+static bool ProcessAllDatabases(void);
+static void DataChecksumsShmemRequest(void *arg);
+static bool DatabaseExists(Oid dboid);
+static List *BuildDatabaseList(void);
+static void FreeDatabaseList(List *dblist);
+static List *BuildRelationList(bool temp_relations, bool include_shared);
 
 const ShmemCallbacks DataChecksumsShmemCallbacks = {
 	.request_fn = DataChecksumsShmemRequest,
@@ -492,7 +498,7 @@ AbsorbDataChecksumsBarrier(ProcSignalBarrierType barrier)
 			target_state = PG_DATA_CHECKSUM_OFF;
 			break;
 		default:
-			elog(ERROR, "incorrect barrier \"%i\" received", barrier);
+			elog(ERROR, "incorrect barrier \"%d\" received", barrier);
 	}
 
 	/*
@@ -530,7 +536,7 @@ AbsorbDataChecksumsBarrier(ProcSignalBarrierType barrier)
 	if (!found)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("incorrect data checksum state %i for target state %i",
+				errmsg("incorrect data checksum state %d for target state %d",
 					   current, target_state));
 
 	SetLocalDataChecksumState(target_state);
@@ -862,6 +868,73 @@ ProcessSingleRelationByOid(Oid relationId, BufferAccessStrategy strategy)
 }
 
 /*
+ * WaitForDataChecksumsWorkerState
+ *		Wait for a data checksums worker to start or stop.
+ *
+ * This is like WaitForBackgroundWorkerStartup() and
+ * WaitForBackgroundWorkerShutdown(), except that it also reacts to SIGINT
+ * received by the launcher.  The launcher owns the overall checksum
+ * operation, so canceling it should stop the worker it has registered or is
+ * currently running.
+ *
+ * If wait_for_startup is true, wait until the worker is no longer in
+ * BGWH_NOT_YET_STARTED state, like WaitForBackgroundWorkerStartup().  If it
+ * is false, wait until the worker reaches BGWH_STOPPED state, like
+ * WaitForBackgroundWorkerShutdown().
+ *
+ * pidp is set to the worker's PID when startup succeeds, if it is not NULL.
+ */
+static BgwHandleStatus
+WaitForDataChecksumsWorkerState(BackgroundWorkerHandle *handle,
+								bool wait_for_startup,
+								pid_t *pidp,
+								uint32 wait_event)
+{
+	BgwHandleStatus status;
+	bool		termination_requested = false;
+
+	for (;;)
+	{
+		int			rc;
+		pid_t		pid;
+
+		CHECK_FOR_INTERRUPTS();
+
+		status = GetBackgroundWorkerPid(handle, &pid);
+		if (status == BGWH_STARTED && pidp)
+			*pidp = pid;
+
+		if (abort_requested && !termination_requested)
+		{
+			TerminateBackgroundWorker(handle);
+			termination_requested = true;
+		}
+
+		/*
+		 * Startup waits for the worker to leave BGWH_NOT_YET_STARTED, while
+		 * shutdown waits for it to reach BGWH_STOPPED.
+		 */
+		if (status == BGWH_STOPPED ||
+			(wait_for_startup && status == BGWH_STARTED))
+			break;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0,
+					   wait_event);
+
+		if (rc & WL_POSTMASTER_DEATH)
+		{
+			status = BGWH_POSTMASTER_DIED;
+			break;
+		}
+
+		ResetLatch(MyLatch);
+	}
+
+	return status;
+}
+
+/*
  * ProcessDatabase
  *		Enable data checksums in a single database.
  *
@@ -921,9 +994,20 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 		return DATACHECKSUMSWORKER_FAILED;
 	}
 
-	status = WaitForBackgroundWorkerStartup(bgw_handle, &pid);
+	/*
+	 * While this expects to wait for BGWORKER_STARTUP it may return _STOPPED
+	 * if the worker was terminated in the meantime so we must check status.
+	 */
+	status = WaitForDataChecksumsWorkerState(bgw_handle, true, &pid,
+											 WAIT_EVENT_BGWORKER_STARTUP);
 	if (status == BGWH_STOPPED)
 	{
+		if (abort_requested)
+		{
+			result = DATACHECKSUMSWORKER_ABORTED;
+			goto done;
+		}
+
 		/*
 		 * If the worker managed to start, and stop, before we got to waiting
 		 * for it we can see a STOPPED status here without it being a failure.
@@ -981,7 +1065,8 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 			 "Waiting for worker in database %s (pid %ld)", db->dbname, (long) pid);
 	pgstat_report_activity(STATE_RUNNING, activity);
 
-	status = WaitForBackgroundWorkerShutdown(bgw_handle);
+	status = WaitForDataChecksumsWorkerState(bgw_handle, false, NULL,
+											 WAIT_EVENT_BGWORKER_SHUTDOWN);
 	if (status == BGWH_POSTMASTER_DIED)
 		ereport(FATAL,
 				errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -1004,6 +1089,11 @@ ProcessDatabase(DataChecksumsWorkerDatabase *db)
 	if (result == DATACHECKSUMSWORKER_FAILED && !DatabaseExists(db->dboid))
 		result = DATACHECKSUMSWORKER_DROPDB;
 
+	CHECK_FOR_LAUNCHER_ABORT_REQUEST();
+	if (abort_requested)
+		result = DATACHECKSUMSWORKER_ABORTED;
+
+done:
 	if (result == DATACHECKSUMSWORKER_ABORTED)
 		ereport(LOG,
 				errmsg("data checksums processing was aborted in database \"%s\"",
@@ -1056,9 +1146,9 @@ launcher_exit(int code, Datum arg)
 /*
  * launcher_cancel_handler
  *
- * Internal routine for reacting to SIGINT and flagging the worker to abort.
- * The worker won't be interrupted immediately but will check for abort flag
- * between each block in a relation.
+ * Internal routine for reacting to SIGINT and flagging the launcher to abort.
+ * If a worker is registered or running, the launcher will request worker
+ * termination from its normal control flow.
  */
 static void
 launcher_cancel_handler(SIGNAL_ARGS)
@@ -1068,10 +1158,8 @@ launcher_cancel_handler(SIGNAL_ARGS)
 	abort_requested = true;
 
 	/*
-	 * There is no sleeping in the main loop, the flag will be checked
-	 * periodically in ProcessSingleRelationFork. The worker does however
-	 * sleep when waiting for concurrent transactions to end so we still need
-	 * to set the latch.
+	 * Wake the launcher if it is waiting for transactions to finish or for a
+	 * worker to start up or shut down.
 	 */
 	SetLatch(MyLatch);
 
@@ -1226,8 +1314,9 @@ again:
 		if (!ProcessAllDatabases())
 		{
 			/*
-			 * If the target state changed during processing then it's not a
-			 * failure, so restart processing instead.
+			 * If processing was canceled, or the target state changed during
+			 * processing, then it's not a failure. In the latter case, the
+			 * launcher will restart processing with the new target state.
 			 */
 			CHECK_FOR_LAUNCHER_ABORT_REQUEST();
 			if (abort_requested)
@@ -1314,6 +1403,8 @@ ProcessAllDatabases(void)
 
 	/* Get a list of all databases to process */
 	WaitForAllTransactionsToFinish();
+	if (abort_requested)
+		return false;
 	DatabaseList = BuildDatabaseList();
 
 	/*
@@ -1370,6 +1461,7 @@ ProcessAllDatabases(void)
 		else if (result == DATACHECKSUMSWORKER_ABORTED || abort_requested)
 		{
 			/* Abort flag set, so exit the whole process */
+			FreeDatabaseList(DatabaseList);
 			return false;
 		}
 		else if (result == DATACHECKSUMSWORKER_DROPDB)
