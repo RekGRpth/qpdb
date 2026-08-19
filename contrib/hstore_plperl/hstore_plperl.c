@@ -111,7 +111,8 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 	Pairs	   *pairs;
 
 	/* Dereference references recursively. */
-	while (SvROK(in))
+	plperl_materialize_sv(in);
+	while (in && SvROK(in))
 	{
 		/*
 		 * It's possible for circular references to make this an infinite
@@ -120,10 +121,11 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 		 */
 		CHECK_FOR_INTERRUPTS();
 		in = SvRV(in);
+		plperl_materialize_sv(in);
 	}
 
 	/* Now we must have a hash. */
-	if (SvTYPE(in) != SVt_PVHV)
+	if (!in || SvTYPE(in) != SVt_PVHV)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot transform non-hash Perl value to hstore")));
@@ -137,8 +139,10 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 	i = 0;
 	while ((he = hv_iternext(hv)))
 	{
-		char	   *key = sv2cstr(HeSVKEY_force(he));
-		SV		   *value = HeVAL(he);
+		char	   *key = hek2cstr(he);
+		SV		   *value = hv_iterval(hv, he);
+
+		plperl_materialize_sv(value);
 
 		if (i >= pcount)
 		{
@@ -146,11 +150,11 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 			pairs = repalloc_array(pairs, Pairs, pcount);
 		}
 
-		pairs[i].key = pstrdup(key);
+		pairs[i].key = key;
 		pairs[i].keylen = hstoreCheckKeyLen(strlen(pairs[i].key));
 		pairs[i].needfree = true;
 
-		if (!SvOK(value))
+		if (!value || !SvOK(value))
 		{
 			pairs[i].val = NULL;
 			pairs[i].vallen = 0;
@@ -158,7 +162,7 @@ plperl_to_hstore(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			pairs[i].val = pstrdup(sv2cstr(value));
+			pairs[i].val = sv2cstr(value);
 			pairs[i].vallen = hstoreCheckValLen(strlen(pairs[i].val));
 			pairs[i].isnull = false;
 		}

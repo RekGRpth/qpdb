@@ -399,6 +399,16 @@ ginVacuumPostingTreeLeaves(GinVacuumState *gvs, BlockNumber blkno)
 		{
 			LockBuffer(buffer, GIN_UNLOCK);
 			LockBuffer(buffer, GIN_EXCLUSIVE);
+
+			if (!GinPageIsLeaf(page))
+			{
+				/*
+				 * The root page was a leaf page, but became an internal page
+				 * while no lock was held.  Unlock and reacquire a share lock.
+				 */
+				UnlockReleaseBuffer(buffer);
+				continue;
+			}
 			break;
 		}
 
@@ -630,13 +640,19 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	{
 		/* Yes, so initialize stats to zeroes */
 		stats = palloc0_object(IndexBulkDeleteResult);
-
-		/*
-		 * and cleanup any pending inserts
-		 */
-		ginInsertCleanup(&gvs.ginstate, !AmAutoVacuumWorkerProcess(),
-						 false, true, stats);
 	}
+
+	/*
+	 * The pending list might have already-dead TIDs that VACUUM now requires
+	 * us to remove from the index.  We must force cleanup of the pending list
+	 * now, before vacuuming proper begins, to make sure nothing is missed.
+	 *
+	 * When running in an autovacuum worker, we won't necessarily _fully_
+	 * empty the pending list.  This is still safe; concurrent inserters
+	 * cannot insert new tuples whose TIDs VACUUM needs us to remove.
+	 */
+	ginInsertCleanup(&gvs.ginstate, !AmAutoVacuumWorkerProcess(),
+					 false, true, stats);
 
 	/* we'll re-count the tuples each time */
 	stats->num_index_tuples = 0;
