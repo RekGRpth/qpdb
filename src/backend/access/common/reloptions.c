@@ -348,7 +348,7 @@ static relopt_int intRelOpts[] =
 			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
 			ShareUpdateExclusiveLock
 		},
-		-1, -1, INT_MAX
+		-2, -1, INT_MAX
 	},
 	{
 		{
@@ -613,6 +613,76 @@ static void parse_one_reloption(relopt_value *option, char *text_str,
 	((option).isset ? strlen((option).string_val) : \
 	 ((relopt_string *) (option).gen)->default_len)
 
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Verify that every option a TOAST table accepts defaults to a value the user
+ * cannot set.  That way, we can tell whether a reloption is set on the TOAST
+ * table or if we should pull the value from its main table.
+ */
+static void
+assert_toast_defaults_unsettable(void)
+{
+	for (int i = 0; relOpts[i]; i++)
+	{
+		relopt_gen *gen = relOpts[i];
+
+		if ((gen->kinds & RELOPT_KIND_TOAST) == 0)
+			continue;
+
+		/*
+		 * A TOAST table's value is filled in from its main table's at the
+		 * same offset in the same struct, so the option must be settable on a
+		 * heap too.
+		 */
+		Assert((gen->kinds & RELOPT_KIND_HEAP) != 0);
+
+		switch (gen->type)
+		{
+			case RELOPT_TYPE_TERNARY:
+
+				/*
+				 * Ternaries carry no default, and parse_one_reloption() can
+				 * only produce true or false, so PG_TERNARY_UNSET is already
+				 * beyond a user's reach.
+				 */
+				break;
+
+			case RELOPT_TYPE_INT:
+				{
+					relopt_int *optint = (relopt_int *) gen;
+
+					Assert(optint->default_val < optint->min ||
+						   optint->default_val > optint->max);
+					break;
+				}
+
+			case RELOPT_TYPE_REAL:
+				{
+					relopt_real *optreal = (relopt_real *) gen;
+
+					Assert(optreal->default_val < optreal->min ||
+						   optreal->default_val > optreal->max);
+					break;
+				}
+
+			case RELOPT_TYPE_ENUM:
+				{
+					relopt_enum *optenum = (relopt_enum *) gen;
+
+					for (relopt_enum_elt_def *elt = optenum->members;
+						 elt->string_val; elt++)
+						Assert(elt->symbol_val != optenum->default_val);
+					break;
+				}
+
+			default:
+				/* Neither bools nor strings can express "unset". */
+				Assert(false);
+		}
+	}
+}
+#endif							/* USE_ASSERT_CHECKING */
+
 /*
  * initialize_reloptions
  *		initialization routine, must be called before parsing
@@ -730,6 +800,10 @@ initialize_reloptions(void)
 
 	/* flag the work is complete */
 	need_initialization = false;
+
+#ifdef USE_ASSERT_CHECKING
+	assert_toast_defaults_unsettable();
+#endif
 }
 
 /*
@@ -1968,68 +2042,72 @@ fillRelOptions(void *rdopts, Size basesize,
 
 
 /*
+ * Parse table for StdRdOptions.
+ */
+static const relopt_parse_elt stdRdOptionsTab[] = {
+	{"fillfactor", RELOPT_TYPE_INT, offsetof(StdRdOptions, fillfactor)},
+	{"autovacuum_enabled", RELOPT_TYPE_TERNARY,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, enabled)},
+	{"autovacuum_parallel_workers", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, autovacuum_parallel_workers)},
+	{"autovacuum_vacuum_threshold", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_threshold)},
+	{"autovacuum_vacuum_max_threshold", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_max_threshold)},
+	{"autovacuum_vacuum_insert_threshold", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_ins_threshold)},
+	{"autovacuum_analyze_threshold", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, analyze_threshold)},
+	{"autovacuum_vacuum_cost_limit", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_cost_limit)},
+	{"autovacuum_freeze_min_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_min_age)},
+	{"autovacuum_freeze_max_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_max_age)},
+	{"autovacuum_freeze_table_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_table_age)},
+	{"autovacuum_multixact_freeze_min_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_min_age)},
+	{"autovacuum_multixact_freeze_max_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_max_age)},
+	{"autovacuum_multixact_freeze_table_age", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_table_age)},
+	{"log_autovacuum_min_duration", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_vacuum_min_duration)},
+	{"log_autoanalyze_min_duration", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_analyze_min_duration)},
+	{"toast_tuple_target", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, toast_tuple_target)},
+	{"autovacuum_vacuum_cost_delay", RELOPT_TYPE_REAL,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_cost_delay)},
+	{"autovacuum_vacuum_scale_factor", RELOPT_TYPE_REAL,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_scale_factor)},
+	{"autovacuum_vacuum_insert_scale_factor", RELOPT_TYPE_REAL,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_ins_scale_factor)},
+	{"autovacuum_analyze_scale_factor", RELOPT_TYPE_REAL,
+	offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, analyze_scale_factor)},
+	{"user_catalog_table", RELOPT_TYPE_BOOL,
+	offsetof(StdRdOptions, user_catalog_table)},
+	{"parallel_workers", RELOPT_TYPE_INT,
+	offsetof(StdRdOptions, parallel_workers)},
+	{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
+	offsetof(StdRdOptions, vacuum_index_cleanup)},
+	{"vacuum_truncate", RELOPT_TYPE_TERNARY,
+	offsetof(StdRdOptions, vacuum_truncate)},
+	{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
+	offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
+};
+
+/*
  * Option parser for anything that uses StdRdOptions.
  */
 bytea *
 default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 {
-	static const relopt_parse_elt tab[] = {
-		{"fillfactor", RELOPT_TYPE_INT, offsetof(StdRdOptions, fillfactor)},
-		{"autovacuum_enabled", RELOPT_TYPE_TERNARY,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, enabled)},
-		{"autovacuum_parallel_workers", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, autovacuum_parallel_workers)},
-		{"autovacuum_vacuum_threshold", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_threshold)},
-		{"autovacuum_vacuum_max_threshold", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_max_threshold)},
-		{"autovacuum_vacuum_insert_threshold", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_ins_threshold)},
-		{"autovacuum_analyze_threshold", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, analyze_threshold)},
-		{"autovacuum_vacuum_cost_limit", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_cost_limit)},
-		{"autovacuum_freeze_min_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_min_age)},
-		{"autovacuum_freeze_max_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_max_age)},
-		{"autovacuum_freeze_table_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, freeze_table_age)},
-		{"autovacuum_multixact_freeze_min_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_min_age)},
-		{"autovacuum_multixact_freeze_max_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_max_age)},
-		{"autovacuum_multixact_freeze_table_age", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_table_age)},
-		{"log_autovacuum_min_duration", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_vacuum_min_duration)},
-		{"log_autoanalyze_min_duration", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_analyze_min_duration)},
-		{"toast_tuple_target", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, toast_tuple_target)},
-		{"autovacuum_vacuum_cost_delay", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_cost_delay)},
-		{"autovacuum_vacuum_scale_factor", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_scale_factor)},
-		{"autovacuum_vacuum_insert_scale_factor", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, vacuum_ins_scale_factor)},
-		{"autovacuum_analyze_scale_factor", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, analyze_scale_factor)},
-		{"user_catalog_table", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, user_catalog_table)},
-		{"parallel_workers", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, parallel_workers)},
-		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
-		offsetof(StdRdOptions, vacuum_index_cleanup)},
-		{"vacuum_truncate", RELOPT_TYPE_TERNARY,
-		offsetof(StdRdOptions, vacuum_truncate)},
-		{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
-		offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
-	};
-
 	return (bytea *) build_reloptions(reloptions, validate, kind,
 									  sizeof(StdRdOptions),
-									  tab, lengthof(tab));
+									  stdRdOptionsTab,
+									  lengthof(stdRdOptionsTab));
 }
 
 /*
