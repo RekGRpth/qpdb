@@ -208,14 +208,13 @@ cmpspellaffix(const void *s1, const void *s2)
 }
 
 static int
-cmpcmdflag(const void *f1, const void *f2)
+cmpcmdflag(const void *f1, const void *f2, void *arg)
 {
 	const CompoundAffixFlag *fv1 = f1;
 	const CompoundAffixFlag *fv2 = f2;
+	FlagMode	flagMode = *(const FlagMode *) arg;
 
-	Assert(fv1->flagMode == fv2->flagMode);
-
-	if (fv1->flagMode == FM_NUM)
+	if (flagMode == FM_NUM)
 	{
 		if (fv1->flag.i == fv2->flag.i)
 			return 0;
@@ -349,7 +348,7 @@ cmpaffix(const void *s1, const void *s2)
 static void
 getNextFlagFromString(IspellDict *Conf, const char **sflagset, char *sflag)
 {
-	int32		s;
+	long		sval;
 	char	   *next;
 	const char *sbuf = *sflagset;
 	int			maxstep;
@@ -377,17 +376,17 @@ getNextFlagFromString(IspellDict *Conf, const char **sflagset, char *sflag)
 				break;
 			case FM_NUM:
 				errno = 0;
-				s = strtol(*sflagset, &next, 10);
+				sval = strtol(*sflagset, &next, 10);
 				if (*sflagset == next || errno == ERANGE)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("invalid affix flag \"%s\"", *sflagset)));
-				if (s < 0 || s > FLAGNUM_MAXSIZE)
+				if (sval < 0 || sval > FLAGNUM_MAXSIZE)
 					ereport(ERROR,
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("affix flag \"%s\" is out of range",
 									*sflagset)));
-				sflag += sprintf(sflag, "%0d", s);
+				sflag += sprintf(sflag, "%0d", (int) sval);
 
 				/* Go to start of the next flag */
 				*sflagset = next;
@@ -1034,34 +1033,43 @@ parse_affentry(const char *str, char *mask, char *find, char *repl)
 }
 
 /*
+ * Parse an affix flag written in the "num" flag mode.
+ */
+static uint32
+parseNumericAffixFlag(const char *s)
+{
+	char	   *next;
+	long		i;
+
+	errno = 0;
+	i = strtol(s, &next, 10);
+	if (s == next || errno == ERANGE)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("invalid affix flag \"%s\"", s)));
+	if (i < 0 || i > FLAGNUM_MAXSIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("affix flag \"%s\" is out of range", s)));
+
+	return (uint32) i;
+}
+
+/*
  * Sets a Hunspell options depending on flag type.
+ *
+ * Conf->flagMode must already have its final value, since it decides which
+ * member of the entry's union is written.  See finalizeCompoundAffixFlags().
  */
 static void
 setCompoundAffixFlagValue(IspellDict *Conf, CompoundAffixFlag *entry,
-						  char *s, uint32 val)
+						  const char *s, uint32 val)
 {
 	if (Conf->flagMode == FM_NUM)
-	{
-		char	   *next;
-		int			i;
-
-		errno = 0;
-		i = strtol(s, &next, 10);
-		if (s == next || errno == ERANGE)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("invalid affix flag \"%s\"", s)));
-		if (i < 0 || i > FLAGNUM_MAXSIZE)
-			ereport(ERROR,
-					(errcode(ERRCODE_CONFIG_FILE_ERROR),
-					 errmsg("affix flag \"%s\" is out of range", s)));
-
-		entry->flag.i = i;
-	}
+		entry->flag.i = parseNumericAffixFlag(s);
 	else
 		entry->flag.s = cpstrdup(Conf, s);
 
-	entry->flagMode = Conf->flagMode;
 	entry->value = val;
 }
 
@@ -1120,10 +1128,50 @@ addCompoundAffixFlagValue(IspellDict *Conf, const char *s, uint32 val)
 
 	newValue = Conf->CompoundAffixFlags + Conf->nCompoundAffixFlag;
 
-	setCompoundAffixFlagValue(Conf, newValue, sbuf, val);
+	/*
+	 * Only remember the flag as a string for now.  The FLAG option that says
+	 * how flags are spelled may appear anywhere in the affix file, including
+	 * after the compound flags themselves, so the final representation cannot
+	 * be chosen until the whole file has been read.  See
+	 * finalizeCompoundAffixFlags().
+	 *
+	 * The interim copy goes in the short-lived build context, since the final
+	 * representation may well not be a string at all.
+	 */
+	newValue->flag.s = MemoryContextStrdup(Conf->buildCxt, sbuf);
+	newValue->value = val;
 
 	Conf->usecompound = true;
 	Conf->nCompoundAffixFlag++;
+}
+
+/*
+ * Convert the compound flags collected by addCompoundAffixFlagValue() to the
+ * representation implied by the flag mode the affix file ended up declaring.
+ *
+ * This must run before the flags are sorted or searched.  Doing the conversion
+ * here rather than while reading the file makes the position of the FLAG line
+ * irrelevant, which is how the flags on AF, SFX and PFX lines are already
+ * treated: those are parsed in a second pass over the file, and so always use
+ * the final flag mode.
+ */
+static void
+finalizeCompoundAffixFlags(IspellDict *Conf)
+{
+	for (int i = 0; i < Conf->nCompoundAffixFlag; i++)
+	{
+		CompoundAffixFlag *entry = Conf->CompoundAffixFlags + i;
+
+		/*
+		 * Replace the interim string with the representation the flag mode
+		 * calls for.  In both cases the old value is read before the new one
+		 * is stored, so overwriting the union in place is safe.
+		 */
+		if (Conf->flagMode == FM_NUM)
+			entry->flag.i = parseNumericAffixFlag(entry->flag.s);
+		else
+			entry->flag.s = cpstrdup(Conf, entry->flag.s);
+	}
 }
 
 /*
@@ -1149,9 +1197,9 @@ getCompoundAffixFlagValue(IspellDict *Conf, const char *s)
 		setCompoundAffixFlagValue(Conf, &key, sflag, 0);
 
 		found = (CompoundAffixFlag *)
-			bsearch(&key, Conf->CompoundAffixFlags,
-					Conf->nCompoundAffixFlag, sizeof(CompoundAffixFlag),
-					cmpcmdflag);
+			bsearch_arg(&key, Conf->CompoundAffixFlags,
+						Conf->nCompoundAffixFlag, sizeof(CompoundAffixFlag),
+						cmpcmdflag, &Conf->flagMode);
 		if (found != NULL)
 			flag |= found->value;
 	}
@@ -1171,7 +1219,7 @@ getAffixFlagSet(IspellDict *Conf, char *s)
 {
 	if (Conf->useFlagAliases && *s != '\0')
 	{
-		int			curaffix;
+		long		curaffix;
 		char	   *end;
 
 		errno = 0;
@@ -1302,9 +1350,12 @@ NIImportOOAffixes(IspellDict *Conf, const char *filename)
 	}
 	tsearch_readline_end(&trst);
 
+	/* Conf->flagMode is final now, so the compound flags can be converted */
+	finalizeCompoundAffixFlags(Conf);
+
 	if (Conf->nCompoundAffixFlag > 1)
-		qsort(Conf->CompoundAffixFlags, Conf->nCompoundAffixFlag,
-			  sizeof(CompoundAffixFlag), cmpcmdflag);
+		qsort_arg(Conf->CompoundAffixFlags, Conf->nCompoundAffixFlag,
+				  sizeof(CompoundAffixFlag), cmpcmdflag, &Conf->flagMode);
 
 	if (!tsearch_readline_begin(&trst, filename))
 		ereport(ERROR,
@@ -1576,6 +1627,12 @@ nextline:
 		pfree(pstr);
 	}
 	tsearch_readline_end(&trst);
+
+	/*
+	 * The old file format has no FLAG command, so the mode is still FM_CHAR
+	 * here, but the flags collected above must be converted all the same.
+	 */
+	finalizeCompoundAffixFlags(Conf);
 	return;
 
 isnewformat:
@@ -1748,7 +1805,7 @@ NISortDictionary(IspellDict *Conf)
 {
 	int			i;
 	int			naffix;
-	int			curaffix;
+	long		curaffix;
 
 	/* compress affixes */
 
@@ -1791,7 +1848,7 @@ NISortDictionary(IspellDict *Conf)
 				curaffix = 0;
 			}
 
-			Conf->Spell[i]->p.d.affix = curaffix;
+			Conf->Spell[i]->p.d.affix = (int) curaffix;
 			Conf->Spell[i]->p.d.len = strlen(Conf->Spell[i]->word);
 		}
 	}
@@ -1829,7 +1886,7 @@ NISortDictionary(IspellDict *Conf)
 													 Conf->Spell[i]->p.flag);
 			}
 
-			Conf->Spell[i]->p.d.affix = curaffix;
+			Conf->Spell[i]->p.d.affix = (int) curaffix;
 			Conf->Spell[i]->p.d.len = strlen(Conf->Spell[i]->word);
 		}
 
