@@ -39,13 +39,10 @@
 #include "px.h"
 
 #ifdef __i386__
-#define BF_ASM				0	/* 1 */
 #define BF_SCALE			1
 #elif defined(__x86_64__)
-#define BF_ASM				0
 #define BF_SCALE			1
 #else
-#define BF_ASM				0
 #define BF_SCALE			0
 #endif
 
@@ -518,14 +515,6 @@ BF_swap(BF_word *x, int count)
 	R = L; \
 	L = tmp4 ^ data.ctx.P[BF_N + 1]
 
-#if BF_ASM
-
-extern void _BF_body_r(BF_ctx *ctx);
-
-#define BF_body() \
-	_BF_body_r(&data.ctx)
-#else
-
 #define BF_body() \
 do { \
 	L = R = 0; \
@@ -545,7 +534,6 @@ do { \
 		*(ptr - 1) = R; \
 	} while (ptr < &data.ctx.S[3][0xFF]); \
 } while (0)
-#endif
 
 static void
 BF_set_key(const char *key, BF_key expanded, BF_key initial,
@@ -633,7 +621,7 @@ _crypt_blowfish_rn(const char *key, const char *setting,
 	count = (BF_word) 1 << ((setting[4] - '0') * 10 + (setting[5] - '0'));
 	if (count < 16 || BF_decode(data.binary.salt, &setting[7], 16))
 	{
-		px_memset(data.binary.salt, 0, sizeof(data.binary.salt));
+		explicit_bzero(data.binary.salt, sizeof(data.binary.salt));
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid salt")));
@@ -754,7 +742,7 @@ _crypt_blowfish_rn(const char *key, const char *setting,
  * that this does not guarantee there's no sensitive data left on the
  * stack and/or in registers; I'm not aware of portable code that does.
  */
-	px_memset(&data, 0, sizeof(data));
+	explicit_bzero(&data, sizeof(data));
 
 	return output;
 }

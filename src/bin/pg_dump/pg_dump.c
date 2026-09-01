@@ -8797,9 +8797,6 @@ getTriggers(Archive *fout, TableInfo tblinfo[], int numTables)
 			pg_fatal("unrecognized table OID %u", tgrelid);
 
 		/* Save data for this table */
-		tbinfo->triggers = tginfo + j;
-		tbinfo->numTriggers = numtrigs;
-
 		for (int c = 0; c < numtrigs; c++, j++)
 		{
 			tginfo[j].dobj.objType = DO_TRIGGER;
@@ -11149,18 +11146,16 @@ dumpRelationStats_dumper(Archive *fout, const void *userArg, const TocEntry *te)
 		/*
 		 * The results must be in the order of the relations supplied in the
 		 * parameters to ensure we remain in sync as we walk through the TOC.
-		 *
-		 * For versions before 19, the redundant filter clause on s.tablename
-		 * = ANY(...) seems sufficient to convince the planner to use
-		 * pg_class_relname_nsp_index, which avoids a full scan of pg_stats.
-		 * In newer versions, pg_stats returns the table OIDs, eliminating the
-		 * need for that hack.
+		 * The redundant filter clause seems sufficient to convince the
+		 * planner to use pg_class_relname_nsp_index, which avoids a full scan
+		 * of pg_stats.  This may not work for all versions.
 		 */
 		if (fout->remoteVersion >= 190000)
 			appendPQExpBufferStr(query,
 								 "FROM pg_catalog.pg_stats s "
 								 "JOIN unnest($1) WITH ORDINALITY AS u (tableid, ord) "
 								 "ON s.tableid = u.tableid "
+								 "WHERE s.tableid = ANY($1) "
 								 "ORDER BY u.ord, s.attname, s.inherited");
 		else
 			appendPQExpBufferStr(query,
