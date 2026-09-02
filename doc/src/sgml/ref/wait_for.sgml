@@ -3,8 +3,8 @@ doc/src/sgml/ref/wait_for.sgml
 PostgreSQL documentation
 -->
 
-<refentry id="sql-wait-for">
- <indexterm zone="sql-wait-for">
+<refentry id="sql-waitfor">
+ <indexterm zone="sql-waitfor">
   <primary>WAIT FOR</primary>
  </indexterm>
 
@@ -161,8 +161,8 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>'
         <listitem>
          <para>
           Specify to not throw an error in the case of timeout or
-          running on the primary.  In this case the result status can be get from
-          the return value.
+          running on the primary.  In this case the result status can be
+          obtained from the return value.
          </para>
         </listitem>
        </varlistentry>
