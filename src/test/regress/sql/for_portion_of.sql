@@ -1849,4 +1849,119 @@ SELECT * FROM fpo_rls ORDER BY valid_at;
 DROP TABLE fpo_rls;
 DROP ROLE regress_fpo_rls;
 
+--
+-- Parameters in the FOR PORTION OF bounds
+--
+
+CREATE TABLE fpo_param (
+  id int4range,
+  valid_at daterange,
+  name text
+);
+INSERT INTO fpo_param (id, valid_at, name) VALUES
+  ('[1,2)', daterange('2000-01-01', '2010-01-01'), 'one');
+
+-- A parameter of unspecified type in an ordinary expression gets its type
+-- resolved from context.  This is the control case for the FROM/TO bounds
+-- below: it builds exactly the same daterange the FROM/TO form does.
+PREPARE fpo_param_control AS
+  UPDATE fpo_param SET name = 'ctl' WHERE valid_at && daterange($1, $2);
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_control';
+
+-- The (portion) form resolves the parameter type from the range column.
+PREPARE fpo_param_portion AS
+  UPDATE fpo_param FOR PORTION OF valid_at ($1) SET name = 'portion';
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_portion';
+
+-- The FROM/TO form should likewise resolve its bounds to the range's
+-- subtype, so that clients need not spell out the parameter types.
+PREPARE fpo_param_update AS
+  UPDATE fpo_param FOR PORTION OF valid_at FROM $1 TO $2 SET name = 'upd';
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_update';
+
+PREPARE fpo_param_delete AS
+  DELETE FROM fpo_param FOR PORTION OF valid_at FROM $1 TO $2;
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_delete';
+
+-- Only one bound parameterized.
+PREPARE fpo_param_one AS
+  UPDATE fpo_param FOR PORTION OF valid_at FROM $1 TO '2003-01-01'
+    SET name = 'one-bound';
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_one';
+
+-- A parameter used as both bounds must still resolve to one type.
+PREPARE fpo_param_same AS
+  UPDATE fpo_param FOR PORTION OF valid_at FROM $1 TO $1 SET name = 'same';
+SELECT parameter_types FROM pg_prepared_statements
+  WHERE name = 'fpo_param_same';
+
+EXECUTE fpo_param_update('2002-01-01', '2003-01-01');
+SELECT * FROM fpo_param ORDER BY valid_at;
+
+DEALLOCATE fpo_param_control;
+DEALLOCATE fpo_param_portion;
+DEALLOCATE fpo_param_update;
+DEALLOCATE fpo_param_delete;
+DEALLOCATE fpo_param_one;
+DEALLOCATE fpo_param_same;
+
+-- The bounds we keep for deparsing are the coerced ones, so an untyped NULL
+-- bound renders with the range's subtype instead of "unknown".
+CREATE TABLE fpo_param_src (id int);
+CREATE RULE fpo_param_r AS ON DELETE TO fpo_param_src DO INSTEAD
+  DELETE FROM fpo_param FOR PORTION OF valid_at FROM NULL TO '2001-01-01';
+SELECT definition FROM pg_rules WHERE rulename = 'fpo_param_r';
+
+DROP TABLE fpo_param_src;
+DROP TABLE fpo_param;
+
+--
+-- EXPLAIN without ANALYZE must only plan the statement, so it must not
+-- evaluate the FOR PORTION OF target.
+--
+
+CREATE TABLE fpo_explain (
+  id int4range,
+  valid_at daterange,
+  name text
+);
+INSERT INTO fpo_explain (id, valid_at, name) VALUES
+  ('[1,2)', daterange('2000-01-01', '2010-01-01'), 'one');
+
+-- GENERIC_PLAN exists precisely so that a statement containing parameter
+-- placeholders can be planned without supplying any parameter values.  The
+-- hand-written equivalent qual is the control case.
+EXPLAIN (COSTS OFF, GENERIC_PLAN)
+  UPDATE fpo_explain SET name = 'q' WHERE valid_at && $1::daterange;
+EXPLAIN (COSTS OFF, GENERIC_PLAN)
+  UPDATE fpo_explain FOR PORTION OF valid_at ($1::daterange) SET name = 'q';
+EXPLAIN (COSTS OFF, GENERIC_PLAN)
+  DELETE FROM fpo_explain FOR PORTION OF valid_at ($1::daterange);
+
+-- A null target is a run-time error, so plain EXPLAIN should still report
+-- the plan.
+EXPLAIN (COSTS OFF)
+  UPDATE fpo_explain FOR PORTION OF valid_at (NULL::daterange) SET name = 'q';
+EXPLAIN (COSTS OFF)
+  DELETE FROM fpo_explain FOR PORTION OF valid_at (NULL::daterange);
+
+-- Actually running it is still an error.
+UPDATE fpo_explain FOR PORTION OF valid_at (NULL::daterange) SET name = 'q';
+DELETE FROM fpo_explain FOR PORTION OF valid_at (NULL::daterange);
+
+-- EXPLAIN ANALYZE does execute, so the null check must still fire there.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  UPDATE fpo_explain FOR PORTION OF valid_at (NULL::daterange) SET name = 'q';
+
+UPDATE fpo_explain FOR PORTION OF valid_at FROM '2002-01-01' TO '2003-01-01'
+  SET name = 'q';
+SELECT * FROM fpo_explain ORDER BY valid_at;
+
+DROP TABLE fpo_explain;
+
 RESET datestyle;

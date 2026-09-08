@@ -287,6 +287,20 @@ REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING
 
        <listitem>
         <para>
+          The table's access method is not <literal>heap</literal>.
+        </para>
+       </listitem>
+
+       <listitem>
+        <para>
+          The table is declared as a catalog table using the
+          <link linkend="reloption-user-catalog-table"><literal>user_catalog_table</literal></link>
+          storage parameter.
+        </para>
+       </listitem>
+
+       <listitem>
+        <para>
          <command>REPACK</command> is executed inside a transaction block.
         </para>
        </listitem>
@@ -329,6 +343,8 @@ REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING
      <para>
       Applies <xref linkend="sql-analyze"/> on the table after repacking.  This is
       currently only supported when a single (non-partitioned) table is specified.
+      This option cannot be used inside a transaction block, or from a function,
+      procedure, or <command>DO</command> block.
      </para>
     </listitem>
    </varlistentry>

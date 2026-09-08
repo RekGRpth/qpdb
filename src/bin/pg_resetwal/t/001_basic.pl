@@ -133,6 +133,10 @@ command_fails_like(
 	qr/error: invalid argument for option -o/,
 	'fails with incorrect -o option');
 command_fails_like(
+	[ 'pg_resetwal', '-o' => '-1', $node->data_dir ],
+	qr/error: invalid argument for option -o/,
+	'fails with -o value -1');
+command_fails_like(
 	[ 'pg_resetwal', '-o' => '0', $node->data_dir ],
 	qr/must not be 0/,
 	'fails with -o value 0');

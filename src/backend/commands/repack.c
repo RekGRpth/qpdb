@@ -303,7 +303,7 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 	if ((params.options & CLUOPT_CONCURRENT) != 0)
 	{
 		/*
-		 * Make sure we're not in a transaction block.
+		 * In concurrent mode, make sure we're not in a transaction block.
 		 *
 		 * The reason is that repack_setup_logical_decoding() could wait
 		 * indefinitely for our XID to complete. (The deadlock detector would
@@ -313,6 +313,17 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 		 * to understand and we don't lose any functionality.
 		 */
 		PreventInTransactionBlock(isTopLevel, "REPACK (CONCURRENTLY)");
+	}
+	else if ((params.options & CLUOPT_ANALYZE) != 0)
+	{
+		/*
+		 * With ANALYZE, process_single_relation() would commit the current
+		 * transaction and start a new one, which would break our state if
+		 * we're in a transaction block or PL-execution environment.  Reject
+		 * the option in that case.  It may be possible to remove this
+		 * restriction in the future.
+		 */
+		PreventInTransactionBlock(isTopLevel, "REPACK (ANALYZE)");
 	}
 
 	/*
@@ -877,6 +888,20 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 				errdetail("%s requires \"wal_level\" to be set to \"replica\" or higher.",
 						  "REPACK (CONCURRENTLY)"));
 
+	/*
+	 * A table AM that doesn't support logical decoding would cause REPACK
+	 * (CONCURRENTLY) to silently lose the changes made during the rewrite.
+	 * Nothing in TableAmRoutine tells us whether it does, so for now restrict
+	 * to heap. Check the routine rather than the AM OID, so that an AM
+	 * reusing the heap handler still works.
+	 */
+	if (rel->rd_tableam != GetHeapamTableAmRoutine())
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errdetail("This operation is only supported for the \"heap\" access method."));
+
 	/* Data changes in system relations are not logically decoded. */
 	if (IsCatalogRelation(rel))
 		ereport(ERROR,
@@ -885,6 +910,19 @@ check_concurrent_repack_requirements(Relation rel, Oid *ident_idx_p)
 					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
 				errhint("%s is not supported for catalog relations.",
 						"REPACK (CONCURRENTLY)"));
+
+	/*
+	 * REPACK (CONCURRENTLY) is not MVCC-safe; it doesn't preserve visibility
+	 * information, which logical decoding needs because it reads user catalog
+	 * tables under a historic snapshot. Removing this check requires making
+	 * it MVCC-safe and logical rewrite mappings.
+	 */
+	if (RelationIsUsedAsCatalogTable(rel))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   "REPACK (CONCURRENTLY)", RelationGetRelationName(rel)),
+				errdetail("This operation is not supported for user catalog tables."));
 
 	/*
 	 * reorderbuffer.c does not seem to handle processing of TOAST relation
