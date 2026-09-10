@@ -511,6 +511,11 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	bool		recheck = ((params->options & CLUOPT_RECHECK) != 0);
 	bool		concurrent = ((params->options & CLUOPT_CONCURRENT) != 0);
 	Oid			ident_idx = InvalidOid;
+	const int	progress_index[] = {
+		PROGRESS_REPACK_COMMAND,
+		PROGRESS_REPACK_INDEX_RELID
+	};
+	const int64 progress_values[] = {cmd, indexOid};
 
 	/* Determine the lock mode to use. */
 	lmode = RepackLockLevel(concurrent);
@@ -526,7 +531,8 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	CHECK_FOR_INTERRUPTS();
 
 	pgstat_progress_start_command(PROGRESS_COMMAND_REPACK, tableOid);
-	pgstat_progress_update_param(PROGRESS_REPACK_COMMAND, cmd);
+	/* Report the ordering index even when using a sequential scan and sort. */
+	pgstat_progress_update_multi_param(2, progress_index, progress_values);
 
 	/*
 	 * Switch to the table owner's userid, so that any index functions are run
@@ -1423,10 +1429,12 @@ copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldIndex,
 
 	/*
 	 * Decide whether to use an indexscan or seqscan-and-optional-sort to scan
-	 * the OldHeap.  We know how to use a sort to duplicate the ordering of a
-	 * btree index, and will use seqscan-and-sort for that case if the planner
-	 * tells us it's cheaper.  Otherwise, always indexscan if an index is
-	 * provided, else plain seqscan.
+	 * the OldHeap.  If the index is a btree, ask the planner to choose via
+	 * normal path cost comparison.
+	 *
+	 * The underlying tuplesort.c code doesn't support AMs other than btree,
+	 * so we must always use a normal indexscan if a non-btree index is
+	 * specified -- or an unsorted seqscan if no index is given.
 	 */
 	if (OldIndex != NULL && OldIndex->rd_rel->relam == BTREE_AM_OID)
 		use_sort = plan_cluster_use_sort(RelationGetRelid(OldHeap),

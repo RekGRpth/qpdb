@@ -2876,22 +2876,42 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	int			saved_sec_context;
 	Snapshot	snapshot;
 
-	/*
-	 * Advance the command counter so the snapshot sees the effects of prior
-	 * triggers in this statement.  Mirrors what the SPI path does in
-	 * ri_PerformCheck().
-	 */
-	CommandCounterIncrement();
-	snapshot = RegisterSnapshot(GetTransactionSnapshot());
-
 	INJECTION_POINT("ri-before-pk-lock", NULL);
 
 	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+
+	/*
+	 * Advance the command counter so the check sees the effects of prior
+	 * triggers in this statement, as SPI does when executing the query issued
+	 * by ri_PerformCheck().  Do this after locking the referenced relation
+	 * and before reloading the constraint information, so local invalidations
+	 * are processed under the lock.
+	 */
+	CommandCounterIncrement();
 
 	/* Re-read the constraint under that lock; see ri_FastPathGetEntry(). */
 	riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
 
 	idx_rel = index_open(riinfo->conindid, AccessShareLock);
+
+	/*
+	 * Only now take the snapshot the scan will use.  Acquiring it before
+	 * table_open() would let an unbounded amount of time pass while we wait
+	 * for the lock, during which another transaction can commit the very row
+	 * we are about to look for.  The scan would not see it and the check
+	 * would report a violation for a key that exists.
+	 *
+	 * The SPI path does not have this problem: for this check it passes
+	 * InvalidSnapshot, so SPI takes the snapshot after the
+	 * referenced-relation lock has been acquired.
+	 *
+	 * Make this snapshot active too, as SPI does.  STABLE cast and equality
+	 * functions use the active snapshot, so leaving the outer query's
+	 * snapshot active could hide changes made by earlier triggers even though
+	 * the index scan can see them.
+	 */
+	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	PushActiveSnapshot(snapshot);
 
 	slot = table_slot_create(pk_rel, NULL);
 
@@ -2929,6 +2949,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	index_endscan(scandesc);
 	ExecDropSingleTupleTableSlot(slot);
 	UnregisterSnapshot(snapshot);
+	PopActiveSnapshot();
 
 	if (!found)
 		ri_ReportViolation(riinfo, pk_rel, fk_rel,
@@ -3423,8 +3444,8 @@ ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 
 			/*
 			 * In READ COMMITTED, FIND_LAST_VERSION should have chased the
-			 * chain and returned TM_Ok.  Getting here means something
-			 * unexpected -- fall through to error.
+			 * chain rather than returning TM_Updated.  As in ExecLockRows(),
+			 * treat this as an unexpected result.
 			 */
 			elog(ERROR, "unexpected table_tuple_lock status: %u", result);
 			break;
@@ -3432,10 +3453,8 @@ ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 		case TM_SelfModified:
 
 			/*
-			 * The current command or a later command in this transaction
-			 * modified the PK row.  This shouldn't normally happen during an
-			 * FK check (we're not modifying pk_rel), but handle it safely by
-			 * treating the tuple as not found.
+			 * As in ExecLockRows(), ignore a tuple updated or deleted by the
+			 * current command or a later command in this transaction.
 			 */
 			return false;
 
