@@ -1032,8 +1032,8 @@ static const SchemaQuery Query_for_trigger_of_table = {
 #define Query_for_list_of_database_vars \
 "SELECT conf FROM ("\
 "       SELECT setdatabase, pg_catalog.split_part(pg_catalog.unnest(setconfig),'=',1) conf"\
-"         FROM pg_db_role_setting "\
-"       ) s, pg_database d "\
+"         FROM pg_catalog.pg_db_role_setting "\
+"       ) s, pg_catalog.pg_database d "\
 " WHERE s.setdatabase = d.oid "\
 "   AND conf LIKE '%s'"\
 "   AND d.datname LIKE '%s'"
@@ -1441,6 +1441,7 @@ static const char *const table_storage_parameters[] = {
 	"toast.vacuum_max_eager_freeze_failure_rate",
 	"toast.vacuum_truncate",
 	"toast_tuple_target",
+	"toast_value_type",
 	"user_catalog_table",
 	"vacuum_index_cleanup",
 	"vacuum_max_eager_freeze_failure_rate",
@@ -2189,11 +2190,7 @@ match_previous_words(int pattern_id,
 	{
 		/* only some object types can be created as part of CREATE SCHEMA */
 		if (HeadMatches("CREATE", "SCHEMA"))
-			COMPLETE_WITH("AGGREGATE", "COLLATION", "DOMAIN", "FUNCTION",
-						  "INDEX", "OPERATOR", "PROCEDURE", "SEQUENCE", "TABLE",
-						  "TEXT SEARCH CONFIGURATION", "TEXT SEARCH DICTIONARY",
-						  "TEXT SEARCH PARSER", "TEXT SEARCH TEMPLATE",
-						  "TRIGGER", "TYPE", "VIEW",
+			COMPLETE_WITH("TABLE", "VIEW", "INDEX", "SEQUENCE", "TRIGGER",
 			/* for INDEX and TABLE/SEQUENCE, respectively */
 						  "UNIQUE", "UNLOGGED");
 		else
@@ -3493,15 +3490,15 @@ match_previous_words(int pattern_id,
 	else if (Matches("CREATE", "DATABASE", MatchAny, "STRATEGY"))
 		COMPLETE_WITH("WAL_LOG", "FILE_COPY");
 
-	/* CREATE DOMAIN --- is allowed inside CREATE SCHEMA, so use TailMatches */
-	else if (TailMatches("CREATE", "DOMAIN", MatchAny))
+	/* CREATE DOMAIN */
+	else if (Matches("CREATE", "DOMAIN", MatchAny))
 		COMPLETE_WITH("AS");
-	else if (TailMatches("CREATE", "DOMAIN", MatchAny, "AS"))
+	else if (Matches("CREATE", "DOMAIN", MatchAny, "AS"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_datatypes);
-	else if (TailMatches("CREATE", "DOMAIN", MatchAny, "AS", MatchAny))
+	else if (Matches("CREATE", "DOMAIN", MatchAny, "AS", MatchAny))
 		COMPLETE_WITH("COLLATE", "DEFAULT", "CONSTRAINT",
 					  "NOT NULL", "NULL", "CHECK (");
-	else if (TailMatches("CREATE", "DOMAIN", MatchAny, "COLLATE"))
+	else if (Matches("CREATE", "DOMAIN", MatchAny, "COLLATE"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_collations);
 
 	/* CREATE EXTENSION */
@@ -3846,10 +3843,10 @@ match_previous_words(int pattern_id,
 	else if (Matches("CREATE", "TABLESPACE", MatchAny, "OWNER", MatchAny))
 		COMPLETE_WITH("LOCATION");
 
-/* CREATE TEXT SEARCH --- is allowed inside CREATE SCHEMA, so use TailMatches */
-	else if (TailMatches("CREATE", "TEXT", "SEARCH"))
+/* CREATE TEXT SEARCH */
+	else if (Matches("CREATE", "TEXT", "SEARCH"))
 		COMPLETE_WITH("CONFIGURATION", "DICTIONARY", "PARSER", "TEMPLATE");
-	else if (TailMatches("CREATE", "TEXT", "SEARCH", "CONFIGURATION|DICTIONARY|PARSER|TEMPLATE", MatchAny))
+	else if (Matches("CREATE", "TEXT", "SEARCH", "CONFIGURATION|DICTIONARY|PARSER|TEMPLATE", MatchAny))
 		COMPLETE_WITH("(");
 
 /* CREATE TRANSFORM */
