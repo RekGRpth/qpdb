@@ -60,6 +60,7 @@
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "utils/fmgrprotos.h"
+#include "utils/injection_point.h"
 #include "utils/pg_lsn.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
@@ -239,6 +240,8 @@ addLSNWaiter(XLogRecPtr lsn, WaitLSNType lsnType)
 	updateMinWaitedLSN(lsnType);
 
 	LWLockRelease(WaitLSNLock);
+
+	INJECTION_POINT("wait-for-lsn-after-register", NULL);
 }
 
 /*
@@ -485,10 +488,18 @@ WaitForLSN(WaitLSNType lsnType, XLogRecPtr targetLSN, int64 timeout)
 		if (WaitLSNTypeRequiresRecovery(lsnType) && !RecoveryInProgress())
 		{
 			/*
-			 * Recovery was ended, but check if target LSN was already
+			 * Recovery has ended, but check if target LSN was already
 			 * reached.
 			 */
 			deleteLSNWaiter(lsnType);
+
+			/*
+			 * Recovery may have advanced the current position after
+			 * currentLSN was read above.  Once RecoveryInProgress() returns
+			 * false, the final position is stable, so read it again before
+			 * deciding whether promotion reached the target.
+			 */
+			currentLSN = GetCurrentLSNForWaitType(lsnType);
 
 			if (PromoteIsTriggered() && targetLSN <= currentLSN)
 				return WAIT_LSN_RESULT_SUCCESS;
