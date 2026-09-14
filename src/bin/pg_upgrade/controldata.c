@@ -431,7 +431,7 @@ get_control_data(ClusterInfo *cluster)
 			cluster->controldata.date_is_int = strstr(p, "64-bit integers") != NULL;
 			got_date_is_int = true;
 		}
-		else if ((p = strstr(bufin, "checksum")) != NULL)
+		else if ((p = strstr(bufin, "Data page checksum version:")) != NULL)
 		{
 			p = strchr(p, ':');
 
@@ -658,8 +658,10 @@ check_control_data(ControlData *oldctrl,
 	 * upgrade. The user should either let the process finish, or turn off
 	 * data checksums, before retrying.
 	 */
-	if (oldctrl->data_checksum_version > PG_DATA_CHECKSUM_VERSION)
+	if (oldctrl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_ON)
 		pg_fatal("data checksums are being enabled in the old cluster");
+	if (oldctrl->data_checksum_version == PG_DATA_CHECKSUM_INPROGRESS_OFF)
+		pg_fatal("data checksums are being disabled in the old cluster");
 
 	/*
 	 * We might eventually allow upgrades from checksum to no-checksum

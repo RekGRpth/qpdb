@@ -286,8 +286,7 @@ $node_standby->psql(
 	'postgres',
 	"BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1; WAIT FOR LSN '${lsn3}';",
 	stderr => \$stderr);
-ok( $stderr =~
-	  /WAIT FOR must be called without an active or registered snapshot/,
+ok( $stderr =~ /WAIT must be called without an active or registered snapshot/,
 	"get an error when running in a transaction with an isolation level higher than REPEATABLE READ"
 );
 
@@ -315,21 +314,21 @@ $node_standby->psql(
 	'postgres',
 	"SELECT pg_wal_replay_wait_wrap('${lsn3}');",
 	stderr => \$stderr);
-ok($stderr =~ /WAIT FOR can only be executed as a top-level statement/,
+ok($stderr =~ /WAIT can only be executed as a top-level statement/,
 	"get an error when running within a function");
 
 $node_standby->psql(
 	'postgres',
 	"CALL pg_wal_replay_wait_proc('${lsn3}');",
 	stderr => \$stderr);
-ok($stderr =~ /WAIT FOR can only be executed as a top-level statement/,
+ok($stderr =~ /WAIT can only be executed as a top-level statement/,
 	"get an error when running within a procedure");
 
 $node_standby->psql(
 	'postgres',
 	"DO \$\$ BEGIN EXECUTE format('WAIT FOR LSN %L;', '${lsn3}'); END \$\$;",
 	stderr => \$stderr);
-ok($stderr =~ /WAIT FOR can only be executed as a top-level statement/,
+ok($stderr =~ /WAIT can only be executed as a top-level statement/,
 	"get an error when running within a DO block");
 
 # 6. Check parameter validation error cases on standby before promotion
@@ -342,6 +341,14 @@ $node_standby->psql(
 	"WAIT FOR LSN '${test_lsn}' WITH (timeout '-1000ms');",
 	stderr => \$stderr);
 ok($stderr =~ /timeout cannot be negative/, "get error for negative timeout");
+
+# Test out of range timeout
+$node_standby->psql(
+	'postgres',
+	"WAIT FOR LSN '${test_lsn}' WITH (timeout '2147483648ms');",
+	stderr => \$stderr);
+ok($stderr =~ /invalid timeout value: "2147483648ms"/,
+	"get error for out of range timeout");
 
 # Test unknown parameter with WITH clause
 $node_standby->psql(
@@ -406,6 +413,12 @@ $output = $node_standby->safe_psql(
 	WAIT FOR LSN '${lsn3}' WITH (timeout 100, no_throw);]);
 ok($output eq "timeout",
 	"WAIT FOR WITH clause returns correct timeout status");
+
+# Test maximum timeout
+$output = $node_standby->safe_psql(
+	'postgres', qq[
+	WAIT FOR LSN '${lsn2}' WITH (timeout '2147483647ms', no_throw);]);
+ok($output eq "success", "maximum timeout value is accepted");
 
 # Test WITH clause error case - invalid option
 $node_standby->psql(

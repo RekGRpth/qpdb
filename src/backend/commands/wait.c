@@ -13,8 +13,6 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogwait.h"
@@ -37,7 +35,7 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 			 DestReceiver *dest)
 {
 	XLogRecPtr	lsn;
-	int64		timeout = 0;
+	int			timeout = 0;
 	WaitLSNResult waitLSNResult;
 	WaitLSNType lsnType = WAIT_LSN_TYPE_STANDBY_REPLAY; /* default */
 	bool		throw = true;
@@ -56,8 +54,8 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s can only be executed as a top-level statement",
-						"WAIT FOR"),
-				 errdetail("WAIT FOR cannot be used within a function, procedure, or DO block.")));
+						"WAIT"),
+				 errdetail("WAIT cannot be used within a function, procedure, or DO block.")));
 
 	/* Parse and validate the mandatory LSN */
 	lsn = DatumGetLSN(DirectFunctionCall1(pg_lsn_in,
@@ -94,7 +92,6 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 		{
 			char	   *timeout_str;
 			const char *hintmsg;
-			double		dval;
 
 			if (timeout_specified)
 				errorConflictingDefElem(defel, pstate);
@@ -102,33 +99,18 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 
 			timeout_str = defGetString(defel);
 
-			if (!parse_real(timeout_str, &dval, GUC_UNIT_MS, &hintmsg))
-			{
+			if (!parse_int(timeout_str, &timeout, GUC_UNIT_MS, &hintmsg))
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("invalid timeout value: \"%s\"", timeout_str),
-						hintmsg ? errhint("%s", _(hintmsg)) : 0);
-			}
+						hintmsg ? errhint("%s", _(hintmsg)) : 0,
+						parser_errposition(pstate, defel->location));
 
-			/*
-			 * Get rid of any fractional part in the input. This is so we
-			 * don't fail on just-out-of-range values that would round into
-			 * range.
-			 */
-			dval = rint(dval);
-
-			/* Range check */
-			if (unlikely(isnan(dval) || !FLOAT8_FITS_IN_INT64(dval)))
-				ereport(ERROR,
-						errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						errmsg("timeout value is out of range"));
-
-			if (dval < 0)
+			if (timeout < 0)
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("timeout cannot be negative"));
-
-			timeout = (int64) dval;
+						errmsg("timeout cannot be negative"),
+						parser_errposition(pstate, defel->location));
 		}
 		else if (strcmp(defel->defname, "no_throw") == 0)
 		{
@@ -173,8 +155,8 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 	if (HaveRegisteredOrActiveSnapshot())
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("WAIT FOR must be called without an active or registered snapshot"),
-				errdetail("WAIT FOR cannot be executed within a transaction with an isolation level higher than READ COMMITTED."));
+				errmsg("WAIT must be called without an active or registered snapshot"),
+				errdetail("WAIT cannot be executed within a transaction with an isolation level higher than READ COMMITTED."));
 
 	/*
 	 * As the result we should hold no snapshot, and correspondingly our xmin

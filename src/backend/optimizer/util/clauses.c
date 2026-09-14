@@ -1255,7 +1255,8 @@ contain_exec_param_walker(Node *node, List *param_ids)
  * not nested within another one, or they'll see the wrong test value.  If one
  * appears "bare" in the arguments of a SQL function, then we can't inline the
  * SQL function for fear of creating such a situation.  The same applies for
- * CaseTestExpr used within the elemexpr of an ArrayCoerceExpr.
+ * CaseTestExpr used within the elemexpr of an ArrayCoerceExpr or the coercion
+ * of a JsonConstructorExpr.
  *
  * CoerceToDomainValue would have the same issue if domain CHECK expressions
  * could get inlined into larger expressions, but presently that's impossible.
@@ -1324,6 +1325,26 @@ contain_context_dependent_node_walker(Node *node, int *flags)
 		save_flags = *flags;
 		*flags |= CCDN_CASETESTEXPR_OK;
 		res = contain_context_dependent_node_walker((Node *) ac->elemexpr,
+													flags);
+		*flags = save_flags;
+		return res;
+	}
+	else if (IsA(node, JsonConstructorExpr))
+	{
+		JsonConstructorExpr *jce = (JsonConstructorExpr *) node;
+		int			save_flags;
+		bool		res;
+
+		/* Check the args and func expressions */
+		if (contain_context_dependent_node_walker((Node *) jce->args, flags))
+			return true;
+		if (contain_context_dependent_node_walker((Node *) jce->func, flags))
+			return true;
+
+		/* Check the coercion, which is allowed to contain CaseTestExpr */
+		save_flags = *flags;
+		*flags |= CCDN_CASETESTEXPR_OK;
+		res = contain_context_dependent_node_walker((Node *) jce->coercion,
 													flags);
 		*flags = save_flags;
 		return res;
@@ -3390,6 +3411,8 @@ eval_const_expressions_mutator(Node *node,
 		case T_JsonConstructorExpr:
 			{
 				JsonConstructorExpr *jce = (JsonConstructorExpr *) node;
+				JsonConstructorExpr *newjce;
+				Node	   *save_case_val;
 
 				/*
 				 * JSCTOR_JSON_ARRAY_QUERY carries a pre-built executable form
@@ -3400,16 +3423,43 @@ eval_const_expressions_mutator(Node *node,
 				if (jce->type == JSCTOR_JSON_ARRAY_QUERY)
 					return eval_const_expressions_mutator((Node *) jce->func,
 														  context);
+
+				/*
+				 * Copy the node and const-simplify its arguments.  We can't
+				 * use ece_generic_processing() here because we need to mess
+				 * with case_val only while processing the coercion.
+				 */
+				newjce = makeNode(JsonConstructorExpr);
+				memcpy(newjce, jce, sizeof(JsonConstructorExpr));
+				newjce->args = (List *)
+					eval_const_expressions_mutator((Node *) jce->args,
+												   context);
+				newjce->func = (Expr *)
+					eval_const_expressions_mutator((Node *) jce->func,
+												   context);
+
+				/*
+				 * Set up for the CaseTestExpr node contained in the coercion.
+				 * We must prevent it from absorbing any outer CASE value.
+				 */
+				save_case_val = context->case_val;
+				context->case_val = NULL;
+
+				newjce->coercion = (Expr *)
+					eval_const_expressions_mutator((Node *) jce->coercion,
+												   context);
+
+				context->case_val = save_case_val;
+
+				return (Node *) newjce;
 			}
-			break;
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 
 			/*
 			 * Return a SubPlan unchanged --- too late to do anything with it.
-			 *
-			 * XXX should we ereport() here instead?  Probably this routine
-			 * should never be invoked after SubPlan creation.
+			 * This can happen in estimation mode, which runs after SubPlans
+			 * have been created.
 			 */
 			return node;
 		case T_RelabelType:
@@ -4215,20 +4265,28 @@ eval_const_expressions_mutator(Node *node,
 				return (Node *) newcdomain;
 			}
 		case T_PlaceHolderVar:
-
-			/*
-			 * In estimation mode, just strip the PlaceHolderVar node
-			 * altogether; this amounts to estimating that the contained value
-			 * won't be forced to null by an outer join.  In regular mode we
-			 * just use the default behavior (ie, simplify the expression but
-			 * leave the PlaceHolderVar node intact).
-			 */
-			if (context->estimate)
 			{
 				PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
-				return eval_const_expressions_mutator((Node *) phv->phexpr,
-													  context);
+				/*
+				 * Leave a PHV of an upper query level alone: its expression
+				 * belongs to that level, which has already preprocessed it.
+				 * But we do copy the subtree, just to conform to this
+				 * function's API spec.
+				 */
+				if (phv->phlevelsup > 0)
+					return copyObject(node);
+
+				/*
+				 * In estimation mode, just strip the PlaceHolderVar node
+				 * altogether; this amounts to estimating that the contained
+				 * value won't be forced to null by an outer join.  In regular
+				 * mode we just use the default behavior (ie, simplify the
+				 * expression but leave the PlaceHolderVar node intact).
+				 */
+				if (context->estimate)
+					return eval_const_expressions_mutator((Node *) phv->phexpr,
+														  context);
 			}
 			break;
 		case T_ConvertRowtypeExpr:

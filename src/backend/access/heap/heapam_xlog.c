@@ -283,10 +283,8 @@ heap_xlog_prune_freeze(XLogReaderState *record)
 		if (PageIsNew(vmpage))
 			PageInit(vmpage, BLCKSZ, 0);
 
-		visibilitymap_set(blkno, vmbuffer, vmflags, rlocator);
-
-		Assert(BufferIsDirty(vmbuffer));
-		PageSetLSN(vmpage, lsn);
+		if (visibilitymap_set(blkno, vmbuffer, vmflags, rlocator) != vmflags)
+			PageSetLSN(vmpage, lsn);
 	}
 
 	if (BufferIsValid(vmbuffer))
@@ -583,6 +581,7 @@ heap_xlog_multi_insert(XLogReaderState *record)
 		char	   *tupdata;
 		char	   *endptr;
 		Size		len;
+		bool		inserted_tuples_frozen = false;
 
 		/* Tuples are stored as block data */
 		tupdata = XLogRecGetBlockData(record, HEAP_MULTI_INSERT_BLKREF_HEAP,
@@ -630,6 +629,10 @@ heap_xlog_multi_insert(XLogReaderState *record)
 			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
 			ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
 
+			/* If one inserted tuple was frozen, they all were */
+			if (i == 0)
+				inserted_tuples_frozen = HeapTupleHeaderXminFrozen(htup);
+
 			offnum = PageAddItem(page, htup, newlen, offnum, true, true);
 			if (offnum == InvalidOffsetNumber)
 				elog(PANIC, "failed to add tuple");
@@ -637,31 +640,67 @@ heap_xlog_multi_insert(XLogReaderState *record)
 		if (tupdata != endptr)
 			elog(PANIC, "total tuple length mismatch");
 
-		freespace = PageGetHeapFreeSpace(page); /* needed to update FSM below */
-
 		PageSetLSN(page, lsn);
 
 		if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
 			PageClearAllVisible(page);
 
 		/*
-		 * XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible. If
-		 * we are not setting the page frozen, then set the page's prunable
-		 * hint so that we trigger on-access pruning later which may set the
-		 * page all-visible in the VM.
+		 * XLH_INSERT_ALL_FROZEN_SET implies that all tuples are visible, so
+		 * set PD_ALL_VISIBLE and clear pd_prune_xid.
+		 *
+		 * If the page isn't being set all-frozen and we aren't inserting
+		 * frozen tuples, set pd_prune_xid so that the page gets on-access
+		 * pruned.
+		 *
+		 * Frozen tuples may be added to an already all-frozen page or to a
+		 * page containing non-frozen tuples, but they introduce nothing new
+		 * for on-access pruning, so preserve the existing hint.
 		 */
 		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET)
 		{
 			PageSetAllVisible(page);
 			PageClearPrunable(page);
 		}
-		else
+		else if (!inserted_tuples_frozen)
 			PageSetPrunable(page, XLogRecGetXid(record));
 
 		MarkBufferDirty(buffer);
 	}
+
 	if (BufferIsValid(buffer))
+	{
+		/*
+		 * If we are marking the page all-frozen or the page is running low on
+		 * free space, update the FSM as well. Arbitrarily, our definition of
+		 * "low" is less than 20%. We can't do much better than that without
+		 * knowing the fill-factor for the table.
+		 *
+		 * XXX: Unless setting the page all-frozen, we don't do this if the
+		 * page was restored from full page image. We don't bother to update
+		 * the FSM in that case, it doesn't need to be totally accurate
+		 * anyway.
+		 *
+		 * If setting the page all-frozen, we update the FSM regardless since,
+		 * once frozen, we lose the chance to update it during vacuum after
+		 * promotion. See comment in heap_xlog_prune_freeze() for details.
+		 */
+		bool		update_fsm = false;
+
+		if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET ||
+			action == BLK_NEEDS_REDO)
+		{
+			freespace = PageGetHeapFreeSpace(BufferGetPage(buffer));
+			if (xlrec->flags & XLH_INSERT_ALL_FROZEN_SET ||
+				freespace < BLCKSZ / 5)
+				update_fsm = true;
+		}
+
 		UnlockReleaseBuffer(buffer);
+
+		if (update_fsm)
+			XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
+	}
 
 	buffer = InvalidBuffer;
 
@@ -692,35 +731,19 @@ heap_xlog_multi_insert(XLogReaderState *record)
 									  &vmbuffer) == BLK_NEEDS_REDO)
 	{
 		Page		vmpage = BufferGetPage(vmbuffer);
+		uint8		vmflags = VISIBILITYMAP_ALL_VISIBLE |
+			VISIBILITYMAP_ALL_FROZEN;
 
 		/* initialize the page if it was read as zeros */
 		if (PageIsNew(vmpage))
 			PageInit(vmpage, BLCKSZ, 0);
 
-		visibilitymap_set(blkno,
-						  vmbuffer,
-						  VISIBILITYMAP_ALL_VISIBLE |
-						  VISIBILITYMAP_ALL_FROZEN,
-						  rlocator);
-
-		Assert(BufferIsDirty(vmbuffer));
-		PageSetLSN(vmpage, lsn);
+		if (visibilitymap_set(blkno, vmbuffer, vmflags, rlocator) != vmflags)
+			PageSetLSN(vmpage, lsn);
 	}
 
 	if (BufferIsValid(vmbuffer))
 		UnlockReleaseBuffer(vmbuffer);
-
-	/*
-	 * If the page is running low on free space, update the FSM as well.
-	 * Arbitrarily, our definition of "low" is less than 20%. We can't do much
-	 * better than that without knowing the fill-factor for the table.
-	 *
-	 * XXX: Don't do this if the page was restored from full page image. We
-	 * don't bother to update the FSM in that case, it doesn't need to be
-	 * totally accurate anyway.
-	 */
-	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
-		XLogRecordPageWithFreeSpace(rlocator, blkno, freespace);
 }
 
 /*
