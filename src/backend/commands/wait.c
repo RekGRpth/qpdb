@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * wait.c
- *	  Implements WAIT FOR, which allows waiting for events such as
+ *	  Implements WAIT, which allows waiting for events such as
  *	  time passing or LSN having been replayed, flushed, or written.
  *
  * Portions Copyright (c) 2025-2026, PostgreSQL Global Development Group
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogwait.h"
@@ -47,7 +48,7 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 	bool		mode_specified = false;
 
 	/*
-	 * WAIT FOR must not be run as a non-top-level statement (e.g., inside a
+	 * WAIT must not be run as a non-top-level statement (e.g., inside a
 	 * function, procedure, or DO block). Forbid this case upfront.
 	 */
 	if (!isTopLevel)
@@ -135,7 +136,7 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 	 * We are going to wait for the LSN.  We should first care that we don't
 	 * hold a snapshot and correspondingly our MyProc->xmin is invalid.
 	 * Otherwise, our snapshot could prevent the replay of WAL records
-	 * implying a kind of self-deadlock.  This is the reason why WAIT FOR is a
+	 * implying a kind of self-deadlock.  This is the reason why WAIT is a
 	 * command, not a procedure or function.
 	 *
 	 * Non-top-level contexts are rejected above, but be defensive and pop any
@@ -155,8 +156,9 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 	if (HaveRegisteredOrActiveSnapshot())
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("WAIT must be called without an active or registered snapshot"),
-				errdetail("WAIT cannot be executed within a transaction with an isolation level higher than READ COMMITTED."));
+				errmsg("WAIT cannot be executed while the current transaction holds a snapshot"),
+				IsolationUsesXactSnapshot() ?
+				errdetail("This transaction runs at an isolation level higher than READ COMMITTED, so it holds a snapshot from its first query until it ends.") : 0);
 
 	/*
 	 * As the result we should hold no snapshot, and correspondingly our xmin
@@ -227,7 +229,7 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,
 					 errmsg("cannot wait for a standby LSN while holding locks"),
 					 errdetail("This session holds a lock on %s, which could make recovery wait for this session while this session waits for recovery.",
 							   locktagbuf.data),
-					 errhint("Release the locks, or execute WAIT FOR before acquiring them.")));
+					 errhint("Release the locks, or execute WAIT before acquiring them.")));
 		}
 	}
 
