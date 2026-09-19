@@ -395,7 +395,8 @@ static bool ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 static bool ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo);
 static bool ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
 									Relation pk_rel, Relation idx_rel);
-static void ri_CheckPermissions(Relation query_rel);
+static void ri_CheckPermissions(const RI_ConstraintInfo *riinfo,
+								Relation query_rel);
 static bool recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys,
 									 int nkeys, TupleTableSlot *new_slot);
 static void build_index_scankeys(const RI_ConstraintInfo *riinfo,
@@ -2601,7 +2602,7 @@ get_ri_constraint_root(Oid constrOid)
 }
 
 /*
- * Callback for pg_constraint inval events
+ * Callback for pg_constraint and pg_amop inval events
  *
  * While most syscache callbacks just flush all their entries, pg_constraint
  * gets enough update traffic that it's probably worth being smarter.
@@ -2625,6 +2626,17 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 	dlist_mutable_iter iter;
 
 	Assert(ri_constraint_cache != NULL);
+
+	/*
+	 * pg_amop changes can affect any constraint's fast-path metadata, and
+	 * this pg_amop hashvalue can't be matched against the pg_constraint-keyed
+	 * cache entries, so flush them all via the match-everything path below as
+	 * the large-list reset below does.  Being selective would mean mapping
+	 * the change back to the affected constraints, not worth it for DDL this
+	 * rare.
+	 */
+	if (cacheid == AMOPOPID)
+		hashvalue = 0;
 
 	/*
 	 * If the list of currently valid entries gets excessively large, we mark
@@ -2939,7 +2951,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 						   saved_sec_context |
 						   SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
-	ri_CheckPermissions(pk_rel);
+	ri_CheckPermissions(riinfo, pk_rel);
 
 	/*
 	 * Begin the scan under the switched user id, so that any access method
@@ -3106,7 +3118,7 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 * albeit checked once per flush rather than once per row, like in
 	 * ri_FastPathCheck().
 	 */
-	ri_CheckPermissions(pk_rel);
+	ri_CheckPermissions(riinfo, pk_rel);
 
 	/*
 	 * Begin the scan under the switched user id, so that any access method
@@ -3566,19 +3578,49 @@ ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
 		}
 	}
 
+	/*
+	 * The equality operator stored in pg_constraint must still be an equality
+	 * member of the index opfamily.  When it is not, the direct fast-path
+	 * probe errors, so mark the fast path unusable and fall back to SPI,
+	 * which uses the same operator in a query where the planner simply
+	 * declines the index.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			idx_col;
+
+		for (idx_col = 0; idx_col < idx_rel->rd_index->indnkeyatts; idx_col++)
+		{
+			if (idx_rel->rd_index->indkey.values[idx_col] ==
+				riinfo->pk_attnums[i])
+				break;
+		}
+		Assert(idx_col < idx_rel->rd_index->indnkeyatts);
+
+		if (get_op_opfamily_strategy(riinfo->pf_eq_oprs[i],
+									 idx_rel->rd_opfamily[idx_col]) != BTEqualStrategyNumber)
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
 	riinfo->fastpath_state = RI_FASTPATH_USABLE;
 	return true;
 }
 
 /*
  * ri_CheckPermissions
- *   Check that the current user has permissions to look into the schema of
- *   and SELECT from 'query_rel'
+ *		Check permissions for the SELECT ... FOR KEY SHARE used by the SPI
+ *		path, as the referenced table's owner.
  */
 static void
-ri_CheckPermissions(Relation query_rel)
+ri_CheckPermissions(const RI_ConstraintInfo *riinfo, Relation query_rel)
 {
 	AclResult	aclresult;
+	AclMode		requiredPerms = ACL_SELECT | ACL_SELECT_FOR_UPDATE;
+	RTEPermissionInfo *perminfo;
+	bool		result;
 
 	/* USAGE on schema. */
 	aclresult = object_aclcheck(NamespaceRelationId,
@@ -3588,11 +3630,32 @@ ri_CheckPermissions(Relation query_rel)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(RelationGetNamespace(query_rel)));
 
-	/* SELECT on relation. */
-	aclresult = pg_class_aclcheck(RelationGetRelid(query_rel), GetUserId(),
-								  ACL_SELECT);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_TABLE,
+	/* Avoid building the column bitmap when table privileges suffice. */
+	if (pg_class_aclmask(RelationGetRelid(query_rel), GetUserId(),
+						 requiredPerms, ACLMASK_ALL) == requiredPerms)
+		return;
+
+	/*
+	 * SELECT is needed only on the referenced key columns.  FOR KEY SHARE
+	 * also needs UPDATE privilege, which may be granted on any column.  Use
+	 * the executor's checks for both, leaving updatedCols empty as the SPI
+	 * query does.
+	 */
+	perminfo = makeNode(RTEPermissionInfo);
+	perminfo->relid = RelationGetRelid(query_rel);
+	perminfo->requiredPerms = requiredPerms;
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
+
+		perminfo->selectedCols = bms_add_member(perminfo->selectedCols, attno);
+	}
+
+	result = ExecCheckOneRelPerms(perminfo);
+	bms_free(perminfo->selectedCols);
+	pfree(perminfo);
+	if (!result)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE,
 					   RelationGetRelationName(query_rel));
 }
 
@@ -4022,8 +4085,11 @@ ri_InitHashTables(void)
 									  RI_INIT_CONSTRAINTHASHSIZE,
 									  &ctl, HASH_ELEM | HASH_BLOBS);
 
-	/* Arrange to flush cache on pg_constraint changes */
+	/* Arrange to flush cache on pg_constraint or pg_amop changes */
 	CacheRegisterSyscacheCallback(CONSTROID,
+								  InvalidateConstraintCacheCallBack,
+								  (Datum) 0);
+	CacheRegisterSyscacheCallback(AMOPOPID,
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
 

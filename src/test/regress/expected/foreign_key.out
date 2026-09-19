@@ -402,17 +402,68 @@ CREATE TABLE FKTABLE ( ftest1 int REFERENCES PKTABLE, ftest2 int );
 INSERT INTO PKTABLE VALUES (1, 'Test1');
 INSERT INTO PKTABLE VALUES (2, 'Test2');
 INSERT INTO PKTABLE VALUES (3, 'Test3');
--- Grant usage on PKTABLE to user regress_foreign_key_user
+-- Grant SELECT on PKTABLE to user regress_foreign_key_user
 CREATE USER regress_foreign_key_user NOLOGIN;
 GRANT SELECT ON PKTABLE TO regress_foreign_key_user;
 ALTER TABLE PKTABLE OWNER to regress_foreign_key_user;
 -- Inserting into FKTABLE should work
 INSERT INTO FKTABLE VALUES (3, 5);
--- Revoke usage on PKTABLE from user regress_foreign_key_user
+-- Revoke SELECT on PKTABLE from user regress_foreign_key_user
 REVOKE SELECT ON PKTABLE FROM regress_foreign_key_user;
 -- Inserting into FKTABLE should fail
 INSERT INTO FKTABLE VALUES (2, 6);
 ERROR:  permission denied for table pktable
+-- SELECT on the referenced key column is enough, without SELECT on ptest2.
+GRANT SELECT (ptest1) ON PKTABLE TO regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6);
+-- SELECT on an unrelated column does not suffice.
+REVOKE SELECT (ptest1) ON PKTABLE FROM regress_foreign_key_user;
+GRANT SELECT (ptest2) ON PKTABLE TO regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6); -- fails
+ERROR:  permission denied for table pktable
+REVOKE SELECT (ptest2) ON PKTABLE FROM regress_foreign_key_user;
+GRANT SELECT (ptest1) ON PKTABLE TO regress_foreign_key_user;
+-- FOR KEY SHARE also requires UPDATE privilege.
+REVOKE UPDATE ON PKTABLE FROM regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6); -- fails
+ERROR:  permission denied for table pktable
+-- UPDATE on any column suffices, even one that the check does not read.
+GRANT UPDATE (ptest2) ON PKTABLE TO regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6);
+-- Table-level SELECT can be combined with column-level UPDATE.
+GRANT SELECT ON PKTABLE TO regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6);
+REVOKE UPDATE (ptest2) ON PKTABLE FROM regress_foreign_key_user;
+INSERT INTO FKTABLE VALUES (2, 6); -- fails
+ERROR:  permission denied for table pktable
+DROP TABLE FKTABLE;
+DROP TABLE PKTABLE;
+-- Check all referenced columns, including when index and FK order differ.
+CREATE TABLE PKTABLE ( ptest0 text, ptest1 int, ptest2 int,
+                      PRIMARY KEY (ptest2, ptest1) );
+CREATE TABLE FKTABLE ( ftest1 int, ftest2 int );
+INSERT INTO PKTABLE VALUES ('unused', 1, 2);
+INSERT INTO FKTABLE VALUES (1, 2);
+ALTER TABLE FKTABLE ADD CONSTRAINT fktable_fk
+    FOREIGN KEY (ftest1, ftest2) REFERENCES PKTABLE (ptest1, ptest2) NOT VALID;
+ALTER TABLE PKTABLE OWNER TO regress_foreign_key_user;
+ALTER TABLE FKTABLE OWNER TO regress_foreign_key_user;
+REVOKE SELECT ON PKTABLE FROM regress_foreign_key_user;
+GRANT SELECT (ptest1) ON PKTABLE TO regress_foreign_key_user;
+-- Lack of SELECT on FKTABLE forces validation to check each row.
+REVOKE SELECT ON FKTABLE FROM regress_foreign_key_user;
+SET ROLE regress_foreign_key_user;
+ALTER TABLE FKTABLE VALIDATE CONSTRAINT fktable_fk; -- fails
+ERROR:  permission denied for table pktable
+GRANT SELECT (ptest2) ON PKTABLE TO regress_foreign_key_user;
+-- Per-row validation also requires UPDATE privilege.
+REVOKE UPDATE ON PKTABLE FROM regress_foreign_key_user;
+ALTER TABLE FKTABLE VALIDATE CONSTRAINT fktable_fk; -- fails
+ERROR:  permission denied for table pktable
+-- UPDATE on the unrelated column is enough.
+GRANT UPDATE (ptest0) ON PKTABLE TO regress_foreign_key_user;
+ALTER TABLE FKTABLE VALIDATE CONSTRAINT fktable_fk;
+RESET ROLE;
 DROP TABLE FKTABLE;
 DROP TABLE PKTABLE;
 DROP USER regress_foreign_key_user;
@@ -1030,6 +1081,73 @@ CREATE TABLE PKTABLE (ptest1 int, ptest2 inet, ptest3 int, ptest4 inet, PRIMARY 
 ptest3) REFERENCES pktable);
 ERROR:  foreign key constraint "pktable_ptest4_ptest3_fkey" cannot be implemented
 DETAIL:  Key columns "ptest4" of the referencing table and "ptest1" of the referenced table are of incompatible types: inet and integer.
+-- Replace the equality operator the FK recorded with an identical
+-- implementation, so only opfamily membership changes.  The recorded operator
+-- is now absent from the family; the fast path must fall back to SPI instead
+-- of probing with it.
+create schema fk_opfamily;
+set search_path = fk_opfamily, pg_catalog;
+create operator family fam using btree;
+create operator class int_ops for type integer using btree family fam as
+  operator 1 <(integer,integer), operator 2 <=(integer,integer),
+  operator 3 =(integer,integer), operator 4 >=(integer,integer),
+  operator 5 >(integer,integer), function 1 btint4cmp(integer,integer);
+alter operator family fam using btree add
+  operator 1 <(integer,bigint), operator 2 <=(integer,bigint),
+  operator 3 =(integer,bigint), operator 4 >=(integer,bigint),
+  operator 5 >(integer,bigint),
+  operator 1 <(bigint,integer), operator 2 <=(bigint,integer),
+  operator 3 =(bigint,integer), operator 4 >=(bigint,integer),
+  operator 5 >(bigint,integer),
+  operator 1 <(bigint,bigint), operator 2 <=(bigint,bigint),
+  operator 3 =(bigint,bigint), operator 4 >=(bigint,bigint),
+  operator 5 >(bigint,bigint),
+  function 1 (integer,bigint) btint48cmp(integer,bigint),
+  function 1 (bigint,integer) btint84cmp(bigint,integer),
+  function 1 (bigint,bigint) btint8cmp(bigint,bigint);
+create operator =#= (leftarg=integer, rightarg=bigint, function=int48eq);
+create table p(k integer);
+create unique index p_idx on p(k int_ops);
+-- Two identical FKs to exercise both cache states: warm gets a row now so its
+-- fast-path metadata is built and cached; cold is left empty and has none.
+create table warm(k bigint references p(k));
+create table cold(k bigint references p(k));
+insert into p values (1), (2);
+insert into warm values (1);
+-- Change only pg_amop.  warm's cached metadata now names an operator the
+-- opfamily no longer contains; cold is still evaluated fresh.
+begin;
+alter operator family fam using btree drop operator 3(integer,bigint);
+alter operator family fam using btree add operator 3 =#=(integer,bigint);
+commit;
+-- A present key must be accepted and a missing one rejected, via SPI.
+insert into warm values (2);
+insert into warm values (99);
+ERROR:  insert or update on table "warm" violates foreign key constraint "warm_k_fkey"
+DETAIL:  Key (k)=(99) is not present in table "p".
+insert into cold values (2);
+insert into cold values (99);
+ERROR:  insert or update on table "cold" violates foreign key constraint "cold_k_fkey"
+DETAIL:  Key (k)=(99) is not present in table "p".
+select * from warm order by k;
+ k 
+---
+ 1
+ 2
+(2 rows)
+
+select * from cold order by k;
+ k 
+---
+ 2
+(1 row)
+
+reset search_path;
+drop table fk_opfamily.warm, fk_opfamily.cold, fk_opfamily.p;
+drop operator class fk_opfamily.int_ops using btree;
+drop operator family fk_opfamily.fam using btree;
+drop operator fk_opfamily.=#=(integer,bigint);
+drop schema fk_opfamily;
 --
 -- Now some cases with inheritance
 -- Basic 2 table case: 1 column of matching types.
