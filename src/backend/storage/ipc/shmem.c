@@ -1131,12 +1131,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 
 	LWLockAcquire(ShmemIndexLock, LW_EXCLUSIVE);
 
-	/*
-	 * During postmaster startup, look up the existing entry if any.
-	 */
-	*foundPtr = false;
-	if (IsUnderPostmaster)
-		*foundPtr = AttachShmemIndexEntry(&request, true);
+	/* Look up the existing entry if any */
+	*foundPtr = AttachShmemIndexEntry(&request, true);
 
 	/* Initialize it if not found */
 	if (!*foundPtr)
@@ -1380,7 +1376,7 @@ pg_get_shmem_allocations_numa(PG_FUNCTION_ARGS)
  * If the shared segment was allocated using huge pages, returns the size of
  * a huge page. Otherwise returns the size of regular memory page.
  *
- * This should be used only after the server is started.
+ * This should be used only after shared memory has been initialized.
  */
 Size
 pg_get_shmem_pagesize(void)
@@ -1395,7 +1391,6 @@ pg_get_shmem_pagesize(void)
 	os_page_size = sysconf(_SC_PAGESIZE);
 #endif
 
-	Assert(IsUnderPostmaster);
 	Assert(huge_pages_status != HUGE_PAGES_UNKNOWN);
 
 	if (huge_pages_status == HUGE_PAGES_ON)
