@@ -5832,11 +5832,10 @@ fetch_remote_statistics(Relation relation,
 	}
 
 	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 *
-	 * Note that unlike the sampling case, we only query pg_class and
-	 * pg_stats, so we do the remote access as the current user.
+	 * Get the connection to use.  We do the remote access as the table's
+	 * owner.  Note that unlike AnalyzeForeignTable(), the core code would
+	 * already have switched us to the table's owner, before we are called
+	 * from ImportForeignStatistics().
 	 */
 	user = GetUserMapping(GetUserId(), table->serverid);
 	conn = GetConnection(user, false, NULL);
@@ -5955,7 +5954,10 @@ fetch_remote_statistics(Relation relation,
 
 	/*
 	 * If the remote table is partitioned, import relpages = 0, to match the
-	 * sampling case.
+	 * sampling path.  Otherwise, import the relpages value as-is, regardless
+	 * of any difference between the remote and local block sizes.  Note that
+	 * this is fine because it's only used for costing remote operations on
+	 * the foreign table.
 	 */
 	if (relkind == RELKIND_PARTITIONED_TABLE)
 		remstats->relpages = 0;
