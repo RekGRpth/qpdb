@@ -155,6 +155,7 @@ static Plan *set_mergeappend_references(PlannerInfo *root,
 										int rtoffset);
 static void set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static Relids offset_relid_set(Relids relids, int rtoffset);
+static List *offset_relid_set_list(List *relid_sets, int rtoffset);
 static Node *fix_dummy_setop_vars_mutator(Node *node, int *first_child_relid);
 static Node *fix_scan_expr(PlannerInfo *root, Node *node,
 						   int rtoffset, double num_exec);
@@ -210,7 +211,8 @@ static List *set_windowagg_runcondition_references(PlannerInfo *root,
 												   Plan *plan);
 
 static void record_elided_node(PlannerGlobal *glob, int plan_node_id,
-							   NodeTag elided_type, Bitmapset *relids);
+							   NodeTag elided_type, Bitmapset *relids,
+							   List *child_append_relid_sets);
 
 
 /*****************************************************************************
@@ -1471,7 +1473,8 @@ set_subqueryscan_references(PlannerInfo *root,
 		/* Remember that we removed a SubqueryScan */
 		scanrelid = plan->scan.scanrelid + rtoffset;
 		record_elided_node(root->glob, plan->subplan->plan_node_id,
-						   T_SubqueryScan, bms_make_singleton(scanrelid));
+						   T_SubqueryScan, bms_make_singleton(scanrelid),
+						   NIL);
 	}
 	else
 	{
@@ -1899,7 +1902,9 @@ set_append_references(PlannerInfo *root,
 
 			/* Remember that we removed an Append */
 			record_elided_node(root->glob, p->plan_node_id, T_Append,
-							   offset_relid_set(aplan->apprelids, rtoffset));
+							   offset_relid_set(aplan->apprelids, rtoffset),
+							   offset_relid_set_list(aplan->child_append_relid_sets,
+													 rtoffset));
 
 			return result;
 		}
@@ -1913,6 +1918,8 @@ set_append_references(PlannerInfo *root,
 	set_dummy_tlist_references((Plan *) aplan, rtoffset);
 
 	aplan->apprelids = offset_relid_set(aplan->apprelids, rtoffset);
+	aplan->child_append_relid_sets =
+		offset_relid_set_list(aplan->child_append_relid_sets, rtoffset);
 
 	/*
 	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
@@ -1977,7 +1984,9 @@ set_mergeappend_references(PlannerInfo *root,
 
 			/* Remember that we removed a MergeAppend */
 			record_elided_node(root->glob, p->plan_node_id, T_MergeAppend,
-							   offset_relid_set(mplan->apprelids, rtoffset));
+							   offset_relid_set(mplan->apprelids, rtoffset),
+							   offset_relid_set_list(mplan->child_append_relid_sets,
+													 rtoffset));
 
 			return result;
 		}
@@ -1991,6 +2000,8 @@ set_mergeappend_references(PlannerInfo *root,
 	set_dummy_tlist_references((Plan *) mplan, rtoffset);
 
 	mplan->apprelids = offset_relid_set(mplan->apprelids, rtoffset);
+	mplan->child_append_relid_sets =
+		offset_relid_set_list(mplan->child_append_relid_sets, rtoffset);
 
 	/*
 	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
@@ -2050,6 +2061,24 @@ offset_relid_set(Relids relids, int rtoffset)
 	if (rtoffset == 0)
 		return relids;
 	return bms_offset_members(relids, rtoffset);
+}
+
+/*
+ * offset_relid_set_list
+ *		Apply rtoffset to the members of each Relid set in a List.
+ */
+static List *
+offset_relid_set_list(List *relid_sets, int rtoffset)
+{
+	List	   *result = NIL;
+
+	if (rtoffset == 0)
+		return relid_sets;
+
+	foreach_ptr(Bitmapset, relids, relid_sets)
+		result = lappend(result, offset_relid_set(relids, rtoffset));
+
+	return result;
 }
 
 /*
@@ -3815,13 +3844,15 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
  */
 static void
 record_elided_node(PlannerGlobal *glob, int plan_node_id,
-				   NodeTag elided_type, Bitmapset *relids)
+				   NodeTag elided_type, Bitmapset *relids,
+				   List *child_append_relid_sets)
 {
 	ElidedNode *n = makeNode(ElidedNode);
 
 	n->plan_node_id = plan_node_id;
 	n->elided_type = elided_type;
 	n->relids = relids;
+	n->child_append_relid_sets = child_append_relid_sets;
 
 	glob->elidedNodes = lappend(glob->elidedNodes, n);
 }

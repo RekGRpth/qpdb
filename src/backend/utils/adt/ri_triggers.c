@@ -31,6 +31,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_collation.h"
@@ -45,6 +46,7 @@
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -2790,6 +2792,14 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
 
 	/*
+	 * The row lock taken below is refused in a read-only transaction unless
+	 * the referenced table is temporary, as ExecCheckXactReadOnly() refuses
+	 * the SPI path's SELECT ... FOR KEY SHARE.
+	 */
+	if (XactReadOnly && !isTempNamespace(RelationGetNamespace(pk_rel)))
+		PreventCommandIfReadOnly("SELECT FOR KEY SHARE");
+
+	/*
 	 * Advance the command counter so the check sees the effects of prior
 	 * triggers in this statement, as SPI does when executing the query issued
 	 * by ri_PerformCheck().  Do this after locking the referenced relation
@@ -2945,8 +2955,16 @@ ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 	if (!IsolationUsesXactSnapshot())
 		lockflags |= TUPLE_LOCK_FLAG_FIND_LAST_VERSION;
 
+	/*
+	 * Lock as of the command ID the scan's snapshot was taken with, as
+	 * ExecLockRows() uses the es_output_cid fixed when its query started.
+	 * User code run during the scan, such as an equality function, may have
+	 * advanced the current command ID since; with that, a row it updated
+	 * would look updated by an earlier command (TM_Invisible) rather than by
+	 * this one (TM_SelfModified).
+	 */
 	result = table_tuple_lock(pk_rel, &slot->tts_tid, snap,
-							  slot, GetCurrentCommandId(false),
+							  slot, snap->curcid,
 							  LockTupleKeyShare, LockWaitBlock,
 							  lockflags, &tmfd);
 
