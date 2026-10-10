@@ -3262,13 +3262,23 @@ eval_const_expressions_mutator(Node *node,
 				/* Copy the node and const-simplify its arguments */
 				expr = (NullIfExpr *) ece_generic_processing(node);
 
-				/* If either argument is NULL they can't be equal */
+				/*
+				 * If either argument is NULL they can't be equal, so the
+				 * result is the first argument, relabeled if needed to expose
+				 * the NULLIF's typmod and collation
+				 */
 				foreach(arg, expr->args)
 				{
 					if (!IsA(lfirst(arg), Const))
 						has_nonconst_input = true;
 					else if (((Const *) lfirst(arg))->constisnull)
-						return (Node *) linitial(expr->args);
+						return applyRelabelType((Node *) linitial(expr->args),
+												expr->opresulttype,
+												exprTypmod(node),
+												expr->opcollid,
+												COERCE_IMPLICIT_CAST,
+												-1,
+												false);
 				}
 
 				/*
@@ -3750,10 +3760,17 @@ eval_const_expressions_mutator(Node *node,
 
 				/*
 				 * If no non-FALSE alternatives, CASE reduces to the default
-				 * result
+				 * result, relabeled if needed to expose the CASE's typmod and
+				 * collation
 				 */
 				if (newargs == NIL)
-					return defresult;
+					return applyRelabelType(defresult,
+											caseexpr->casetype,
+											exprTypmod(node),
+											caseexpr->casecollid,
+											COERCE_IMPLICIT_CAST,
+											-1,
+											false);
 				/* Otherwise we need a new CASE node */
 				newcase = makeNode(CaseExpr);
 				newcase->casetype = caseexpr->casetype;
@@ -3820,26 +3837,19 @@ eval_const_expressions_mutator(Node *node,
 
 					/*
 					 * We can remove null constants from the list.  For a
-					 * nonnullable expression, if it has not been preceded by
-					 * any non-null-constant expressions then it is the
-					 * result.  Otherwise, it's the next argument, but we can
-					 * drop following arguments since they will never be
-					 * reached.
+					 * nonnullable expression, we can drop following arguments
+					 * since they will never be reached.
 					 */
 					if (IsA(e, Const))
 					{
 						if (((Const *) e)->constisnull)
 							continue;	/* drop null constant */
-						if (newargs == NIL)
-							return e;	/* first expr */
 						newargs = lappend(newargs, e);
 						break;
 					}
 					if (expr_is_nonnullable(context->root, (Expr *) e,
 											NOTNULL_SOURCE_HASHTABLE))
 					{
-						if (newargs == NIL)
-							return e;	/* first expr */
 						newargs = lappend(newargs, e);
 						break;
 					}
@@ -3858,10 +3868,18 @@ eval_const_expressions_mutator(Node *node,
 
 				/*
 				 * If there's exactly one surviving argument, we no longer
-				 * need COALESCE at all: the result is that argument
+				 * need COALESCE at all: the result is that argument,
+				 * relabeled if needed to expose the COALESCE's typmod and
+				 * collation
 				 */
 				if (list_length(newargs) == 1)
-					return (Node *) linitial(newargs);
+					return applyRelabelType((Node *) linitial(newargs),
+											coalesceexpr->coalescetype,
+											exprTypmod(node),
+											coalesceexpr->coalescecollid,
+											COERCE_IMPLICIT_CAST,
+											-1,
+											false);
 
 				newcoalesce = makeNode(CoalesceExpr);
 				newcoalesce->coalescetype = coalesceexpr->coalescetype;
@@ -4932,8 +4950,8 @@ var_is_nonnullable(PlannerInfo *root, Var *var, NotNullSource source)
 				 * Note that we need to check if the relation actually has any
 				 * children, as we might not have done that yet.
 				 */
-				if (rte->inh && has_subclass(rte->relid) &&
-					rte->relkind != RELKIND_PARTITIONED_TABLE)
+				if (rte->relkind != RELKIND_PARTITIONED_TABLE &&
+					rte->inh && has_subclass(rte->relid))
 					return false;
 
 				/* We need not lock the relation since it was already locked */
@@ -4941,6 +4959,18 @@ var_is_nonnullable(PlannerInfo *root, Var *var, NotNullSource source)
 				attr = TupleDescCompactAttr(RelationGetDescr(rel),
 											var->varattno - 1);
 				result = (attr->attnullability == ATTNULLABLE_VALID);
+
+				/*
+				 * We cannot trust a NOT NULL constraint on a virtual
+				 * generated column of a partitioned table.  Each partition
+				 * enforces it against its own generation expression, which
+				 * can differ from the parent's expression used by the query.
+				 */
+				if (result && rte->relkind == RELKIND_PARTITIONED_TABLE &&
+					TupleDescAttr(RelationGetDescr(rel),
+								  var->varattno - 1)->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+					result = false;
+
 				table_close(rel, NoLock);
 
 				return result;
@@ -5067,14 +5097,6 @@ expr_is_nonnullable(PlannerInfo *root, Expr *expr, NotNullSource source)
 				/*
 				 * A BooleanTest expression always evaluates to a boolean
 				 * value.  It never returns SQL NULL.
-				 */
-				return true;
-			}
-		case T_DistinctExpr:
-			{
-				/*
-				 * IS DISTINCT FROM never returns NULL, effectively acting as
-				 * though NULL were a normal data value.
 				 */
 				return true;
 			}
