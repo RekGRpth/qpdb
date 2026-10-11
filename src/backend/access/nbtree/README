@@ -757,8 +757,9 @@ cleanup lock when replaying VACUUM records during recovery, but recovery
 does not need to lock every leaf page (only those leaf pages that have
 items to delete) -- that's sufficient to avoid breaking index-only scans
 during recovery (see section above about making TID recycling safe). That
-leaves concern only for plain index scans. (XXX: Not actually clear why
-this is totally unnecessary during recovery.)
+leaves concern only for plain index scans. (XXX: This reasoning is faulty,
+see CAH2-Wzkro678xEDOrsxrq-YDVP4w7nXybhVJV2MxrzTj-5OU4w@mail.gmail.com for
+details.)
 
 MVCC snapshot plain index scans are always safe, for the same reasons that
 they're safe during original execution.  HeapTupleSatisfiesToast() doesn't
