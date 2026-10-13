@@ -119,7 +119,7 @@ static void show_window_def(WindowAggState *planstate,
 static void show_window_keys(StringInfo buf, PlanState *planstate,
 							 int nkeys, AttrNumber *keycols,
 							 List *ancestors, ExplainState *es);
-static void show_storage_info(char *maxStorageType, int64 maxSpaceUsed,
+static void show_storage_info(bool diskUsed, int64 maxSpaceUsed,
 							  ExplainState *es);
 static void show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 							 List *ancestors, ExplainState *es);
@@ -3006,13 +3006,14 @@ show_window_keys(StringInfo buf, PlanState *planstate,
  * Show information on storage method and maximum memory/disk space used.
  */
 static void
-show_storage_info(char *maxStorageType, int64 maxSpaceUsed, ExplainState *es)
+show_storage_info(bool diskUsed, int64 maxSpaceUsed, ExplainState *es)
 {
 	int64		maxSpaceUsedKB = BYTES_TO_KILOBYTES(maxSpaceUsed);
+	const char *storageType = diskUsed ? "Disk" : "Memory";
 
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-		ExplainPropertyText("Storage", maxStorageType, es);
+		ExplainPropertyText("Storage", storageType, es);
 		ExplainPropertyInteger("Maximum Storage", "kB", maxSpaceUsedKB, es);
 	}
 	else
@@ -3020,7 +3021,7 @@ show_storage_info(char *maxStorageType, int64 maxSpaceUsed, ExplainState *es)
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
 						 "Storage: %s  Maximum Storage: " INT64_FORMAT "kB\n",
-						 maxStorageType,
+						 storageType,
 						 maxSpaceUsedKB);
 	}
 }
@@ -3485,20 +3486,46 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 static void
 show_material_info(MaterialState *mstate, ExplainState *es)
 {
-	char	   *maxStorageType;
+	bool		usedDisk;
 	int64		maxSpaceUsed;
 
 	Tuplestorestate *tupstore = mstate->tuplestorestate;
 
-	/*
-	 * Nothing to show if ANALYZE option wasn't used or if execution didn't
-	 * get as far as creating the tuplestore.
-	 */
-	if (!es->analyze || tupstore == NULL)
+	if (!es->analyze)
 		return;
 
-	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
-	show_storage_info(maxStorageType, maxSpaceUsed, es);
+	/*
+	 * Nothing to show for the leader if execution didn't get as far as
+	 * creating the tuplestore.
+	 */
+	if (tupstore != NULL)
+	{
+		tuplestore_get_stats(tupstore, &usedDisk, &maxSpaceUsed);
+		show_storage_info(usedDisk, maxSpaceUsed, es);
+	}
+
+	if (mstate->shared_info == NULL)
+		return;
+
+	/* Show details from parallel workers */
+	for (int n = 0; n < mstate->shared_info->num_workers; n++)
+	{
+		MaterialInstrumentation *si;
+
+		si = &mstate->shared_info->sinstrument[n];
+
+		/* Skip workers that didn't create a tuplestore */
+		if (si->maxSpaceUsed == 0)
+			continue;
+
+		if (es->workers_state)
+			ExplainOpenWorker(n, es);
+
+		show_storage_info(si->usedDisk, si->maxSpaceUsed, es);
+
+		if (es->workers_state)
+			ExplainCloseWorker(n, es);
+	}
 }
 
 /*
@@ -3508,7 +3535,7 @@ show_material_info(MaterialState *mstate, ExplainState *es)
 static void
 show_windowagg_info(WindowAggState *winstate, ExplainState *es)
 {
-	char	   *maxStorageType;
+	bool		usedDisk;
 	int64		maxSpaceUsed;
 
 	Tuplestorestate *tupstore = winstate->buffer;
@@ -3520,8 +3547,8 @@ show_windowagg_info(WindowAggState *winstate, ExplainState *es)
 	if (!es->analyze || tupstore == NULL)
 		return;
 
-	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
-	show_storage_info(maxStorageType, maxSpaceUsed, es);
+	tuplestore_get_stats(tupstore, &usedDisk, &maxSpaceUsed);
+	show_storage_info(usedDisk, maxSpaceUsed, es);
 }
 
 /*
@@ -3531,7 +3558,7 @@ show_windowagg_info(WindowAggState *winstate, ExplainState *es)
 static void
 show_ctescan_info(CteScanState *ctescanstate, ExplainState *es)
 {
-	char	   *maxStorageType;
+	bool		usedDisk;
 	int64		maxSpaceUsed;
 
 	Tuplestorestate *tupstore = ctescanstate->leader->cte_table;
@@ -3539,8 +3566,8 @@ show_ctescan_info(CteScanState *ctescanstate, ExplainState *es)
 	if (!es->analyze || tupstore == NULL)
 		return;
 
-	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
-	show_storage_info(maxStorageType, maxSpaceUsed, es);
+	tuplestore_get_stats(tupstore, &usedDisk, &maxSpaceUsed);
+	show_storage_info(usedDisk, maxSpaceUsed, es);
 }
 
 /*
@@ -3550,7 +3577,7 @@ show_ctescan_info(CteScanState *ctescanstate, ExplainState *es)
 static void
 show_table_func_scan_info(TableFuncScanState *tscanstate, ExplainState *es)
 {
-	char	   *maxStorageType;
+	bool		usedDisk;
 	int64		maxSpaceUsed;
 
 	Tuplestorestate *tupstore = tscanstate->tupstore;
@@ -3558,8 +3585,8 @@ show_table_func_scan_info(TableFuncScanState *tscanstate, ExplainState *es)
 	if (!es->analyze || tupstore == NULL)
 		return;
 
-	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
-	show_storage_info(maxStorageType, maxSpaceUsed, es);
+	tuplestore_get_stats(tupstore, &usedDisk, &maxSpaceUsed);
+	show_storage_info(usedDisk, maxSpaceUsed, es);
 }
 
 /*
@@ -3569,8 +3596,8 @@ show_table_func_scan_info(TableFuncScanState *tscanstate, ExplainState *es)
 static void
 show_recursive_union_info(RecursiveUnionState *rstate, ExplainState *es)
 {
-	char	   *maxStorageType,
-			   *tempStorageType;
+	bool		maxUsedDisk,
+				tempUsedDisk;
 	int64		maxSpaceUsed,
 				tempSpaceUsed;
 
@@ -3582,16 +3609,16 @@ show_recursive_union_info(RecursiveUnionState *rstate, ExplainState *es)
 	 * from one of them which consumed more memory/disk than the other.  The
 	 * storage size is sum of the two.
 	 */
-	tuplestore_get_stats(rstate->working_table, &tempStorageType,
+	tuplestore_get_stats(rstate->working_table, &tempUsedDisk,
 						 &tempSpaceUsed);
-	tuplestore_get_stats(rstate->intermediate_table, &maxStorageType,
+	tuplestore_get_stats(rstate->intermediate_table, &maxUsedDisk,
 						 &maxSpaceUsed);
 
 	if (tempSpaceUsed > maxSpaceUsed)
-		maxStorageType = tempStorageType;
+		maxUsedDisk = tempUsedDisk;
 
 	maxSpaceUsed += tempSpaceUsed;
-	show_storage_info(maxStorageType, maxSpaceUsed, es);
+	show_storage_info(maxUsedDisk, maxSpaceUsed, es);
 }
 
 /*
