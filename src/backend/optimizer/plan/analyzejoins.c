@@ -151,13 +151,15 @@ remove_useless_outer_joins(PlannerInfo *root)
 		 * As in pull_up_simple_subquery, discard no-longer-needed subqueries.
 		 * This is not just an optimization, but is necessary to prevent
 		 * subsequent processing from descending into stale subtrees and
-		 * seeing inconsistent data.  Likewise discard any securityQuals of
-		 * the removed rel.  (Although simple_rte_array[] will be rebuilt
-		 * shortly, we can still use it to find the RTE in the parse tree.)
+		 * seeing inconsistent data.  For the same reason, discard any
+		 * tablesample and securityQuals subtrees of the removed rel.
+		 * (Although simple_rte_array[] will be rebuilt shortly, we can still
+		 * use it to find the RTE in the parse tree.)
 		 */
 		rte = root->simple_rte_array[innerrelid];
 		if (rte->rtekind == RTE_SUBQUERY)
 			rte->subquery = NULL;
+		rte->tablesample = NULL;
 		rte->securityQuals = NIL;
 
 		/*
@@ -1269,6 +1271,13 @@ remove_self_join_rel(PlannerInfo *root,
 		ChangeVarNodes((Node *) root->append_rel_list, toRemove->relid,
 					   toKeep->relid, 0);
 
+	/*
+	 * As in remove_useless_outer_joins, discard the securityQuals of the
+	 * removed rel, so that later passes don't visit them.  We know the kept
+	 * rel has the same quals.  (tablesample is already known NULL.)
+	 */
+	root->simple_rte_array[toRemove->relid]->securityQuals = NIL;
+
 	/* Clean up the quals that the substitution has messed with */
 	fixup_selfjoin_jointree(root, (Node *) root->parse->jointree,
 							toKeep->relid,
@@ -1970,7 +1979,7 @@ remove_self_joins_recurse(PlannerInfo *root, List *joinlist)
 	int			j;
 	int			numRels;
 
-	/* Collect indexes of base relations of the join tree */
+	/* Collect indexes of possibly-mergeable relations from the joinlist */
 	foreach(jl, joinlist)
 	{
 		Node	   *jlnode = (Node *) lfirst(jl);
@@ -1981,15 +1990,31 @@ remove_self_joins_recurse(PlannerInfo *root, List *joinlist)
 			RangeTblEntry *rte = root->simple_rte_array[varno];
 
 			/*
-			 * We only consider ordinary relations as candidates to be
-			 * removed, and these relations should not have TABLESAMPLE
-			 * clauses specified.  Removing a relation with TABLESAMPLE clause
-			 * could potentially change the semantics of the query. Because of
-			 * UPDATE/DELETE EPQ mechanism, currently Query->resultRelation or
-			 * Query->mergeTargetRelation associated rel cannot be eliminated.
+			 * To be considered for self-join removal, the RTE must:
+			 *
+			 * 1. Be an ordinary relation.  (Someday we might support SJE on
+			 * partitioned tables, but not yet.)
+			 *
+			 * 2. Not have inh set, ie it has no inheritance children (or the
+			 * user wrote ONLY to ignore them).  Under traditional inheritance
+			 * a unique index on a parent table does not establish uniqueness
+			 * across its children.  This rule also keeps us from trying to
+			 * merge an inheritance scan with an ONLY scan, which would be
+			 * wrong.  (preprocess_relation_rtes already cleared the inh flag
+			 * for tables known not to have inheritance children.)
+			 *
+			 * 3. Not have a TABLESAMPLE clause.  Removing a relation with a
+			 * TABLESAMPLE clause would change the semantics of the query,
+			 * even if we merged it with another RTE with an identical
+			 * TABLESAMPLE clause.  (Two such RTEs should represent
+			 * independent samplings of the base table.)
+			 *
+			 * 4. Not be the query's result relation or MERGE target.  Merging
+			 * would cause misbehavior during EPQ.
 			 */
 			if (rte->rtekind == RTE_RELATION &&
 				rte->relkind == RELKIND_RELATION &&
+				!rte->inh &&
 				rte->tablesample == NULL &&
 				varno != root->parse->resultRelation &&
 				varno != root->parse->mergeTargetRelation)
