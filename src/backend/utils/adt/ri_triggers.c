@@ -161,29 +161,13 @@ typedef struct RI_ConstraintInfo
 	FastPathMeta *fpmeta;
 } RI_ConstraintInfo;
 
-typedef struct RI_CompareHashEntry RI_CompareHashEntry;
-
 /* Fast-path metadata for RI checks on foreign key referencing tables */
 typedef struct FastPathMeta
 {
-	FmgrInfo	eq_opr_finfo[RI_MAX_NUMKEYS];
-	FmgrInfo	cast_func_finfo[RI_MAX_NUMKEYS];
 	RegProcedure regops[RI_MAX_NUMKEYS];
 	Oid			subtypes[RI_MAX_NUMKEYS];
 	int			strats[RI_MAX_NUMKEYS];
 	AttrNumber	index_attnos[RI_MAX_NUMKEYS];	/* index column positions */
-
-	/*
-	 * fn_mcxt for the cached FmgrInfos above.  Cast and equality functions
-	 * (e.g. record_eq()) use fn_mcxt as scratch space, caching state there
-	 * and keeping a pointer to it in FmgrInfo.fn_extra.  Give them a context
-	 * of their own, created with this struct and destroyed with it in
-	 * AtEOXact_RI().
-	 *
-	 * Note this context must not be reset while the FmgrInfos remain in use,
-	 * since that would free the state fn_extra still points at.
-	 */
-	MemoryContext scratch_cxt;
 
 	/* Link in ri_fpmeta_dead_list while awaiting deferred release */
 	struct FastPathMeta *next_dead;
@@ -304,7 +288,8 @@ static bool ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 						   bool *concurrently_updated);
 static bool ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo);
 static bool ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
-									Relation pk_rel, Relation idx_rel);
+									Relation fk_rel, Relation pk_rel,
+									Relation idx_rel);
 static void ri_CheckPermissions(const RI_ConstraintInfo *riinfo,
 								Relation query_rel);
 static bool recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys,
@@ -312,11 +297,11 @@ static bool recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys,
 static void ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
 										const FastPathMeta *fpmeta);
 static void build_index_scankeys(const RI_ConstraintInfo *riinfo,
-								 FastPathMeta *fpmeta,
-								 Relation idx_rel, Datum *pk_vals,
-								 char *pk_nulls, ScanKey skeys);
+								 const FastPathMeta *fpmeta,
+								 Relation idx_rel, const Datum *pk_vals,
+								 ScanKey skeys);
 static void ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
-										  Relation fk_rel, Relation idx_rel);
+										  Relation idx_rel);
 static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 							 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
 							 Datum *vals, char *nulls);
@@ -435,8 +420,9 @@ RI_FKey_check(TriggerData *trigdata)
 	 * the per-row executor overhead.
 	 *
 	 * ri_FastPathCheck() reports the violation itself if no matching PK row
-	 * is found.  It returns false if the index checks made after opening the
-	 * relations require a SPI fallback.
+	 * is found.  It returns false if the checks made after opening the
+	 * relations, on the index and on whether the FK values need a coercion to
+	 * reach the equality operator's input type, require a SPI fallback.
 	 */
 	if (ri_fastpath_is_applicable(riinfo) &&
 		ri_FastPathCheck(riinfo, fk_rel, newslot))
@@ -2488,7 +2474,7 @@ get_ri_constraint_root(Oid constrOid)
 }
 
 /*
- * Callback for pg_constraint and pg_amop inval events
+ * Callback for pg_constraint, pg_amop and pg_cast inval events
  *
  * While most syscache callbacks just flush all their entries, pg_constraint
  * gets enough update traffic that it's probably worth being smarter.
@@ -2525,6 +2511,14 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 		hashvalue = 0;
 
 	/*
+	 * Likewise for pg_cast: whether a constraint's FK values are
+	 * binary-coercible to the operator's input type, which decides fast-path
+	 * eligibility, can depend on a binary cast, which may be replaced.
+	 */
+	if (cacheid == CASTSOURCETARGET)
+		hashvalue = 0;
+
+	/*
 	 * If the list of currently valid entries gets excessively large, we mark
 	 * them all invalid so we can empty the list.  This arrangement avoids
 	 * O(N^2) behavior in situations where a session touches many foreign keys
@@ -2552,13 +2546,12 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 			/*
 			 * Detach any fast-path metadata so that the next check
 			 * repopulates it, but do not free it here.  ri_FastPathCheck()
-			 * copies riinfo->fpmeta into a local (and takes FmgrInfo pointers
-			 * into it) and then runs index scans, tuple locking, and
-			 * user-supplied cast and equality functions, all of which can
-			 * accept invalidation messages and reach this callback.  Freeing
-			 * now would leave those callers reading freed memory.  Queue it
-			 * instead; AtEOXact_RI() releases it once no RI check can be
-			 * running.
+			 * copies riinfo->fpmeta into a local and then does catalog
+			 * lookups, index scans, tuple locking, and calls equality
+			 * functions, all of which can accept invalidation messages and
+			 * reach this callback.  Freeing now would leave it reading freed
+			 * memory.  Queue it instead; AtEOXact_RI() releases it once no RI
+			 * check can be running.
 			 */
 			if (riinfo->fpmeta)
 			{
@@ -2813,7 +2806,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 
 	idx_rel = index_open(riinfo->conindid, AccessShareLock);
 
-	if (!ri_check_fastpath_index(riinfo, pk_rel, idx_rel))
+	if (!ri_check_fastpath_index(riinfo, fk_rel, pk_rel, idx_rel))
 	{
 		index_close(idx_rel, NoLock);
 		table_close(pk_rel, NoLock);
@@ -2831,10 +2824,10 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	 * InvalidSnapshot, so SPI takes the snapshot after the
 	 * referenced-relation lock has been acquired.
 	 *
-	 * Make this snapshot active too, as SPI does.  STABLE cast and equality
-	 * functions use the active snapshot, so leaving the outer query's
-	 * snapshot active could hide changes made by earlier triggers even though
-	 * the index scan can see them.
+	 * Make this snapshot active too, as SPI does.  STABLE equality functions
+	 * use the active snapshot, so leaving the outer query's snapshot active
+	 * could hide changes made by earlier triggers even though the index scan
+	 * can see them.
 	 */
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 	PushActiveSnapshot(snapshot);
@@ -2863,7 +2856,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	{
 		/* Reload to ensure it's valid. */
 		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
-		ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
+		ri_populate_fastpath_metadata(riinfo, idx_rel);
 	}
 
 	/*
@@ -2877,7 +2870,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	Assert(fpmeta);
 	ri_CheckFunctionPermissions(riinfo, fpmeta);
 	ri_ExtractValues(fk_rel, newslot, riinfo, false, pk_vals, pk_nulls);
-	build_index_scankeys(riinfo, fpmeta, idx_rel, pk_vals, pk_nulls, skey);
+	build_index_scankeys(riinfo, fpmeta, idx_rel, pk_vals, skey);
 	found = ri_FastPathProbeOne(pk_rel, idx_rel, scandesc, slot,
 								snapshot, riinfo, skey, riinfo->nkeys);
 	SetUserIdAndSecContext(saved_userid, saved_sec_context);
@@ -3017,8 +3010,11 @@ ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 }
 
 /*
- * Apply the checks that do not require opening the referenced index.  An
- * unknown state still needs ri_check_fastpath_index() before using it.
+ * Apply the cheap checks that depend only on riinfo; this runs for every
+ * row.  Checks that need the referenced index or catalog lookups are made
+ * once by ri_check_fastpath_index(), which caches the result in
+ * fastpath_state; an unknown state still needs it before using the fast
+ * path.
  */
 static bool
 ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
@@ -3043,16 +3039,18 @@ ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
 }
 
 /*
- * Check index-dependent eligibility lazily, like fast-path scan metadata.
- * Cache both success and failure until the constraint information is reloaded.
+ * Check eligibility that depends on the index or on the FK column types
+ * lazily, like fast-path scan metadata.  Cache both success and failure until
+ * the constraint information is reloaded.
  *
  * The caller has locked the referenced table, reloaded conindid, and opened
  * the index.  Looking up index properties in ri_LoadConstraintInfo() would
  * race with REINDEX CONCURRENTLY dropping an index read before that lock.
- * The index-property checks use the held relation descriptors.
+ * The index-property checks use the held relation descriptors, and the check
+ * of the FK column types uses fk_rel.
  */
 static bool
-ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
+ri_check_fastpath_index(RI_ConstraintInfo *riinfo, Relation fk_rel,
 						Relation pk_rel, Relation idx_rel)
 {
 	/* Opening the index can have processed further invalidations. */
@@ -3112,6 +3110,27 @@ ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
 
 		if (get_op_opfamily_strategy(riinfo->pf_eq_oprs[i],
 									 idx_rel->rd_opfamily[idx_col]) != BTEqualStrategyNumber)
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
+	/*
+	 * The fast path passes FK values to the equality operator as they are, so
+	 * it needs the FK type to be binary-coercible to the operator's right
+	 * input type.  That covers cross-type operators, which take the FK type
+	 * directly, domains, and binary-compatible types.  Any other coercion is
+	 * left to SPI, which applies it as part of the query.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+		Oid			lefttype;
+		Oid			righttype;
+
+		op_input_types(riinfo->pf_eq_oprs[i], &lefttype, &righttype);
+		if (!IsBinaryCoercible(fk_type, righttype))
 		{
 			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
 			return false;
@@ -3235,9 +3254,10 @@ recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys, int nkeys,
  *
  * This parallels the checks ExecInitFunc() performs when the SPI path
  * initializes its generated query, where the equality operator's function
- * appears in the WHERE clause and the cast function, if any, in the cast
- * applied to the parameter.  Call with the user id already switched to the
- * referenced table's owner.
+ * appears in the WHERE clause.  The fast path is not used when the FK values
+ * need coercion (see ri_check_fastpath_index()), so that is the only function
+ * to check.  Call with the user id already switched to the referenced table's
+ * owner.
  */
 static void
 ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
@@ -3245,21 +3265,15 @@ ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
 {
 	for (int i = 0; i < riinfo->nkeys; i++)
 	{
-		Oid			funcs[2] = {fpmeta->regops[i], fpmeta->cast_func_finfo[i].fn_oid};
+		Oid			funcid = fpmeta->regops[i];
+		AclResult	aclresult;
 
-		for (int j = 0; j < lengthof(funcs); j++)
-		{
-			AclResult	aclresult;
-
-			if (!OidIsValid(funcs[j]))
-				continue;
-			aclresult = object_aclcheck(ProcedureRelationId, funcs[j],
-										GetUserId(), ACL_EXECUTE);
-			if (aclresult != ACLCHECK_OK)
-				aclcheck_error(aclresult, OBJECT_FUNCTION,
-							   get_func_name(funcs[j]));
-			InvokeFunctionExecuteHook(funcs[j]);
-		}
+		aclresult = object_aclcheck(ProcedureRelationId, funcid,
+									GetUserId(), ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION,
+						   get_func_name(funcid));
+		InvokeFunctionExecuteHook(funcid);
 	}
 }
 
@@ -3267,32 +3281,18 @@ ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
  * build_index_scankeys
  *		Build ScanKeys for a direct index probe of the PK's unique index.
  *
- * Uses cached compare entries, operator procedures, and strategy numbers
- * from ri_populate_fastpath_metadata() rather than looking them up on
- * each invocation.  Casts FK values to the operator's expected input
- * type if needed.
+ * Uses operator procedures and strategy numbers cached by
+ * ri_populate_fastpath_metadata() rather than looking them up on each
+ * invocation.  The FK values are used as they are: the fast path is only
+ * used when they need no coercion to the operator's input type.
  */
 static void
 build_index_scankeys(const RI_ConstraintInfo *riinfo,
-					 FastPathMeta *fpmeta,
-					 Relation idx_rel, Datum *pk_vals,
-					 char *pk_nulls, ScanKey skeys)
+					 const FastPathMeta *fpmeta,
+					 Relation idx_rel, const Datum *pk_vals,
+					 ScanKey skeys)
 {
 	Assert(fpmeta);
-
-	/*
-	 * May need to cast each of the individual values of the foreign key to
-	 * the corresponding PK column's type if the equality operator demands it.
-	 */
-	for (int i = 0; i < riinfo->nkeys; i++)
-	{
-		if (pk_nulls[i] != 'n' &&
-			OidIsValid(fpmeta->cast_func_finfo[i].fn_oid))
-			pk_vals[i] = FunctionCall3(&fpmeta->cast_func_finfo[i],
-									   pk_vals[i],
-									   Int32GetDatum(-1),	/* typmod */
-									   BoolGetDatum(false));	/* implicit coercion */
-	}
 
 	/*
 	 * Set up ScanKeys for the index scan. This is essentially how
@@ -3318,13 +3318,12 @@ build_index_scankeys(const RI_ConstraintInfo *riinfo,
  * ri_populate_fastpath_metadata
  *		Cache per-key metadata needed by build_index_scankeys().
  *
- * Looks up the compare hash entry, operator procedure OID, and index
- * strategy/subtype for each key column.  Called lazily on first use
- * and persists for the lifetime of the RI_ConstraintInfo entry.
+ * Looks up the operator procedure OID and index strategy/subtype for each
+ * key column.  Called lazily on first use and persists for the lifetime of
+ * the RI_ConstraintInfo entry.
  */
 static void
-ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
-							  Relation fk_rel, Relation idx_rel)
+ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo, Relation idx_rel)
 {
 	FastPathMeta *fpmeta;
 	MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
@@ -3335,16 +3334,10 @@ ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
 	fpmeta = palloc_object(FastPathMeta);
 	fpmeta->next_dead = NULL;
 
-	/* Scratch context for the cached FmgrInfos' fn_mcxt; see FastPathMeta. */
-	fpmeta->scratch_cxt = AllocSetContextCreate(TopMemoryContext,
-												"RI fast-path finfo scratch",
-												ALLOCSET_SMALL_SIZES);
 	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		Oid			eq_opr = riinfo->pf_eq_oprs[i];
-		Oid			typeid = RIAttType(fk_rel, riinfo->fk_attnums[i]);
 		Oid			lefttype;
-		RI_CompareHashEntry *entry = ri_HashCompareOp(eq_opr, typeid);
 		int			idx_col;
 
 		/*
@@ -3363,10 +3356,6 @@ ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
 		/* 1-based attribute number */
 		fpmeta->index_attnos[i] = idx_col + 1;
 
-		fmgr_info_copy(&fpmeta->cast_func_finfo[i], &entry->cast_func_finfo,
-					   fpmeta->scratch_cxt);
-		fmgr_info_copy(&fpmeta->eq_opr_finfo[i], &entry->eq_opr_finfo,
-					   fpmeta->scratch_cxt);
 		fpmeta->regops[i] = get_opcode(eq_opr);
 
 		get_op_opfamily_properties(eq_opr,
@@ -3633,11 +3622,14 @@ ri_InitHashTables(void)
 									  RI_INIT_CONSTRAINTHASHSIZE,
 									  &ctl, HASH_ELEM | HASH_BLOBS);
 
-	/* Arrange to flush cache on pg_constraint or pg_amop changes */
+	/* Arrange to flush cache on pg_constraint, pg_amop or pg_cast changes */
 	CacheRegisterSyscacheCallback(CONSTROID,
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
 	CacheRegisterSyscacheCallback(AMOPOPID,
+								  InvalidateConstraintCacheCallBack,
+								  (Datum) 0);
+	CacheRegisterSyscacheCallback(CASTSOURCETARGET,
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
 
@@ -3879,11 +3871,8 @@ ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
 /*
  * ri_HashCompareOp -
  *
- * Look up or create a cache entry for the given equality operator and
- * the caller's value type (typeid).  The entry holds the operator's
- * FmgrInfo and, if typeid doesn't match what the operator expects as
- * its right-hand input, a cast function to coerce the value before
- * comparison.
+ * See if we know how to compare two values, and create a new hash entry
+ * if not.
  */
 static RI_CompareHashEntry *
 ri_HashCompareOp(Oid eq_opr, Oid typeid)
@@ -3939,15 +3928,8 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 		 * moment since that will never be generated for implicit coercions.
 		 */
 		op_input_types(eq_opr, &lefttype, &righttype);
-
-		/*
-		 * pf_eq_oprs (used by the fast path) can be cross-type when the FK
-		 * and PK columns differ in type, e.g. int48eq for int4 PK / int8 FK.
-		 * If the FK column's type, or the base type of a domain over it,
-		 * already matches what the operator expects as its right-hand input,
-		 * no cast is needed.
-		 */
-		if (getBaseType(typeid) == righttype)
+		Assert(lefttype == righttype);
+		if (typeid == lefttype)
 			castfunc = InvalidOid;	/* simplest case */
 		else
 		{
@@ -4037,7 +4019,6 @@ AtEOXact_RI(bool isCommit)
 		FastPathMeta *dead = ri_fpmeta_dead_list;
 
 		ri_fpmeta_dead_list = dead->next_dead;
-		MemoryContextDelete(dead->scratch_cxt);
 		pfree(dead);
 	}
 }

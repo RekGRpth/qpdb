@@ -1592,6 +1592,10 @@ pgstat_register_kind(PgStat_Kind kind, const PgStat_KindInfo *kind_info)
 			ereport(ERROR,
 					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
 					 errhint("Custom cumulative statistics cannot use a dedicated hash table for fixed-numbered objects.")));
+		if (kind_info->to_serialized_name || kind_info->from_serialized_name)
+			ereport(ERROR,
+					(errmsg("failed to register custom cumulative statistics \"%s\" with ID %u", kind_info->name, kind),
+					 errhint("Custom cumulative statistics cannot use serialized names for fixed-numbered objects.")));
 	}
 	else
 	{
@@ -2044,6 +2048,14 @@ pgstat_read_statsfile(void)
 						if (!kind_info)
 						{
 							elog(WARNING, "could not find information of kind for entry %u/%u/%" PRIu64 " of type %c",
+								 key.kind, key.dboid,
+								 key.objid, t);
+							goto error;
+						}
+
+						if (kind_info->fixed_amount)
+						{
+							elog(WARNING, "invalid fixed_amount in stats kind for entry %u/%u/%" PRIu64 " of type %c",
 								 key.kind, key.dboid,
 								 key.objid, t);
 							goto error;
