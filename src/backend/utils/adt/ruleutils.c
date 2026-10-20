@@ -3839,13 +3839,6 @@ set_deparse_context_plan(List *dpcontext, Plan *plan, List *ancestors)
 	dpns->ancestors = ancestors;
 	set_deparse_plan(dpns, plan);
 
-	/* For ModifyTable, set aliases for OLD and NEW in RETURNING */
-	if (IsA(plan, ModifyTable))
-	{
-		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
-		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
-	}
-
 	return dpcontext;
 }
 
@@ -5148,10 +5141,10 @@ get_rtable_name(int rtindex, deparse_context *context)
  * of a given Plan node
  *
  * This sets the plan, outer_plan, inner_plan, outer_tlist, inner_tlist,
- * and index_tlist fields.  Caller must already have adjusted the ancestors
- * list if necessary.  Note that the rtable, subplans, and ctes fields do
- * not need to change when shifting attention to different plan nodes in a
- * single plan tree.
+ * index_tlist, ret_old_alias, and ret_new_alias fields as appropriate.
+ * Caller must already have adjusted the ancestors list if necessary.
+ * Note that the rtable, subplans, and ctes fields do not need to change
+ * when shifting attention to different plan nodes in a single plan tree.
  */
 static void
 set_deparse_plan(deparse_namespace *dpns, Plan *plan)
@@ -5227,6 +5220,15 @@ set_deparse_plan(deparse_namespace *dpns, Plan *plan)
 		dpns->index_tlist = ((CustomScan *) plan)->custom_scan_tlist;
 	else
 		dpns->index_tlist = NIL;
+
+	/* Set up table aliases for OLD and NEW in RETURNING */
+	if (IsA(plan, ModifyTable))
+	{
+		dpns->ret_old_alias = ((ModifyTable *) plan)->returningOldAlias;
+		dpns->ret_new_alias = ((ModifyTable *) plan)->returningNewAlias;
+	}
+	else
+		dpns->ret_old_alias = dpns->ret_new_alias = NULL;
 }
 
 /*
@@ -7735,9 +7737,15 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 
 		/* might be returning old/new column value */
 		if (var->varreturningtype == VAR_RETURNING_OLD)
+		{
 			refname = dpns->ret_old_alias;
+			Assert(refname);
+		}
 		else if (var->varreturningtype == VAR_RETURNING_NEW)
+		{
 			refname = dpns->ret_new_alias;
+			Assert(refname);
+		}
 		else
 			refname = (char *) list_nth(dpns->rtable_names, varno - 1);
 
@@ -8912,7 +8920,6 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 		case T_CoalesceExpr:
 		case T_MinMaxExpr:
 		case T_SQLValueFunction:
-		case T_XmlExpr:
 		case T_NextValueExpr:
 		case T_NullIfExpr:
 		case T_Aggref:
@@ -9014,6 +9021,17 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 			}
 			pg_fallthrough;
 
+		case T_XmlExpr:
+
+			/*
+			 * Function-like (name(..)), except "x IS DOCUMENT", which is a
+			 * postfix test like IS NULL.  (The IsA check is needed because
+			 * T_OpExpr falls through to here.)
+			 */
+			if (IsA(node, XmlExpr) && ((XmlExpr *) node)->op != IS_DOCUMENT)
+				return true;
+			pg_fallthrough;
+
 		case T_SubLink:
 		case T_NullTest:
 		case T_BooleanTest:
@@ -9038,13 +9056,14 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_RowExpr: /* other separators */
 				case T_CoalesceExpr:	/* own parentheses */
 				case T_MinMaxExpr:	/* own parentheses */
-				case T_XmlExpr: /* own parentheses */
 				case T_NullIfExpr:	/* other separators */
 				case T_Aggref:	/* own parentheses */
 				case T_GroupingFunc:	/* own parentheses */
 				case T_WindowFunc:	/* own parentheses */
 				case T_CaseExpr:	/* other separators */
 					return true;
+				case T_XmlExpr: /* own parentheses, except IS DOCUMENT */
+					return ((XmlExpr *) parentNode)->op != IS_DOCUMENT;
 				default:
 					return false;
 			}
@@ -9090,7 +9109,6 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_RowExpr: /* other separators */
 				case T_CoalesceExpr:	/* own parentheses */
 				case T_MinMaxExpr:	/* own parentheses */
-				case T_XmlExpr: /* own parentheses */
 				case T_NullIfExpr:	/* other separators */
 				case T_Aggref:	/* own parentheses */
 				case T_GroupingFunc:	/* own parentheses */
@@ -9098,6 +9116,8 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				case T_CaseExpr:	/* other separators */
 				case T_JsonExpr:	/* own parentheses */
 					return true;
+				case T_XmlExpr: /* own parentheses, except IS DOCUMENT */
+					return ((XmlExpr *) parentNode)->op != IS_DOCUMENT;
 				default:
 					return false;
 			}
@@ -10150,6 +10170,9 @@ get_rule_expr(Node *node, deparse_context *context,
 						appendStringInfoString(buf, "XMLSERIALIZE(");
 						break;
 					case IS_DOCUMENT:
+						/* postfix test, like IS NULL: not self-delimiting */
+						if (!PRETTY_PAREN(context))
+							appendStringInfoChar(buf, '(');
 						break;
 				}
 				if (xexpr->op == IS_XMLPARSE || xexpr->op == IS_XMLSERIALIZE)
@@ -10257,7 +10280,9 @@ get_rule_expr(Node *node, deparse_context *context,
 							}
 							break;
 						case IS_DOCUMENT:
-							get_rule_expr_paren((Node *) xexpr->args, context, false, node);
+							Assert(list_length(xexpr->args) == 1);
+							get_rule_expr_paren((Node *) linitial(xexpr->args),
+												context, false, node);
 							break;
 					}
 				}
@@ -10273,7 +10298,11 @@ get_rule_expr(Node *node, deparse_context *context,
 				}
 
 				if (xexpr->op == IS_DOCUMENT)
+				{
 					appendStringInfoString(buf, " IS DOCUMENT");
+					if (!PRETTY_PAREN(context))
+						appendStringInfoChar(buf, ')');
+				}
 				else
 					appendStringInfoChar(buf, ')');
 			}
@@ -10775,10 +10804,12 @@ looks_like_function(Node *node)
 		case T_CoalesceExpr:
 		case T_MinMaxExpr:
 		case T_SQLValueFunction:
-		case T_XmlExpr:
 		case T_JsonExpr:
 			/* these are all accepted by func_expr_common_subexpr */
 			return true;
+		case T_XmlExpr:
+			/* all but IS DOCUMENT, which is a postfix test */
+			return ((XmlExpr *) node)->op != IS_DOCUMENT;
 		default:
 			break;
 	}
