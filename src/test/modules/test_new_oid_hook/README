@@ -1,0 +1,9 @@
+test_new_oid_hook tests new_oid_hook, through which an extension proposes
+the OID of a new catalog row.
+
+Functions
+=========
+test_new_oid_hook_propose(catalog regclass, proposed oid)
+    RETURNS void
+
+Makes the hook propose the OID once, for the next new row of the catalog.

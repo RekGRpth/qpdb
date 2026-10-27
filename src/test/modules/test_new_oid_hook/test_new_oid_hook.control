@@ -1,0 +1,4 @@
+comment = 'Test code for new_oid_hook'
+default_version = '1.0'
+module_pathname = '$libdir/test_new_oid_hook'
+relocatable = true

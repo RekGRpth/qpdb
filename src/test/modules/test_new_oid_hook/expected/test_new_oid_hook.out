@@ -1,0 +1,102 @@
+CREATE EXTENSION test_new_oid_hook;
+-- A proposed OID is used, and the relation's file is named after it
+SELECT test_new_oid_hook_propose('pg_class', 4000000000);
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE TABLE proposed_oid_table (a int);
+SELECT oid, relfilenode FROM pg_class WHERE relname = 'proposed_oid_table';
+    oid     | relfilenode 
+------------+-------------
+ 4000000000 |  4000000000
+(1 row)
+
+-- Also for catalogs other than pg_class
+SELECT test_new_oid_hook_propose('pg_namespace', 4000000001);
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE SCHEMA proposed_oid_schema;
+SELECT oid FROM pg_namespace WHERE nspname = 'proposed_oid_schema';
+    oid     
+------------
+ 4000000001
+(1 row)
+
+-- A proposed OID in use is an error, not a duplicate
+SELECT test_new_oid_hook_propose('pg_class', 4000000000);
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE TABLE proposed_oid_in_use (a int);
+ERROR:  proposed OID 4000000000 is already in use in relation "pg_class"
+SELECT count(*) FROM pg_class WHERE oid = 4000000000;
+ count 
+-------
+     1
+(1 row)
+
+-- So is one in the range of system objects
+SELECT test_new_oid_hook_propose('pg_class', 100);
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE TABLE proposed_oid_system (a int);
+ERROR:  proposed OID 100 for relation "pg_class" is in the range of system objects
+-- A proposed OID that names an existing file gets a relfilenumber of its own
+CREATE TABLE truncated_table (a int);
+TRUNCATE truncated_table;
+SELECT test_new_oid_hook_propose('pg_class', relfilenode)
+  FROM pg_class WHERE relname = 'truncated_table';
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE TABLE proposed_oid_file (a int);
+SELECT p.oid = r.relfilenode AS oid_names_file,
+       p.relfilenode <> p.oid AS own_relfilenode
+  FROM pg_class p, pg_class r
+  WHERE p.relname = 'proposed_oid_file' AND r.relname = 'truncated_table';
+ oid_names_file | own_relfilenode 
+----------------+-----------------
+ t              | t
+(1 row)
+
+INSERT INTO proposed_oid_file VALUES (1);
+SELECT * FROM proposed_oid_file;
+ a 
+---
+ 1
+(1 row)
+
+-- The same for an index, with a file the table above did not take
+TRUNCATE truncated_table;
+SELECT test_new_oid_hook_propose('pg_class', relfilenode)
+  FROM pg_class WHERE relname = 'truncated_table';
+ test_new_oid_hook_propose 
+---------------------------
+ 
+(1 row)
+
+CREATE INDEX proposed_oid_index ON proposed_oid_table (a);
+SELECT p.oid = r.relfilenode AS oid_names_file,
+       p.relfilenode <> p.oid AS own_relfilenode
+  FROM pg_class p, pg_class r
+  WHERE p.relname = 'proposed_oid_index' AND r.relname = 'truncated_table';
+ oid_names_file | own_relfilenode 
+----------------+-----------------
+ t              | t
+(1 row)
+
+DROP TABLE proposed_oid_table, proposed_oid_file, truncated_table;
+DROP SCHEMA proposed_oid_schema;
+DROP EXTENSION test_new_oid_hook;

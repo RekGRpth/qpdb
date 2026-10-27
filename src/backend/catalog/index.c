@@ -976,6 +976,12 @@ index_create(Relation heapRelation,
 		{
 			indexRelationId =
 				GetNewRelFileNumber(tableSpaceId, pg_class, relpersistence);
+
+			/* An OID from new_oid_hook may name an existing file */
+			if (NewOidNeedsRelFileNumber() && create_storage &&
+				RELKIND_HAS_STORAGE(relkind))
+				relFileNumber = GetNewRelFileNumber(tableSpaceId, NULL,
+													relpersistence);
 		}
 	}
 

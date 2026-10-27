@@ -1282,8 +1282,15 @@ heap_create_with_catalog(const char *relname,
 		}
 
 		if (!OidIsValid(relid))
+		{
 			relid = GetNewRelFileNumber(reltablespace, pg_class_desc,
 										relpersistence);
+
+			/* An OID from new_oid_hook may name an existing file */
+			if (NewOidNeedsRelFileNumber() && RELKIND_HAS_STORAGE(relkind))
+				relfilenumber = GetNewRelFileNumber(reltablespace, NULL,
+													relpersistence);
+		}
 	}
 
 	/*
