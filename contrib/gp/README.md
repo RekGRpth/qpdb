@@ -17,6 +17,8 @@ transactions are yet to come; see [Roadmap](#roadmap).
   (`NEW_OID_HOOK_VERSION`).  The patch is proposed to pgsql-hackers; until
   it is in, the server is built from this tree.
 - `gp` in `shared_preload_libraries` on every server of the cluster.
+- `max_prepared_transactions` above zero on the segments, for two-phase
+  commit of DDL.
 
 ## Architecture
 
@@ -114,12 +116,22 @@ compute its own values; and `CREATE INDEX CONCURRENTLY`.
 
 The segments run DDL in transactions that follow the transaction of the
 coordinator: the first statement opens one, and the end of the transaction
-of the coordinator commits or rolls them back.  An error on a segment fails
-the statement on the coordinator, which rolls back everywhere.  Until
-two-phase commit comes, a failure of `COMMIT` on a segment after the commit
-of the coordinator is only a warning, and a transaction that rolled back a
-subtransaction after sending DDL cannot commit.  `gp.dispatch_ddl = off`
-keeps DDL on the coordinator, for maintenance.
+of the coordinator ends them by two-phase commit.  Before the coordinator
+commits, each segment runs `PREPARE TRANSACTION 'gp_<xid>'`, `<xid>` being
+the transaction of the coordinator; a segment that cannot fails the commit,
+and the others roll back.  After the coordinator commits, the segments run
+`COMMIT PREPARED`.  An error on a segment at any statement fails the
+transaction everywhere.  A subtransaction cannot be rolled back on the
+segments yet, so a transaction that rolled back one after sending DDL
+cannot commit.  `gp.dispatch_ddl = off` keeps DDL on the coordinator, for
+maintenance.
+
+A segment lost between the commit of the coordinator and `COMMIT PREPARED`
+keeps its transaction prepared, holding its locks, and the coordinator
+warns.  Until recovery comes, resolve it by hand: `pg_xact_status('<xid>')`
+on the coordinator tells whether to run `COMMIT PREPARED 'gp_<xid>'` or
+`ROLLBACK PREPARED 'gp_<xid>'` on the segment; `pg_prepared_xacts` there
+lists such transactions.
 
 ### Distribution (`distribution.c`)
 
@@ -148,6 +160,7 @@ Then, with the server installed:
 ```sh
 export PGBIN=/path/to/install/bin     # or have its pg_config in PATH
 contrib/gp/tools/gp-cluster.sh init   # coordinator on 9000, segments on 9001-9003
+                                      # with max_prepared_transactions = 64
 contrib/gp/tools/gp-cluster.sh start  # creates extension gp, waits for segments
 contrib/gp/tools/gp-cluster.sh status
 psql -h localhost -p 9000 postgres -c 'SELECT * FROM gp.cluster_segments()'
@@ -208,6 +221,7 @@ start their own clusters:
 | `008_distribution.pl` | Distribution policies and colocation groups |
 | `009_same_oids.pl` | Objects get the OIDs of the coordinator on a segment |
 | `010_ddl.pl` | DDL of the coordinator on the segments: statements, transactions, what stays, what is refused |
+| `011_two_phase.pl` | Two-phase commit of DDL, a segment that cannot prepare, a segment lost before `COMMIT PREPARED` |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -219,9 +233,9 @@ by the patch and `contrib/gp`.
 
 1. **Cluster skeleton** — done: roles, registration, the copy of segments,
    connections, settings of sessions, distribution policies.
-2. **DDL and the same OIDs** — in progress: the same OIDs and propagating
-   DDL are done; next are two-phase commit of DDL, then roles, `GRANT`,
-   owners and commands that run outside a transaction.
+2. **DDL and the same OIDs** — in progress: the same OIDs, propagating DDL
+   and its two-phase commit are done; next are roles, `GRANT`, owners and
+   commands that run outside a transaction.
 3. **Placing data and correct SELECT** — routing of `INSERT` and `COPY`,
    plan fragments on segments, every query correct through a gather on the
    coordinator.

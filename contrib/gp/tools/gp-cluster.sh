@@ -81,11 +81,13 @@ cmd_init()
 
 	while read -r name nport role; do
 		echo "initdb $name"
-		# A segment has a number and registers on the coordinator
+		# A segment has a number, registers on the coordinator and prepares
+		# transactions of DDL
 		case $role in
 			segment) set -- -c "gp.segment_id=${name#seg}" \
 				-c "gp.coordinator=host=localhost port=$port" \
-				-c gp.register_retry_interval=1 ;;
+				-c gp.register_retry_interval=1 \
+				-c max_prepared_transactions=64 ;;
 			*) set -- ;;
 		esac
 		"$PGBIN/initdb" --pgdata "$dir/$name" --auth trust --no-instructions \
