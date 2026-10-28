@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # As in pg-ci.yml: test every commit on master, but only the last push on
+  # other branches.
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-core-diff:
     runs-on: ubuntu-latest
@@ -18,3 +24,68 @@ jobs:
           fetch-depth: 0
       - run: git fetch https://github.com/postgres/postgres.git master
       - run: contrib/gp/tools/check-core-diff.sh FETCH_HEAD
+
+  # Mode B: all tests of the tree on a single node with gp preloaded but not
+  # configured (gp.role = none), against the original expected files.  It
+  # proves that the extension is harmless while it is not turned on.
+  #
+  # PG_TEST_INITDB_EXTRA_OPTS reaches both pg_regress and
+  # PostgreSQL::Test::Cluster, unlike TEMP_CONFIG, which meson passes to TAP
+  # tests only.  Tests that set shared_preload_libraries themselves override
+  # it and run without gp.
+  mode-b:
+    name: Mode B - gp preloaded
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/anarazel/pg-vm-images/main/linux_debian_trixie_ci:latest
+      options: --privileged --pid=host --ipc=host --ulimit memlock=-1:-1
+    env:
+      BUILD_JOBS: 4
+      TEST_JOBS: 4
+      PGCTLTIMEOUT: 120
+      TEMP_CONFIG: ${{ github.workspace }}/src/tools/ci/pg_ci_base.conf
+      PG_TEST_INITDB_EXTRA_OPTS: -c shared_preload_libraries=gp
+    defaults:
+      run:
+        shell: su postgres -c "bash --noprofile --norc -eo pipefail {0}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          useradd -m postgres
+          chown -R postgres:postgres .
+
+      - name: Configure
+        run: |
+          meson setup \
+            -Dcassert=true \
+            -Dinjection_points=true \
+            -Dtap_tests=enabled \
+            --buildtype=debug \
+            build
+
+      - name: Build
+        run: ninja -C build -j${BUILD_JOBS} all testprep
+
+      - name: Test world
+        run: |
+          meson test -C build --no-rebuild --print-errorlogs --suite setup
+          meson test -C build --no-rebuild --print-errorlogs \
+            --num-processes ${TEST_JOBS} --no-suite setup
+
+      - name: Upload logs
+        if: failure() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/testrun/**/*.log
+            build/testrun/**/*.diffs
+            build/testrun/**/regress_log_*
+            build/meson-logs/**
+          if-no-files-found: ignore
