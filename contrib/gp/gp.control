@@ -1,0 +1,6 @@
+# gp extension
+comment = 'cluster of PostgreSQL servers: a coordinator and segments'
+default_version = '1.0'
+module_pathname = '$libdir/gp'
+relocatable = false
+schema = gp
