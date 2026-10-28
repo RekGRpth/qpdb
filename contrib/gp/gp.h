@@ -15,6 +15,7 @@
 #define GP_H
 
 #include "libpq-fe.h"
+#include "utils/guc.h"
 
 /* Role of the server in the cluster */
 enum
@@ -47,5 +48,13 @@ extern int	gp_segments_get(GpSegment **segments);
 
 /* dispatch.c */
 extern PGconn *gp_connection_get(const GpSegment *segment);
+
+/* oids.c */
+extern char *gp_dispatch_oids;
+extern bool gp_allow_local_ddl;
+extern void gp_oids_init(void);
+extern bool gp_check_dispatch_oids(char **newval, void **extra,
+								   GucSource source);
+extern void gp_assign_dispatch_oids(const char *newval, void *extra);
 
 #endif							/* GP_H */

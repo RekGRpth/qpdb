@@ -25,6 +25,7 @@ gp.segment_id = 1
 gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
 gp.host = '${\$segment->host}'
 gp.register_retry_interval = 1
+gp.allow_local_ddl = on
 log_statement = 'all'
 ");
 $segment->start;

@@ -41,6 +41,15 @@ SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
 SELECT * FROM gp.exec_on_all('SELECT 1');
 SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
 
+-- OIDs are recorded on the coordinator and given to segments
+SHOW gp.allow_local_ddl;
+SHOW gp.dispatch_oids;
+SELECT gp.recorded_oids();
+SET gp.dispatch_oids = '1259:16384,';
+SET gp.dispatch_oids = '1259:16384,1247:16385';
+SET gp.dispatch_oids = '1259:16386';
+RESET gp.dispatch_oids;
+
 -- Buckets of keys are the same on every server
 SELECT gp.bucket(1024, 1), gp.bucket(1024, 1::bigint), gp.bucket(1024, 'abc'::text),
 	   gp.bucket(1024, 1, 'abc'::text), gp.bucket(1024, NULL::int),

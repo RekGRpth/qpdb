@@ -6,6 +6,7 @@ OBJS = \
 	dispatch.o \
 	distribution.o \
 	gp.o \
+	oids.o \
 	segments.o
 
 EXTENSION = gp

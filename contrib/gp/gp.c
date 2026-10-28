@@ -149,6 +149,28 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomStringVariable("gp.dispatch_oids",
+							   "OIDs of the objects of a command from the coordinator.",
+							   "Set on a segment before a command, as \"catalog:oid\" pairs separated by commas.",
+							   &gp_dispatch_oids,
+							   "",
+							   PGC_SUSET,
+							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+							   gp_check_dispatch_oids,
+							   gp_assign_dispatch_oids,
+							   NULL);
+
+	DefineCustomBoolVariable("gp.allow_local_ddl",
+							 "Allows a segment to create objects of its own.",
+							 "Objects of a segment get their OIDs from the coordinator, so this is for maintenance only.",
+							 &gp_allow_local_ddl,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	MarkGUCPrefixReserved("gp");
 
 	/* A misconfigured node does not start */
@@ -171,6 +193,8 @@ _PG_init(void)
 
 	if (gp_role == GP_ROLE_COORDINATOR)
 		gp_segments_init();
+
+	gp_oids_init();
 
 	if (gp_role == GP_ROLE_SEGMENT)
 	{
