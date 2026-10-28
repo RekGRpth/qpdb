@@ -3,24 +3,13 @@ on:
   schedule:
     - cron: '0 19 * * *'
   workflow_dispatch:
-env:
-  GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
 jobs:
   merge:
+    env:
+      GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_ACCESS_TOKEN }}
     runs-on: ubuntu-latest
     steps:
       - uses: rekgrpth/git-clone-shell-action@v1
       - env:
           INPUTS_REPOSITORY: postgres/postgres
-        uses: rekgrpth/git-fetch-upstream-merge-push-shell-action@v1
-  merge-gp:
-    needs: merge
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          INPUTS_BRANCH: gp
-        uses: rekgrpth/git-clone-shell-action@v1
-      - env:
-          INPUTS_BRANCH: master
-          INPUTS_REPOSITORY: ${{ github.repository }}
         uses: rekgrpth/git-fetch-upstream-merge-push-shell-action@v1
