@@ -13,7 +13,7 @@ use Test::More;
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
 $coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
+	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\ngp.dispatch_ddl = off\n");
 $coordinator->start;
 $coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
 

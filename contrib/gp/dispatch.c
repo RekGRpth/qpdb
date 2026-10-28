@@ -16,6 +16,12 @@
  * remembers what it has got, and gets the difference only when the
  * settings change.
  *
+ * DDL runs on the segments in transactions that follow the transaction of
+ * the coordinator: the first command opens one, and the end of the
+ * transaction of the coordinator commits or rolls them back.  Without
+ * two-phase commit, a subtransaction cannot be rolled back on the segments,
+ * so a transaction that rolled back one after sending DDL cannot commit.
+ *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
  *
@@ -55,8 +61,9 @@ typedef struct GpConnection
 	int			port;
 	PGconn	   *conn;
 	bool		busy;			/* a command runs, its result is not read */
+	bool		in_xact;		/* in a transaction of the coordinator */
 	char	   *settings;		/* settings sent, "name\0value\0" pairs */
-	int			settings_len;
+	int			settings_len;	/* -1 if unknown after a rollback */
 } GpConnection;
 
 /* Connections of the session by segment_id; NULL until the first one */
@@ -65,11 +72,23 @@ static HTAB *connections = NULL;
 static uint32 wait_event_connect = 0;
 static uint32 wait_event_result = 0;
 
+/* Commands sent in transactions of segments in this transaction */
+static int	ndispatched = 0;
+
+/* ndispatched at the start of each open subtransaction, innermost first */
+static List *subxact_marks = NIL;
+
+/* The segments do not have what this transaction has sent them */
+static bool diverged = false;
+
 PG_FUNCTION_INFO_V1(gp_exec_on_all);
 
 static void
 gp_connection_close(GpConnection *entry)
 {
+	/* The segment rolls back what it has got in the transaction */
+	if (entry->in_xact)
+		diverged = true;
 	libpqsrv_disconnect(entry->conn);
 	if (entry->settings != NULL)
 		pfree(entry->settings);
@@ -87,6 +106,9 @@ gp_connections_abort(void)
 	HASH_SEQ_STATUS status;
 	GpConnection *entry;
 
+	if (connections == NULL)
+		return;
+
 	hash_seq_init(&status, connections);
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
@@ -99,19 +121,139 @@ gp_connections_abort(void)
 	}
 }
 
+/*
+ * End the transactions of the segments with COMMIT or ROLLBACK.  The
+ * transaction of the coordinator has ended already, so a failure is only a
+ * warning.
+ */
+static void
+gp_connections_finish(const char *command)
+{
+	HASH_SEQ_STATUS status;
+	GpConnection *entry;
+
+	if (connections == NULL)
+		return;
+
+	hash_seq_init(&status, connections);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		if (entry->in_xact)
+			entry->busy = PQsendQuery(entry->conn, command);
+
+	hash_seq_init(&status, connections);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		PGresult   *res = NULL;
+
+		if (!entry->in_xact)
+			continue;
+		if (entry->busy)
+			res = libpqsrv_get_result_last(entry->conn, wait_event_result);
+		entry->busy = false;
+		entry->in_xact = false;
+
+		/* Settings sent in a rolled back transaction are gone */
+		if (strcmp(command, "ROLLBACK") == 0)
+			entry->settings_len = -1;
+
+		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			ereport(WARNING,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not run %s on segment %d at %s:%d",
+						   command, entry->segment_id, entry->host,
+						   entry->port),
+					errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))));
+			if (PQstatus(entry->conn) != CONNECTION_OK)
+				gp_connection_close(entry);
+		}
+		PQclear(res);
+	}
+}
+
 static void
 gp_connections_xact_callback(XactEvent event, void *arg)
 {
-	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
-		gp_connections_abort();
+	switch (event)
+	{
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			if (diverged)
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot commit a transaction whose DDL the segments have lost"),
+						errdetail("A subtransaction that sent DDL to the segments was rolled back, or a connection to a segment was closed."),
+						errhint("Roll back the whole transaction."));
+			break;
+		case XACT_EVENT_PRE_PREPARE:
+			if (diverged || ndispatched > 0)
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot PREPARE a transaction that has sent DDL to the segments"));
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			gp_connections_finish("COMMIT");
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			gp_connections_abort();
+			gp_connections_finish("ROLLBACK");
+			break;
+		default:
+			break;
+	}
+
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT ||
+		event == XACT_EVENT_PREPARE)
+	{
+		/* TopTransactionContext is gone with the list */
+		ndispatched = 0;
+		subxact_marks = NIL;
+		diverged = false;
+	}
 }
 
 static void
 gp_connections_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
-	if (event == SUBXACT_EVENT_ABORT_SUB)
-		gp_connections_abort();
+	MemoryContext oldcontext;
+
+	switch (event)
+	{
+		case SUBXACT_EVENT_START_SUB:
+			oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+			subxact_marks = lcons_int(ndispatched, subxact_marks);
+			MemoryContextSwitchTo(oldcontext);
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			if (subxact_marks != NIL)
+				subxact_marks = list_delete_first(subxact_marks);
+			break;
+		case SUBXACT_EVENT_ABORT_SUB:
+			gp_connections_abort();
+			if (subxact_marks != NIL)
+			{
+				if (ndispatched > linitial_int(subxact_marks))
+					diverged = true;
+				subxact_marks = list_delete_first(subxact_marks);
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+/*
+ * Follow the transactions of the coordinator; called from _PG_init()
+ */
+void
+gp_dispatch_init(void)
+{
+	RegisterXactCallback(gp_connections_xact_callback, NULL);
+	RegisterSubXactCallback(gp_connections_subxact_callback, NULL);
 }
 
 /*
@@ -160,8 +302,6 @@ gp_connection_open(const GpSegment *segment)
 		ctl.entrysize = sizeof(GpConnection);
 		connections = hash_create("gp connections", 16, &ctl,
 								  HASH_ELEM | HASH_BLOBS);
-		RegisterXactCallback(gp_connections_xact_callback, NULL);
-		RegisterSubXactCallback(gp_connections_subxact_callback, NULL);
 		wait_event_connect = WaitEventExtensionNew("GpConnect");
 		wait_event_result = WaitEventExtensionNew("GpResult");
 	}
@@ -207,6 +347,7 @@ gp_connection_open(const GpSegment *segment)
 	entry->port = segment->port;
 	entry->conn = conn;
 	entry->busy = false;
+	entry->in_xact = false;
 	entry->settings = NULL;
 	entry->settings_len = 0;
 	return entry;
@@ -340,7 +481,12 @@ gp_settings_command(const GpConnection *entry, const StringInfo wanted)
 		return NULL;
 
 	initStringInfo(&cmd);
-	for (const char *p = sent; p < sent + entry->settings_len;)
+
+	/* After a rollback, start from the settings of the server */
+	if (entry->settings_len < 0)
+		appendStringInfoString(&cmd, "RESET ALL; RESET role; ");
+
+	for (const char *p = sent; p < sent + Max(entry->settings_len, 0);)
 	{
 		const char *name = p;
 
@@ -470,11 +616,76 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 }
 
 /*
+ * Connections to all segments, with the settings of the session
+ */
+static int
+gp_connections_ready(GpSegment **segments, GpConnection ***entries)
+{
+	int			nsegments = gp_segments_get(segments);
+	char	  **commands;
+	PGresult  **results;
+	StringInfoData settings;
+
+	gp_connections_forget(*segments, nsegments);
+	*entries = palloc_array(GpConnection *, nsegments);
+	for (int i = 0; i < nsegments; i++)
+		(*entries)[i] = gp_connection_open(&(*segments)[i]);
+
+	/*
+	 * The settings go in a command of their own: in one with the command of
+	 * the user, they would make it a transaction block, where CREATE DATABASE
+	 * and the like cannot run.
+	 */
+	initStringInfo(&settings);
+	gp_settings_collect(&settings);
+	commands = palloc_array(char *, nsegments);
+	for (int i = 0; i < nsegments; i++)
+		commands[i] = gp_settings_command((*entries)[i], &settings);
+	results = gp_dispatch(*segments, *entries, nsegments, commands,
+						  "setting the parameters of the session");
+	for (int i = 0; i < nsegments; i++)
+	{
+		if (commands[i] != NULL)
+			gp_settings_remember((*entries)[i], &settings);
+		PQclear(results[i]);
+	}
+
+	return nsegments;
+}
+
+/*
+ * Run a command on all segments in the transactions that follow the
+ * transaction of the coordinator, opening them if needed
+ */
+void
+gp_dispatch_xact(const char *sql)
+{
+	GpSegment  *segments;
+	GpConnection **entries;
+	int			nsegments = gp_connections_ready(&segments, &entries);
+	char	  **commands = palloc_array(char *, nsegments);
+	PGresult  **results;
+
+	for (int i = 0; i < nsegments; i++)
+	{
+		commands[i] = entries[i]->in_xact ? (char *) sql :
+			psprintf("BEGIN; %s", sql);
+		entries[i]->in_xact = true;
+	}
+	ndispatched++;
+
+	results = gp_dispatch(segments, entries, nsegments, commands, NULL);
+	for (int i = 0; i < nsegments; i++)
+		PQclear(results[i]);
+}
+
+/*
  * gp.exec_on_all(sql): run a command on all segments at once, and return
  * the command status of each.  Each segment runs it in a transaction of
- * its own, so a rollback on the coordinator does not undo it.  If a
- * segment fails, the error of the first one by number is reported after
- * all have answered.
+ * its own, so a rollback on the coordinator does not undo it, unless the
+ * transaction of the coordinator has sent DDL to the segment already: then
+ * the command runs in that transaction.  If a segment fails, the error of
+ * the first one by number is reported after all have answered.
  */
 Datum
 gp_exec_on_all(PG_FUNCTION_ARGS)
@@ -486,35 +697,11 @@ gp_exec_on_all(PG_FUNCTION_ARGS)
 	GpConnection **entries;
 	char	  **commands;
 	PGresult  **results;
-	StringInfoData settings;
 
-	nsegments = gp_segments_get(&segments);
 	InitMaterializedSRF(fcinfo, 0);
+	nsegments = gp_connections_ready(&segments, &entries);
 
-	gp_connections_forget(segments, nsegments);
-	entries = palloc_array(GpConnection *, nsegments);
-	for (int i = 0; i < nsegments; i++)
-		entries[i] = gp_connection_open(&segments[i]);
-
-	/*
-	 * The settings go in a command of their own: in one with the command of
-	 * the user, they would make it a transaction block, where CREATE DATABASE
-	 * and the like cannot run.
-	 */
-	initStringInfo(&settings);
-	gp_settings_collect(&settings);
 	commands = palloc_array(char *, nsegments);
-	for (int i = 0; i < nsegments; i++)
-		commands[i] = gp_settings_command(entries[i], &settings);
-	results = gp_dispatch(segments, entries, nsegments, commands,
-						  "setting the parameters of the session");
-	for (int i = 0; i < nsegments; i++)
-	{
-		if (commands[i] != NULL)
-			gp_settings_remember(entries[i], &settings);
-		PQclear(results[i]);
-	}
-
 	for (int i = 0; i < nsegments; i++)
 		commands[i] = sql;
 	results = gp_dispatch(segments, entries, nsegments, commands, NULL);

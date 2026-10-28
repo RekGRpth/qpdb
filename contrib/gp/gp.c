@@ -171,6 +171,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("gp.dispatch_ddl",
+							 "Sends DDL of the coordinator to the segments.",
+							 "Off, DDL runs on the coordinator only, for maintenance.",
+							 &gp_dispatch_ddl,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	MarkGUCPrefixReserved("gp");
 
 	/* A misconfigured node does not start */
@@ -192,7 +203,11 @@ _PG_init(void)
 				errmsg("\"gp.coordinator\" is set, but \"gp.role\" is not \"segment\""));
 
 	if (gp_role == GP_ROLE_COORDINATOR)
+	{
 		gp_segments_init();
+		gp_dispatch_init();
+		gp_ddl_init();
+	}
 
 	gp_oids_init();
 

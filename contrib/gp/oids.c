@@ -261,22 +261,38 @@ gp_assign_dispatch_oids(const char *newval, void *extra)
 }
 
 /*
+ * Coordinator: the position in the OIDs of the transaction, and the OIDs
+ * recorded since one, as gp.dispatch_oids takes them
+ */
+int
+gp_oids_mark(void)
+{
+	return nrecorded;
+}
+
+char *
+gp_oids_since(int mark)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	for (int i = mark; i < nrecorded; i++)
+		appendStringInfo(&buf, "%s%u:%u", i > mark ? "," : "",
+						 recorded[i].catalog, recorded[i].oid);
+	return buf.data;
+}
+
+/*
  * gp.recorded_oids(): the OIDs of the current transaction on the
  * coordinator, as gp.dispatch_oids takes them
  */
 Datum
 gp_recorded_oids(PG_FUNCTION_ARGS)
 {
-	StringInfoData buf;
-
 	if (gp_role != GP_ROLE_COORDINATOR)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("OIDs are recorded on the coordinator only"));
 
-	initStringInfo(&buf);
-	for (int i = 0; i < nrecorded; i++)
-		appendStringInfo(&buf, "%s%u:%u", i > 0 ? "," : "",
-						 recorded[i].catalog, recorded[i].oid);
-	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+	PG_RETURN_TEXT_P(cstring_to_text(gp_oids_since(0)));
 }

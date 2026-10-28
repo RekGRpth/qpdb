@@ -2,6 +2,7 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 gp_sources = files(
+  'ddl.c',
   'dispatch.c',
   'distribution.c',
   'gp.c',
@@ -53,6 +54,7 @@ tests += {
       't/007_session_settings.pl',
       't/008_distribution.pl',
       't/009_same_oids.pl',
+      't/010_ddl.pl',
     ],
   },
 }
