@@ -19,4 +19,44 @@ ERROR:  parameter "gp.role" cannot be changed without restarting the server
 SET gp.no_such_parameter = 1;
 ERROR:  invalid configuration parameter name "gp.no_such_parameter"
 DETAIL:  "gp" is a reserved prefix.
+-- The coordinator and a server on its own are number 0
+SHOW gp.segment_id;
+ gp.segment_id 
+---------------
+ 0
+(1 row)
+
+SET gp.segment_id = 1;
+ERROR:  parameter "gp.segment_id" cannot be changed without restarting the server
+-- Database of the configuration of the cluster
+SHOW gp.database;
+ gp.database 
+-------------
+ postgres
+(1 row)
+
+-- Segments are dumped with the extension
+SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
+   extconfig   
+---------------
+ {gp.segments}
+(1 row)
+
+SELECT * FROM gp.segments;
+ segment_id | host | port | registered 
+------------+------+------+------------
+(0 rows)
+
+-- Segments register on the coordinator only
+SELECT gp.register_segment(1, 'localhost', 9001);
+ERROR:  segments register on the coordinator only
+CONTEXT:  PL/pgSQL function gp.register_segment(integer,text,integer) line 6 at RAISE
+-- Only a superuser registers segments by default
+SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
+							  'EXECUTE');
+ has_function_privilege 
+------------------------
+ f
+(1 row)
+
 DROP EXTENSION gp;

@@ -40,6 +40,7 @@ tests += {
     'tests': [
       't/001_cluster.pl',
       't/002_gp_cluster.pl',
+      't/003_register.pl',
     ],
   },
 }

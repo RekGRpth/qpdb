@@ -14,8 +14,8 @@
 #
 # Environment:
 #   GP_CLUSTER_DIR  directory of the cluster, $HOME/gp-cluster by default
-#   GP_PORT         port of the coordinator, 9000 by default; segment N
-#                   listens on GP_PORT + 1 + N (init only)
+#   GP_PORT         port of the coordinator, 9000 by default; segment N,
+#                   numbered from 1, listens on GP_PORT + N (init only)
 #   GP_SEGMENTS     number of segments, 3 by default (init only)
 #   PGBIN           directory of initdb, pg_ctl and psql of a server built
 #                   with contrib/gp; taken from pg_config in PATH by default
@@ -63,18 +63,23 @@ cmd_init()
 	segments=${GP_SEGMENTS:-3}
 
 	mkdir -p "$dir"
-	i=0
-	while [ "$i" -lt "$segments" ]; do
-		echo "seg$i $((port + 1 + i)) segment" >>"$nodes.new"
+	i=1
+	while [ "$i" -le "$segments" ]; do
+		echo "seg$i $((port + i)) segment" >>"$nodes.new"
 		i=$((i + 1))
 	done
 	echo "coordinator $port coordinator" >>"$nodes.new"
 
 	while read -r name nport role; do
 		echo "initdb $name"
+		case $role in
+			segment) segment_id=${name#seg} ;;
+			*) segment_id=0 ;;
+		esac
 		"$PGBIN/initdb" --pgdata "$dir/$name" --auth trust --no-instructions \
 			-c shared_preload_libraries=gp \
 			-c "gp.role=$role" \
+			-c "gp.segment_id=$segment_id" \
 			-c "port=$nport" \
 			-c "cluster_name=gp-$name" \
 			>"$dir/$name.initdb.log" 2>&1 ||

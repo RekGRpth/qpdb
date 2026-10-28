@@ -13,6 +13,8 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
@@ -43,6 +45,8 @@ static const struct config_enum_entry gp_role_options[] = {
 
 /* GUC Variables */
 static int	gp_role = GP_ROLE_NONE;
+static int	gp_segment_id = 0;
+static char *gp_database = NULL;
 
 /*
  * Module load callback
@@ -66,5 +70,39 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomIntVariable("gp.segment_id",
+							"Number of the server in the cluster.",
+							"0 on the coordinator, from 1 on segments.",
+							&gp_segment_id,
+							0,
+							0,
+							INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomStringVariable("gp.database",
+							   "Database that holds the configuration of the cluster.",
+							   "Segments register in this database of the coordinator.",
+							   &gp_database,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
 	MarkGUCPrefixReserved("gp");
+
+	/* A misconfigured node does not start */
+	if (gp_role == GP_ROLE_SEGMENT && gp_segment_id == 0)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("\"gp.segment_id\" must be set on a segment"));
+	if (gp_role != GP_ROLE_SEGMENT && gp_segment_id != 0)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("\"gp.segment_id\" is set, but \"gp.role\" is not \"segment\""));
 }
