@@ -56,9 +56,9 @@ SHOW gp.register_retry_interval;
 
 -- Segments are dumped with the extension
 SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
-   extconfig   
----------------
- {gp.segments}
+                                            extconfig                                             
+--------------------------------------------------------------------------------------------------
+ {gp.segments,gp.colocation_groups,gp.colocation_groups_colocation_id_seq,gp.distribution_policy}
 (1 row)
 
 SELECT * FROM gp.segments;
@@ -96,4 +96,30 @@ SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
  f
 (1 row)
 
+-- Buckets of keys are the same on every server
+SELECT gp.bucket(1024, 1), gp.bucket(1024, 1::bigint), gp.bucket(1024, 'abc'::text),
+	   gp.bucket(1024, 1, 'abc'::text), gp.bucket(1024, NULL::int),
+	   gp.bucket(1024, NULL::int, 1), gp.bucket(1024, VARIADIC ARRAY[1]);
+ bucket | bucket | bucket | bucket | bucket | bucket | bucket 
+--------+--------+--------+--------+--------+--------+--------
+    997 |    997 |    123 |     95 |      0 |    997 |    997
+(1 row)
+
+SELECT count(DISTINCT gp.bucket(16, i)) FROM generate_series(1, 1000) i;
+ count 
+-------
+    16
+(1 row)
+
+SELECT gp.bucket(0, 1);
+ERROR:  number of buckets must be positive
+SELECT gp.bucket(1024, point(1, 1));
+ERROR:  type point has no default hash operator class
+HINT:  A distribution key needs types with hash functions.
+-- Tables are distributed on the coordinator only
+CREATE TABLE t (a int);
+SELECT gp.distribute('t', '{a}');
+ERROR:  tables are distributed on the coordinator only
+CONTEXT:  PL/pgSQL function gp.distribute(regclass,name[],regclass) line 12 at RAISE
+DROP TABLE t;
 DROP EXTENSION gp;
