@@ -10,6 +10,12 @@
  * connection to a segment that has left gp.segments or moved is closed,
  * and a broken one is dropped, to be opened again on the next use.
  *
+ * Before a command, the segments get the settings of the session: those a
+ * user may change, set for the database, the role, the client or the
+ * session rather than in the configuration of the server.  A connection
+ * remembers what it has got, and gets the difference only when the
+ * settings change.
+ *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
  *
@@ -23,13 +29,16 @@
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/guc_tables.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
@@ -46,6 +55,8 @@ typedef struct GpConnection
 	int			port;
 	PGconn	   *conn;
 	bool		busy;			/* a command runs, its result is not read */
+	char	   *settings;		/* settings sent, "name\0value\0" pairs */
+	int			settings_len;
 } GpConnection;
 
 /* Connections of the session by segment_id; NULL until the first one */
@@ -60,6 +71,8 @@ static void
 gp_connection_close(GpConnection *entry)
 {
 	libpqsrv_disconnect(entry->conn);
+	if (entry->settings != NULL)
+		pfree(entry->settings);
 	hash_search(connections, &entry->segment_id, HASH_REMOVE, NULL);
 }
 
@@ -194,6 +207,8 @@ gp_connection_open(const GpSegment *segment)
 	entry->port = segment->port;
 	entry->conn = conn;
 	entry->busy = false;
+	entry->settings = NULL;
+	entry->settings_len = 0;
 	return entry;
 }
 
@@ -207,35 +222,177 @@ gp_connection_get(const GpSegment *segment)
 }
 
 /*
- * gp.exec_on_all(sql): run a command on all segments at once, and return
- * the command status of each.  Each segment runs it in a transaction of
- * its own, so a rollback on the coordinator does not undo it.  If a
- * segment fails, the error of the first one by number is reported after
- * all have answered.
+ * Whether the segments get a setting of the session
  */
-Datum
-gp_exec_on_all(PG_FUNCTION_ARGS)
+static bool
+gp_setting_synced(const struct config_generic *var, bool superuser)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	GpSegment  *segments;
-	int			nsegments;
-	GpConnection **entries;
-	PGresult  **results;
+	if (var->context != PGC_USERSET &&
+		!(var->context == PGC_SUSET && superuser))
+		return false;
+
+	/* Not from the configuration of the server: segments have their own */
+	switch (var->source)
+	{
+		case PGC_S_GLOBAL:
+		case PGC_S_DATABASE:
+		case PGC_S_USER:
+		case PGC_S_DATABASE_USER:
+		case PGC_S_CLIENT:
+		case PGC_S_SESSION:
+			break;
+		default:
+			return false;
+	}
+
+	/* Settings of a transaction or of the session user, but SET ROLE */
+	if ((var->flags & GUC_NO_RESET_ALL) && strcmp(var->name, "role") != 0)
+		return false;
+
+	/* The connection sets these itself */
+	if (strcmp(var->name, "application_name") == 0 ||
+		strcmp(var->name, "client_encoding") == 0 ||
+		strncmp(var->name, "gp.", 3) == 0)
+		return false;
+
+	return true;
+}
+
+static int
+gp_setting_cmp(const void *a, const void *b)
+{
+	return strcmp((*(struct config_generic *const *) a)->name,
+				  (*(struct config_generic *const *) b)->name);
+}
+
+/*
+ * The settings of the session that the segments get, as "name\0value\0"
+ * pairs sorted by name
+ */
+static void
+gp_settings_collect(StringInfo settings)
+{
+	int			nvars;
+	struct config_generic **vars = get_guc_variables(&nvars);
+	struct config_generic **synced = palloc_array(struct config_generic *, nvars);
+	int			nsynced = 0;
+	bool		superuser = superuser_arg(GetSessionUserId());
+
+	for (int i = 0; i < nvars; i++)
+		if (gp_setting_synced(vars[i], superuser))
+			synced[nsynced++] = vars[i];
+	qsort(synced, nsynced, sizeof(*synced), gp_setting_cmp);
+
+	for (int i = 0; i < nsynced; i++)
+	{
+		char	   *value = ShowGUCOption(synced[i], true);
+
+		appendBinaryStringInfo(settings, synced[i]->name,
+							   strlen(synced[i]->name) + 1);
+		appendBinaryStringInfo(settings, value, strlen(value) + 1);
+	}
+	pfree(synced);
+}
+
+static bool
+gp_settings_has(const char *settings, int len, const char *name)
+{
+	for (const char *p = settings; p < settings + len;)
+	{
+		if (strcmp(p, name) == 0)
+			return true;
+		p += strlen(p) + 1;		/* name */
+		p += strlen(p) + 1;		/* value */
+	}
+	return false;
+}
+
+/* Append a setting name, quoting each part of a name like "myapp.x" */
+static void
+gp_append_setting_name(StringInfo buf, const char *name)
+{
+	char	   *copy = pstrdup(name);
+	char	   *part = copy;
+
+	for (char *dot; (dot = strchr(part, '.')) != NULL; part = dot + 1)
+	{
+		*dot = '\0';
+		appendStringInfo(buf, "%s.", quote_identifier(part));
+	}
+	appendStringInfoString(buf, quote_identifier(part));
+	pfree(copy);
+}
+
+/*
+ * The command that gives a connection the settings wanted: RESET of those
+ * it has got but are not wanted any more, set_config() of the others, which
+ * parses a list like search_path as SET does.  NULL if it has them already.
+ */
+static char *
+gp_settings_command(const GpConnection *entry, const StringInfo wanted)
+{
+	StringInfoData cmd;
+	const char *sent = entry->settings ? entry->settings : "";
+	bool		first = true;
+
+	if (entry->settings_len == wanted->len &&
+		memcmp(sent, wanted->data, wanted->len) == 0)
+		return NULL;
+
+	initStringInfo(&cmd);
+	for (const char *p = sent; p < sent + entry->settings_len;)
+	{
+		const char *name = p;
+
+		p += strlen(p) + 1;
+		p += strlen(p) + 1;
+		if (gp_settings_has(wanted->data, wanted->len, name))
+			continue;
+		appendStringInfoString(&cmd, "RESET ");
+		gp_append_setting_name(&cmd, name);
+		appendStringInfoString(&cmd, "; ");
+	}
+	for (const char *p = wanted->data; p < wanted->data + wanted->len;)
+	{
+		const char *name = p;
+		const char *value = (p += strlen(p) + 1);
+
+		p += strlen(p) + 1;
+		appendStringInfo(&cmd, "%s pg_catalog.set_config(%s, %s, false)",
+						 first ? "SELECT" : ",",
+						 quote_literal_cstr(name), quote_literal_cstr(value));
+		first = false;
+	}
+	return cmd.data;
+}
+
+static void
+gp_settings_remember(GpConnection *entry, const StringInfo settings)
+{
+	if (entry->settings != NULL)
+		pfree(entry->settings);
+	entry->settings = MemoryContextAlloc(TopMemoryContext,
+										 Max(settings->len, 1));
+	memcpy(entry->settings, settings->data, settings->len);
+	entry->settings_len = settings->len;
+}
+
+/*
+ * Send each connection its command, none for NULL, then wait for all, so
+ * the segments work in parallel.  If a segment fails, report the error of
+ * the first one by number once all have answered; what says what the
+ * commands do, NULL for a command of the user.
+ */
+static PGresult **
+gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
+			char **commands, const char *what)
+{
+	PGresult  **results = palloc0_array(PGresult *, nsegments);
 	int			failed = -1;
 
-	nsegments = gp_segments_get(&segments);
-	InitMaterializedSRF(fcinfo, 0);
-
-	gp_connections_forget(segments, nsegments);
-	entries = palloc_array(GpConnection *, nsegments);
-	results = palloc0_array(PGresult *, nsegments);
 	for (int i = 0; i < nsegments; i++)
-		entries[i] = gp_connection_open(&segments[i]);
-
-	/* Send to all, then wait for all, so the segments work in parallel */
-	for (int i = 0; i < nsegments; i++)
-		entries[i]->busy = PQsendQuery(entries[i]->conn, sql);
+		if (commands[i] != NULL)
+			entries[i]->busy = PQsendQuery(entries[i]->conn, commands[i]);
 	for (int i = 0; i < nsegments; i++)
 	{
 		if (!entries[i]->busy)
@@ -245,22 +402,14 @@ gp_exec_on_all(PG_FUNCTION_ARGS)
 		entries[i]->busy = false;
 	}
 
-	for (int i = 0; i < nsegments; i++)
+	for (int i = 0; i < nsegments && failed < 0; i++)
 	{
-		ExecStatusType status = results[i] ? PQresultStatus(results[i]) :
-			PGRES_FATAL_ERROR;
+		ExecStatusType status;
 
-		if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK)
-		{
-			Datum		values[2];
-			bool		nulls[2] = {0};
-
-			values[0] = Int32GetDatum(segments[i].segment_id);
-			values[1] = CStringGetTextDatum(PQcmdStatus(results[i]));
-			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
-								 values, nulls);
-		}
-		else if (failed < 0)
+		if (commands[i] == NULL)
+			continue;
+		status = results[i] ? PQresultStatus(results[i]) : PGRES_FATAL_ERROR;
+		if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
 			failed = i;
 	}
 
@@ -310,11 +459,76 @@ gp_exec_on_all(PG_FUNCTION_ARGS)
 				errmsg_internal("%s", primary),
 				detail ? errdetail_internal("%s", detail) : 0,
 				hint ? errhint("%s", hint) : 0,
+				what ?
+				errcontext("%s on segment %d at %s:%d", what,
+						   segment->segment_id, segment->host, segment->port) :
 				errcontext("segment %d at %s:%d",
 						   segment->segment_id, segment->host, segment->port));
 	}
 
+	return results;
+}
+
+/*
+ * gp.exec_on_all(sql): run a command on all segments at once, and return
+ * the command status of each.  Each segment runs it in a transaction of
+ * its own, so a rollback on the coordinator does not undo it.  If a
+ * segment fails, the error of the first one by number is reported after
+ * all have answered.
+ */
+Datum
+gp_exec_on_all(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	GpSegment  *segments;
+	int			nsegments;
+	GpConnection **entries;
+	char	  **commands;
+	PGresult  **results;
+	StringInfoData settings;
+
+	nsegments = gp_segments_get(&segments);
+	InitMaterializedSRF(fcinfo, 0);
+
+	gp_connections_forget(segments, nsegments);
+	entries = palloc_array(GpConnection *, nsegments);
 	for (int i = 0; i < nsegments; i++)
+		entries[i] = gp_connection_open(&segments[i]);
+
+	/*
+	 * The settings go in a command of their own: in one with the command of
+	 * the user, they would make it a transaction block, where CREATE DATABASE
+	 * and the like cannot run.
+	 */
+	initStringInfo(&settings);
+	gp_settings_collect(&settings);
+	commands = palloc_array(char *, nsegments);
+	for (int i = 0; i < nsegments; i++)
+		commands[i] = gp_settings_command(entries[i], &settings);
+	results = gp_dispatch(segments, entries, nsegments, commands,
+						  "setting the parameters of the session");
+	for (int i = 0; i < nsegments; i++)
+	{
+		if (commands[i] != NULL)
+			gp_settings_remember(entries[i], &settings);
 		PQclear(results[i]);
+	}
+
+	for (int i = 0; i < nsegments; i++)
+		commands[i] = sql;
+	results = gp_dispatch(segments, entries, nsegments, commands, NULL);
+
+	for (int i = 0; i < nsegments; i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		values[0] = Int32GetDatum(segments[i].segment_id);
+		values[1] = CStringGetTextDatum(PQcmdStatus(results[i]));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+		PQclear(results[i]);
+	}
 	return (Datum) 0;
 }
