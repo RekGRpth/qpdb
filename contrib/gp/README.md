@@ -6,10 +6,9 @@ hold the data and run parts of queries.  It is an extension plus a single
 patch of the server, `new_oid_hook`, rather than a fork.
 
 **Status: under development, not for production.**  The cluster forms,
-segments register themselves, the coordinator runs commands on the
-segments, and objects can get the same OIDs everywhere.  Distributed
-queries, DDL propagation and distributed transactions are yet to come; see
-[Roadmap](#roadmap).
+segments register themselves, and DDL of the coordinator runs on the
+segments with the same OIDs.  Distributed queries and distributed
+transactions are yet to come; see [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -68,8 +67,10 @@ connection remembers what it has got and gets only the difference.
 
 `gp.exec_on_all(sql)` sends a command to all segments at once and returns
 the command status of each.  Each segment runs it in a transaction of its
-own; a cancel or an abort on the coordinator cancels it on the segments.
-It is a tool for maintenance and tests, and the base of DDL propagation.
+own, unless the transaction of the coordinator has sent DDL to the segment
+already: then the command runs in that transaction and sees the DDL.  A
+cancel or an abort on the coordinator cancels it on the segments.  It is a
+tool for maintenance and tests.
 
 ### The same OIDs everywhere (`oids.c`)
 
@@ -88,6 +89,37 @@ in use.
   on, as they would take OIDs that the coordinator may assign later.
 
 Relfilenumbers stay local and may differ.
+
+### DDL on the segments (`ddl.c`)
+
+A DDL statement on the coordinator runs there first; then the segments run
+the same statement, its own text cut out of the query string, with the
+OIDs it got on the coordinator.  Statements nested in a sent one (elements
+of `CREATE SCHEMA`) and statements of extension scripts are not sent on
+their own.  DDL in a function is sent when the function runs on the
+coordinator.
+
+What goes to the segments: `CREATE`, `ALTER` and `DROP` of tables, indexes,
+sequences and views; `CREATE SCHEMA` and `DROP SCHEMA`; composite, enum and
+range types, domains, `ALTER TYPE ... ADD VALUE`; `CREATE` and `ALTER` of
+functions and procedures; renaming and moving to another schema.  Roles,
+`GRANT`, `COMMENT`, owners and commands that run outside a transaction are
+yet to come; other statements run on the coordinator only.
+
+What stays on the coordinator: temporary objects and objects of
+extensions.  What is refused: `ALTER TABLE` that computes a column with a
+non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
+identity, `ALTER COLUMN TYPE ... USING random()`), as each segment would
+compute its own values; and `CREATE INDEX CONCURRENTLY`.
+
+The segments run DDL in transactions that follow the transaction of the
+coordinator: the first statement opens one, and the end of the transaction
+of the coordinator commits or rolls them back.  An error on a segment fails
+the statement on the coordinator, which rolls back everywhere.  Until
+two-phase commit comes, a failure of `COMMIT` on a segment after the commit
+of the coordinator is only a warning, and a transaction that rolled back a
+subtransaction after sending DDL cannot commit.  `gp.dispatch_ddl = off`
+keeps DDL on the coordinator, for maintenance.
 
 ### Distribution (`distribution.c`)
 
@@ -142,6 +174,7 @@ All are set at server start unless noted.
 | `gp.max_segments` | 64 | Size of the copy of `gp.segments` on the coordinator |
 | `gp.dispatch_oids` | | OIDs of a command from the coordinator; superuser, set per command |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
+| `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
 
 ### Functions
 
@@ -174,6 +207,7 @@ start their own clusters:
 | `007_session_settings.pl` | Settings of the session reach the segments |
 | `008_distribution.pl` | Distribution policies and colocation groups |
 | `009_same_oids.pl` | Objects get the OIDs of the coordinator on a segment |
+| `010_ddl.pl` | DDL of the coordinator on the segments: statements, transactions, what stays, what is refused |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -185,9 +219,9 @@ by the patch and `contrib/gp`.
 
 1. **Cluster skeleton** — done: roles, registration, the copy of segments,
    connections, settings of sessions, distribution policies.
-2. **DDL and the same OIDs** — in progress: the same OIDs are done; next
-   are propagating DDL to the segments, two-phase commit of DDL, roles and
-   commands that run outside a transaction.
+2. **DDL and the same OIDs** — in progress: the same OIDs and propagating
+   DDL are done; next are two-phase commit of DDL, then roles, `GRANT`,
+   owners and commands that run outside a transaction.
 3. **Placing data and correct SELECT** — routing of `INSERT` and `COPY`,
    plan fragments on segments, every query correct through a gather on the
    coordinator.

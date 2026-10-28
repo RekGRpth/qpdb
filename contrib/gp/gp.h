@@ -47,7 +47,9 @@ extern void gp_segments_init(void);
 extern int	gp_segments_get(GpSegment **segments);
 
 /* dispatch.c */
+extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
+extern void gp_dispatch_xact(const char *sql);
 
 /* oids.c */
 extern char *gp_dispatch_oids;
@@ -56,5 +58,11 @@ extern void gp_oids_init(void);
 extern bool gp_check_dispatch_oids(char **newval, void **extra,
 								   GucSource source);
 extern void gp_assign_dispatch_oids(const char *newval, void *extra);
+extern int	gp_oids_mark(void);
+extern char *gp_oids_since(int mark);
+
+/* ddl.c */
+extern bool gp_dispatch_ddl;
+extern void gp_ddl_init(void);
 
 #endif							/* GP_H */

@@ -15,6 +15,7 @@ $node->init;
 $node->append_conf(
 	'postgresql.conf', "shared_preload_libraries = 'gp'
 gp.role = 'coordinator'
+gp.dispatch_ddl = off
 gp.max_segments = 2
 max_prepared_transactions = 2
 ");
