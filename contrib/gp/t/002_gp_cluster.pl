@@ -32,10 +32,11 @@ $ENV{GP_PORT} = $port;
 $ENV{GP_SEGMENTS} = $segments;
 delete $ENV{PGBIN};
 
-# Do not leave the servers running if the test fails half-way
+# Do not leave the servers running if the test fails half-way.  END runs
+# after skip_all too, before $dir is set.
 END
 {
-	system($script, 'stop') if -f "$dir/nodes";
+	system($script, 'stop') if defined $dir && -f "$dir/nodes";
 }
 
 # Lines of status, segments first
