@@ -96,6 +96,27 @@ SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
  f
 (1 row)
 
+-- OIDs are recorded on the coordinator and given to segments
+SHOW gp.allow_local_ddl;
+ gp.allow_local_ddl 
+--------------------
+ off
+(1 row)
+
+SHOW gp.dispatch_oids;
+ gp.dispatch_oids 
+------------------
+ 
+(1 row)
+
+SELECT gp.recorded_oids();
+ERROR:  OIDs are recorded on the coordinator only
+SET gp.dispatch_oids = '1259:16384,';
+ERROR:  invalid value for parameter "gp.dispatch_oids": "1259:16384,"
+DETAIL:  A list of OIDs is "catalog:oid" pairs separated by commas.
+SET gp.dispatch_oids = '1259:16384,1247:16385';
+SET gp.dispatch_oids = '1259:16386';
+RESET gp.dispatch_oids;
 -- Buckets of keys are the same on every server
 SELECT gp.bucket(1024, 1), gp.bucket(1024, 1::bigint), gp.bucket(1024, 'abc'::text),
 	   gp.bucket(1024, 1, 'abc'::text), gp.bucket(1024, NULL::int),

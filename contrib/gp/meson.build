@@ -5,6 +5,7 @@ gp_sources = files(
   'dispatch.c',
   'distribution.c',
   'gp.c',
+  'oids.c',
   'segments.c',
 )
 
@@ -51,6 +52,7 @@ tests += {
       't/006_exec_on_all.pl',
       't/007_session_settings.pl',
       't/008_distribution.pl',
+      't/009_same_oids.pl',
     ],
   },
 }

@@ -103,6 +103,13 @@ LANGUAGE C STRICT;
 
 REVOKE ALL ON FUNCTION gp.exec_on_all(text) FROM PUBLIC;
 
+-- OIDs of the new catalog rows of the current transaction on the
+-- coordinator, as a segment takes them in gp.dispatch_oids
+CREATE FUNCTION gp.recorded_oids()
+RETURNS text
+AS 'MODULE_PATHNAME', 'gp_recorded_oids'
+LANGUAGE C STRICT;
+
 -- Colocation groups: tables of a group have keys of the same types and the
 -- same number of buckets, so rows with equal keys are on the same segment
 -- and a join of the tables by the key is local.  map[b + 1] is the segment

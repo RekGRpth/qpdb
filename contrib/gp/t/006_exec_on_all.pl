@@ -30,6 +30,7 @@ gp.segment_id = $segment_id
 gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
 gp.host = '${\$node->host}'
 gp.register_retry_interval = 1
+gp.allow_local_ddl = on
 ");
 	$node->start;
 	return $node;
