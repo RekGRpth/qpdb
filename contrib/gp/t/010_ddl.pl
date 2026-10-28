@@ -166,7 +166,7 @@ DROP TABLE tt});
 pass('temporary objects stay on the coordinator');
 fails(
 	'CREATE TEMP TABLE tt2 (a int); DROP TABLE tt2, s.m1',
-	qr/cannot drop objects of the coordinator and of the cluster at once/,
+	qr/cannot operate on objects of the coordinator and of the cluster at once/,
 	'temporary and other tables are not dropped at once');
 
 run('CREATE EXTENSION hstore');

@@ -44,7 +44,7 @@ fails_to_start(
 my $node = PostgreSQL::Test::Cluster->new('coordinator');
 $node->init;
 $node->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
+	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\ngp.dispatch_ddl = off\n");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION gp');
 

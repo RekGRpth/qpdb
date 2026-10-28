@@ -26,6 +26,7 @@ gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
 gp.host = '${\$segment->host}'
 gp.register_retry_interval = 1
 gp.allow_local_ddl = on
+max_prepared_transactions = 10
 log_statement = 'all'
 ");
 $segment->start;
@@ -83,7 +84,8 @@ is(on_segment("current_setting('work_mem')"),
 
 # A setting the segment refuses names the segment
 $coordinator->safe_psql(
-	'postgres', 'CREATE ROLE alice;
+	'postgres', 'SET gp.dispatch_ddl = off;
+CREATE ROLE alice;
 GRANT USAGE ON SCHEMA gp TO alice;
 GRANT EXECUTE ON FUNCTION gp.exec_on_all(text) TO alice');
 $session->query_safe('SET ROLE alice');

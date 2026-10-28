@@ -59,6 +59,7 @@ tests += {
       't/009_same_oids.pl',
       't/010_ddl.pl',
       't/011_two_phase.pl',
+      't/012_roles.pl',
     ],
   },
 }
