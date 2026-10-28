@@ -75,9 +75,10 @@ command_fails_like([ $script, 'init' ],
 command_like([ $script, 'status' ],
 	qr/\A\Q${\status('stopped')}\E\z/,
 	'status after init');
-command_like([ $script, 'start' ],
-	qr/^seg1 started on port ${\($port + 1)}\n.*^coordinator started on port $port$/ms,
-	'start, segments first');
+command_like(
+	[ $script, 'start' ],
+	qr/^seg1 started on port ${\($port + 1)}\n.*^coordinator started on port $port\n$segments segments registered on the coordinator\n\z/ms,
+	'start, segments first, and wait for them to register');
 command_like([ $script, 'start' ],
 	qr/^coordinator is already running$/m,
 	'start of a running cluster');

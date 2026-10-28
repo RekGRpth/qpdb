@@ -30,6 +30,16 @@ fails_to_start(
 	"gp.role = 'coordinator'\ngp.segment_id = 1\n",
 	qr/"gp.segment_id" is set, but "gp.role" is not "segment"/,
 	'coordinator with gp.segment_id');
+fails_to_start(
+	'segment_without_coordinator',
+	"gp.role = 'segment'\ngp.segment_id = 1\n",
+	qr/"gp.coordinator" must be set on a segment/,
+	'segment without gp.coordinator');
+fails_to_start(
+	'coordinator_with_coordinator',
+	"gp.role = 'coordinator'\ngp.coordinator = 'port=1'\n",
+	qr/"gp.coordinator" is set, but "gp.role" is not "segment"/,
+	'coordinator with gp.coordinator');
 
 my $node = PostgreSQL::Test::Cluster->new('coordinator');
 $node->init;

@@ -9,6 +9,10 @@ EXTENSION = gp
 DATA = gp--1.0.sql
 PGFILEDESC = "gp - cluster of PostgreSQL servers"
 
+PG_CPPFLAGS = -I$(libpq_srcdir)
+SHLIB_LINK_INTERNAL = $(libpq)
+SHLIB_PREREQS = submake-libpq
+
 REGRESS_OPTS = --temp-config $(top_srcdir)/contrib/gp/gp.conf
 REGRESS = gp
 

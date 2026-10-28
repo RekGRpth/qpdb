@@ -7,7 +7,8 @@
 #
 # Commands:
 #   init     create the nodes; the cluster directory must not exist
-#   start    start the segments, then the coordinator
+#   start    start the segments, then the coordinator; create extension gp
+#            in its database postgres and wait for the segments to register
 #   stop     stop the coordinator, then the segments
 #   status   show the nodes, their ports and roles
 #   destroy  stop the nodes and remove the cluster directory
@@ -51,6 +52,14 @@ list()
 	cat "$nodes"
 }
 
+# Run psql in the database postgres of the coordinator
+psql_coordinator()
+{
+	"$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
+		-p "$(sed -n 's/^coordinator \([0-9]*\) .*/\1/p' "$nodes")" \
+		-d postgres "$@"
+}
+
 running()
 {
 	"$PGBIN/pg_ctl" status -D "$dir/$1" >/dev/null 2>&1
@@ -72,14 +81,17 @@ cmd_init()
 
 	while read -r name nport role; do
 		echo "initdb $name"
+		# A segment has a number and registers on the coordinator
 		case $role in
-			segment) segment_id=${name#seg} ;;
-			*) segment_id=0 ;;
+			segment) set -- -c "gp.segment_id=${name#seg}" \
+				-c "gp.coordinator=host=localhost port=$port" \
+				-c gp.register_retry_interval=1 ;;
+			*) set -- ;;
 		esac
 		"$PGBIN/initdb" --pgdata "$dir/$name" --auth trust --no-instructions \
 			-c shared_preload_libraries=gp \
 			-c "gp.role=$role" \
-			-c "gp.segment_id=$segment_id" \
+			"$@" \
 			-c "port=$nport" \
 			-c "cluster_name=gp-$name" \
 			>"$dir/$name.initdb.log" 2>&1 ||
@@ -99,6 +111,21 @@ cmd_start()
 			echo "$name started on port $port"
 		fi
 	done
+
+	psql_coordinator -c 'SET client_min_messages = warning' \
+		-c 'CREATE EXTENSION IF NOT EXISTS gp' ||
+		die "could not create extension gp on the coordinator"
+
+	# Segments retry every few seconds, so the first ones may have failed
+	segments=$(grep -c ' segment$' "$nodes")
+	i=0
+	while [ "$(psql_coordinator -c 'SELECT count(*) FROM gp.segments')" -lt "$segments" ]; do
+		i=$((i + 1))
+		[ "$i" -le 60 ] ||
+			die "segments did not register in 60 seconds, see the logs in $dir"
+		sleep 1
+	done
+	echo "$segments segments registered on the coordinator"
 }
 
 cmd_stop()
