@@ -1,0 +1,22 @@
+CREATE EXTENSION gp;
+SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'gp';
+ extnamespace 
+--------------
+ gp
+(1 row)
+
+-- Without a role the server works on its own
+SHOW gp.role;
+ gp.role 
+---------
+ none
+(1 row)
+
+-- The role is set at server start
+SET gp.role = 'segment';
+ERROR:  parameter "gp.role" cannot be changed without restarting the server
+-- The prefix of the extension is reserved
+SET gp.no_such_parameter = 1;
+ERROR:  invalid configuration parameter name "gp.no_such_parameter"
+DETAIL:  "gp" is a reserved prefix.
+DROP EXTENSION gp;

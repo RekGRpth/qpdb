@@ -46,5 +46,17 @@ extern Oid	GetNewOidWithIndex(Relation relation, Oid indexId,
 extern RelFileNumber GetNewRelFileNumber(Oid reltablespace,
 										 Relation pg_class,
 										 char relpersistence);
+extern bool NewOidNeedsRelFileNumber(void);
+
+/*
+ * Hook for an extension to propose the OID of a new catalog row, see
+ * GetNewOidWithIndex().  Returning InvalidOid leaves the choice to the
+ * server.  NEW_OID_HOOK_VERSION tells extensions that the hook exists.
+ */
+#define NEW_OID_HOOK_VERSION 1
+
+typedef Oid (*new_oid_hook_type) (Relation relation, Oid indexId,
+								  AttrNumber oidcolumn);
+extern PGDLLIMPORT new_oid_hook_type new_oid_hook;
 
 #endif							/* CATALOG_H */

@@ -3970,6 +3970,7 @@ multirange_unnest_fctx
 mxact
 needs_fmgr_hook_type
 network_sortsupport_state
+new_oid_hook_type
 nl_item
 nodeitem
 normal_rand_fctx

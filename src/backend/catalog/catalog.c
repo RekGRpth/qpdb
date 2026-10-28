@@ -55,6 +55,18 @@
 #define GETNEWOID_LOG_THRESHOLD 1000000
 #define GETNEWOID_LOG_MAX_INTERVAL 128000000
 
+/* Hook for an extension to propose the OID of a new catalog row */
+new_oid_hook_type new_oid_hook = NULL;
+
+/* Did new_oid_hook propose the OID that GetNewOidWithIndex() returned last? */
+static bool last_oid_proposed = false;
+
+/* See NewOidNeedsRelFileNumber() */
+static bool new_oid_needs_relfilenumber = false;
+
+static bool OidInUse(Relation relation, Oid indexId, AttrNumber oidcolumn,
+					 Oid oid);
+
 /*
  * IsSystemRelation
  *		True iff the relation is either a system catalog or a toast table.
@@ -469,20 +481,27 @@ IsPinnedObject(Oid classId, Oid objectId)
  * consecutive existing OIDs.  This is a mostly reasonable assumption for
  * system catalogs.
  *
+ * An extension may propose the OID of a catalog row through new_oid_hook,
+ * e.g. to give an object the same OID on several servers.  TOAST value OIDs
+ * are not proposed, and neither are OIDs in bootstrap mode or during
+ * pg_upgrade.  A proposed OID is checked like any other candidate, but one
+ * in use or in the range of system objects is an error rather than a reason
+ * to try another: the extension would accept no other.
+ *
  * Caller must have a suitable lock on the relation.
  */
 Oid
 GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
 	Oid			newOid;
-	SysScanDesc scan;
-	ScanKeyData key;
 	bool		collides;
 	uint64		retries = 0;
 	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
 
 	/* Only system relations are supported */
 	Assert(IsSystemRelation(relation));
+
+	last_oid_proposed = false;
 
 	/* In bootstrap mode, we don't have any indexes to use */
 	if (IsBootstrapProcessingMode())
@@ -496,6 +515,26 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	 */
 	Assert(!IsBinaryUpgrade || RelationGetRelid(relation) != TypeRelationId);
 
+	/* Let an extension propose the OID of a catalog row */
+	if (unlikely(new_oid_hook != NULL) && !IsBinaryUpgrade &&
+		IsCatalogRelation(relation) && !IsToastRelation(relation))
+	{
+		newOid = new_oid_hook(relation, indexId, oidcolumn);
+
+		if (OidIsValid(newOid))
+		{
+			if (newOid < FirstNormalObjectId)
+				elog(ERROR, "proposed OID %u for relation \"%s\" is in the range of system objects",
+					 newOid, RelationGetRelationName(relation));
+			if (OidInUse(relation, indexId, oidcolumn, newOid))
+				elog(ERROR, "proposed OID %u is already in use in relation \"%s\"",
+					 newOid, RelationGetRelationName(relation));
+
+			last_oid_proposed = true;
+			return newOid;
+		}
+	}
+
 	/* Generate new OIDs until we find one not in the table */
 	do
 	{
@@ -503,18 +542,7 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 
 		newOid = GetNewObjectId();
 
-		ScanKeyInit(&key,
-					oidcolumn,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(newOid));
-
-		/* see notes above about using SnapshotAny */
-		scan = systable_beginscan(relation, indexId, true,
-								  SnapshotAny, 1, &key);
-
-		collides = HeapTupleIsValid(systable_getnext(scan));
-
-		systable_endscan(scan);
+		collides = OidInUse(relation, indexId, oidcolumn, newOid);
 
 		/*
 		 * Log that we iterate more than GETNEWOID_LOG_THRESHOLD but have not
@@ -565,6 +593,33 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 }
 
 /*
+ * OidInUse
+ *		Is the OID in the relation, as GetNewOidWithIndex() sees it?
+ */
+static bool
+OidInUse(Relation relation, Oid indexId, AttrNumber oidcolumn, Oid oid)
+{
+	SysScanDesc scan;
+	ScanKeyData key;
+	bool		found;
+
+	ScanKeyInit(&key,
+				oidcolumn,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(oid));
+
+	/* see notes on GetNewOidWithIndex() about using SnapshotAny */
+	scan = systable_beginscan(relation, indexId, true,
+							  SnapshotAny, 1, &key);
+
+	found = HeapTupleIsValid(systable_getnext(scan));
+
+	systable_endscan(scan);
+
+	return found;
+}
+
+/*
  * GetNewRelFileNumber
  *		Generate a new relfilenumber that is unique within the
  *		database of the given tablespace.
@@ -573,6 +628,10 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
  * opened pg_class catalog, and this routine will guarantee that the result
  * is also an unused OID within pg_class.  If the result is to be used only
  * as a relfilenumber for an existing relation, pass NULL for pg_class.
+ *
+ * An OID that new_oid_hook proposed is returned even if a file of that
+ * number exists; NewOidNeedsRelFileNumber() then tells the caller to take
+ * the relfilenumber from a second call with a NULL pg_class.
  *
  * As with GetNewOidWithIndex(), there is some theoretical risk of a race
  * condition, but it doesn't seem worth worrying about.
@@ -622,6 +681,8 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 	 */
 	rlocator.backend = procNumber;
 
+	new_oid_needs_relfilenumber = false;
+
 	do
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -640,6 +701,17 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		{
 			/* definite collision */
 			collides = true;
+
+			/*
+			 * Keep an OID that new_oid_hook proposed, as there is no other
+			 * the extension would accept, and leave the relfilenumber to the
+			 * caller.
+			 */
+			if (pg_class && last_oid_proposed)
+			{
+				collides = false;
+				new_oid_needs_relfilenumber = true;
+			}
 		}
 		else
 		{
@@ -655,6 +727,20 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 	} while (collides);
 
 	return rlocator.locator.relNumber;
+}
+
+/*
+ * NewOidNeedsRelFileNumber
+ *		Must the relation whose OID GetNewRelFileNumber() returned last take
+ *		its relfilenumber from another call?
+ *
+ * That is the case only for an OID that new_oid_hook proposed and that
+ * names an existing file already.
+ */
+bool
+NewOidNeedsRelFileNumber(void)
+{
+	return new_oid_needs_relfilenumber;
 }
 
 /*

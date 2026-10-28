@@ -1,0 +1,20 @@
+# Checks of contrib/gp, in addition to pg-ci.yml, which builds and tests
+# contrib/gp along with the rest of the tree
+
+name: gp
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check-core-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: git fetch https://github.com/postgres/postgres.git master
+      - run: contrib/gp/tools/check-core-diff.sh FETCH_HEAD
