@@ -2,6 +2,7 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 gp_sources = files(
+  'dispatch.c',
   'gp.c',
   'segments.c',
 )
@@ -46,6 +47,7 @@ tests += {
       't/003_register.pl',
       't/004_register_worker.pl',
       't/005_cluster_segments.pl',
+      't/006_exec_on_all.pl',
     ],
   },
 }

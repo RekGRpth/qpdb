@@ -3,6 +3,7 @@
 MODULE_big = gp
 OBJS = \
 	$(WIN32RES) \
+	dispatch.o \
 	gp.o \
 	segments.o
 

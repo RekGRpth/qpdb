@@ -87,4 +87,13 @@ SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
  f
 (1 row)
 
+-- Commands go to the segments from the coordinator only, by a superuser
+SELECT * FROM gp.exec_on_all('SELECT 1');
+ERROR:  segments of the cluster are known on the coordinator only
+SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
+ has_function_privilege 
+------------------------
+ f
+(1 row)
+
 DROP EXTENSION gp;

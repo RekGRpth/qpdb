@@ -37,4 +37,8 @@ SELECT gp.register_segment(1, 'localhost', 9001);
 SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
 							  'EXECUTE');
 
+-- Commands go to the segments from the coordinator only, by a superuser
+SELECT * FROM gp.exec_on_all('SELECT 1');
+SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
+
 DROP EXTENSION gp;

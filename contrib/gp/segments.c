@@ -338,13 +338,13 @@ gp_segments_object_access(ObjectAccessType access, Oid classId,
 }
 
 /*
- * gp.cluster_segments(): the copy of gp.segments, from any database
+ * Copy the segments, ordered by number, into *segments, palloc'd, and
+ * return their number.  Only the coordinator knows them, and only once the
+ * loader has read gp.segments.
  */
-Datum
-gp_cluster_segments(PG_FUNCTION_ARGS)
+int
+gp_segments_get(GpSegment **segments)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	GpSegment  *segments;
 	int			nsegments;
 	bool		loaded;
 
@@ -353,19 +353,33 @@ gp_cluster_segments(PG_FUNCTION_ARGS)
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("segments of the cluster are known on the coordinator only"));
 
-	InitMaterializedSRF(fcinfo, 0);
-
-	segments = palloc_array(GpSegment, gp_max_segments);
+	*segments = palloc_array(GpSegment, gp_max_segments);
 	LWLockAcquire(&shared->lock, LW_SHARED);
 	loaded = shared->loaded;
 	nsegments = shared->nsegments;
-	memcpy(segments, shared->segments, sizeof(GpSegment) * nsegments);
+	memcpy(*segments, shared->segments, sizeof(GpSegment) * nsegments);
 	LWLockRelease(&shared->lock);
 
 	if (!loaded)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("segments of the cluster are not loaded yet"));
+
+	return nsegments;
+}
+
+/*
+ * gp.cluster_segments(): the copy of gp.segments, from any database
+ */
+Datum
+gp_cluster_segments(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	GpSegment  *segments;
+	int			nsegments;
+
+	nsegments = gp_segments_get(&segments);
+	InitMaterializedSRF(fcinfo, 0);
 
 	for (int i = 0; i < nsegments; i++)
 	{

@@ -14,6 +14,8 @@
 #ifndef GP_H
 #define GP_H
 
+#include "libpq-fe.h"
+
 /* Role of the server in the cluster */
 enum
 {
@@ -41,5 +43,9 @@ extern int	gp_max_segments;
 
 /* segments.c */
 extern void gp_segments_init(void);
+extern int	gp_segments_get(GpSegment **segments);
+
+/* dispatch.c */
+extern PGconn *gp_connection_get(const GpSegment *segment);
 
 #endif							/* GP_H */
