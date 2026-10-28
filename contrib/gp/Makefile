@@ -3,7 +3,8 @@
 MODULE_big = gp
 OBJS = \
 	$(WIN32RES) \
-	gp.o
+	gp.o \
+	segments.o
 
 EXTENSION = gp
 DATA = gp--1.0.sql

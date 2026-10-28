@@ -66,6 +66,15 @@ SELECT * FROM gp.segments;
 ------------+------+------+------------
 (0 rows)
 
+-- The coordinator keeps the segments in shared memory
+SHOW gp.max_segments;
+ gp.max_segments 
+-----------------
+ 64
+(1 row)
+
+SELECT * FROM gp.cluster_segments();
+ERROR:  segments of the cluster are known on the coordinator only
 -- Segments register on the coordinator only
 SELECT gp.register_segment(1, 'localhost', 9001);
 ERROR:  segments register on the coordinator only
