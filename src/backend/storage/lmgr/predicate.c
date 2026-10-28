@@ -149,47 +149,6 @@
  *
  *-------------------------------------------------------------------------
  */
-/*
- * INTERFACE ROUTINES
- *
- * predicate lock reporting
- *		GetPredicateLockStatusData(void)
- *		PageIsPredicateLocked(Relation relation, BlockNumber blkno)
- *
- * predicate lock maintenance
- *		GetSerializableTransactionSnapshot(Snapshot snapshot)
- *		SetSerializableTransactionSnapshot(Snapshot snapshot,
- *										   VirtualTransactionId *sourcevxid)
- *		RegisterPredicateLockingXid(void)
- *		PredicateLockRelation(Relation relation, Snapshot snapshot)
- *		PredicateLockPage(Relation relation, BlockNumber blkno,
- *						Snapshot snapshot)
- *		PredicateLockTID(Relation relation, const ItemPointerData *tid, Snapshot snapshot,
- *						 TransactionId tuple_xid)
- *		PredicateLockPageSplit(Relation relation, BlockNumber oldblkno,
- *							   BlockNumber newblkno)
- *		PredicateLockPageCombine(Relation relation, BlockNumber oldblkno,
- *								 BlockNumber newblkno)
- *		TransferPredicateLocksToHeapRelation(Relation relation)
- *		ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
- *
- * conflict detection (may also trigger rollback)
- *		CheckForSerializableConflictOut(Relation relation, TransactionId xid,
- *										Snapshot snapshot)
- *		CheckForSerializableConflictIn(Relation relation, const ItemPointerData *tid,
- *									   BlockNumber blkno)
- *		CheckTableForSerializableConflictIn(Relation relation)
- *
- * final rollback checking
- *		PreCommit_CheckForSerializationFailure(void)
- *
- * two-phase commit support
- *		AtPrepare_PredicateLocks(void);
- *		PostPrepare_PredicateLocks(TransactionId xid);
- *		PredicateLockTwoPhaseFinish(FullTransactionId fxid, bool isCommit);
- *		predicatelock_twophase_recover(FullTransactionId fxid, uint16 info,
- *									   void *recdata, uint32 len);
- */
 
 #include "postgres.h"
 
@@ -1917,45 +1876,6 @@ RegisterPredicateLockingXid(TransactionId xid)
 	/* Initialize the structure. */
 	sxid->myXact = MySerializableXact;
 	LWLockRelease(SerializableXactHashLock);
-}
-
-
-/*
- * Check whether there are any predicate locks held by any transaction
- * for the page at the given block number.
- *
- * Note that the transaction may be completed but not yet subject to
- * cleanup due to overlapping serializable transactions.  This must
- * return valid information regardless of transaction isolation level.
- *
- * Also note that this doesn't check for a conflicting relation lock,
- * just a lock specifically on the given page.
- *
- * One use is to support proper behavior during GiST index vacuum.
- */
-bool
-PageIsPredicateLocked(Relation relation, BlockNumber blkno)
-{
-	PREDICATELOCKTARGETTAG targettag;
-	uint32		targettaghash;
-	LWLock	   *partitionLock;
-	PREDICATELOCKTARGET *target;
-
-	SET_PREDICATELOCKTARGETTAG_PAGE(targettag,
-									relation->rd_locator.dbOid,
-									relation->rd_id,
-									blkno);
-
-	targettaghash = PredicateLockTargetTagHashCode(&targettag);
-	partitionLock = PredicateLockHashPartitionLock(targettaghash);
-	LWLockAcquire(partitionLock, LW_SHARED);
-	target = (PREDICATELOCKTARGET *)
-		hash_search_with_hash_value(PredicateLockTargetHash,
-									&targettag, targettaghash,
-									HASH_FIND, NULL);
-	LWLockRelease(partitionLock);
-
-	return (target != NULL);
 }
 
 
@@ -4711,7 +4631,7 @@ PreCommit_CheckForSerializationFailure(void)
  */
 
 /*
- * AtPrepare_Locks
+ * AtPrepare_PredicateLocks
  *		Do the preparatory work for a PREPARE: make 2PC state file
  *		records for all predicate locks currently held.
  */
@@ -4778,7 +4698,7 @@ AtPrepare_PredicateLocks(void)
 }
 
 /*
- * PostPrepare_Locks
+ * PostPrepare_PredicateLocks
  *		Clean up after successful PREPARE. Unlike the non-predicate
  *		lock manager, we do not need to transfer locks to a dummy
  *		PGPROC because our SERIALIZABLEXACT will stay around
