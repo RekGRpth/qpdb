@@ -39,6 +39,7 @@ tests += {
   'tap': {
     'tests': [
       't/001_cluster.pl',
+      't/002_gp_cluster.pl',
     ],
   },
 }
