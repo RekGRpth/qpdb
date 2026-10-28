@@ -18,6 +18,9 @@ foreach my $role ('coordinator', 'segment', 'segment')
 	$node->init;
 	$node->append_conf('postgresql.conf',
 		"shared_preload_libraries = 'gp'\ngp.role = '$role'\n");
+	$node->append_conf('postgresql.conf',
+		'gp.segment_id = ' . scalar(@nodes))
+	  if $role eq 'segment';
 	$node->start;
 	$roles{ $node->name } = $role;
 	push @nodes, $node;

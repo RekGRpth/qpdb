@@ -45,9 +45,9 @@ sub status
 	my ($state) = @_;
 	my @lines;
 
-	foreach my $i (0 .. $segments - 1)
+	foreach my $i (1 .. $segments)
 	{
-		push @lines, "seg$i\tport " . ($port + 1 + $i) . "\t$state";
+		push @lines, "seg$i\tport " . ($port + $i) . "\t$state";
 	}
 	push @lines, "coordinator\tport $port\t$state";
 	if ($state eq 'running')
@@ -76,7 +76,7 @@ command_like([ $script, 'status' ],
 	qr/\A\Q${\status('stopped')}\E\z/,
 	'status after init');
 command_like([ $script, 'start' ],
-	qr/^seg0 started on port ${\($port + 1)}\n.*^coordinator started on port $port$/ms,
+	qr/^seg1 started on port ${\($port + 1)}\n.*^coordinator started on port $port$/ms,
 	'start, segments first');
 command_like([ $script, 'start' ],
 	qr/^coordinator is already running$/m,
@@ -86,7 +86,7 @@ command_like([ $script, 'status' ],
 	'status of a running cluster');
 
 command_like([ $script, 'stop' ],
-	qr/\Acoordinator stopped\n.*^seg0 stopped\n\z/ms,
+	qr/\Acoordinator stopped\n.*^seg1 stopped\n\z/ms,
 	'stop, coordinator first');
 command_like([ $script, 'status' ],
 	qr/\A\Q${\status('stopped')}\E\z/,
