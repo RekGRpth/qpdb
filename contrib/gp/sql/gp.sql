@@ -41,4 +41,17 @@ SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
 SELECT * FROM gp.exec_on_all('SELECT 1');
 SELECT has_function_privilege('public', 'gp.exec_on_all(text)', 'EXECUTE');
 
+-- Buckets of keys are the same on every server
+SELECT gp.bucket(1024, 1), gp.bucket(1024, 1::bigint), gp.bucket(1024, 'abc'::text),
+	   gp.bucket(1024, 1, 'abc'::text), gp.bucket(1024, NULL::int),
+	   gp.bucket(1024, NULL::int, 1), gp.bucket(1024, VARIADIC ARRAY[1]);
+SELECT count(DISTINCT gp.bucket(16, i)) FROM generate_series(1, 1000) i;
+SELECT gp.bucket(0, 1);
+SELECT gp.bucket(1024, point(1, 1));
+
+-- Tables are distributed on the coordinator only
+CREATE TABLE t (a int);
+SELECT gp.distribute('t', '{a}');
+DROP TABLE t;
+
 DROP EXTENSION gp;
