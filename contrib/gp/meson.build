@@ -48,6 +48,7 @@ tests += {
       't/004_register_worker.pl',
       't/005_cluster_segments.pl',
       't/006_exec_on_all.pl',
+      't/007_session_settings.pl',
     ],
   },
 }
