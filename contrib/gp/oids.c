@@ -153,8 +153,12 @@ gp_oids_xact_callback(XactEvent event, void *arg)
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
-		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
+
+			/*
+			 * Not in a parallel worker: it gets gp.dispatch_oids from the
+			 * leader, but creates no catalog rows
+			 */
 			if (dispatched != NULL && nused < dispatched->count)
 				ereport(ERROR,
 						errcode(ERRCODE_INTERNAL_ERROR),
