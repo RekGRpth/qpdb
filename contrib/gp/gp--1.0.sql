@@ -91,3 +91,14 @@ END
 $$;
 
 REVOKE ALL ON FUNCTION gp.register_segment(int, text, int) FROM PUBLIC;
+
+-- Run a command on all segments at once and return the command status of
+-- each; rows of a query are discarded.  Each segment runs the command in a
+-- transaction of its own: a rollback on the coordinator does not undo it.
+-- An error on a segment is reported after all segments have answered.
+CREATE FUNCTION gp.exec_on_all(sql text, OUT segment_id int, OUT status text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gp_exec_on_all'
+LANGUAGE C STRICT;
+
+REVOKE ALL ON FUNCTION gp.exec_on_all(text) FROM PUBLIC;
