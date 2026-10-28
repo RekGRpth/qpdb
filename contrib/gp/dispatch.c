@@ -18,9 +18,13 @@
  *
  * DDL runs on the segments in transactions that follow the transaction of
  * the coordinator: the first command opens one, and the end of the
- * transaction of the coordinator commits or rolls them back.  Without
- * two-phase commit, a subtransaction cannot be rolled back on the segments,
- * so a transaction that rolled back one after sending DDL cannot commit.
+ * transaction of the coordinator ends them by two-phase commit.  Before the
+ * coordinator commits, the segments prepare their transactions, and a
+ * segment that cannot fails the commit; after it commits, they commit them.
+ * A segment that cannot commit then keeps its transaction prepared, to be
+ * committed by hand until recovery comes.  A subtransaction cannot be
+ * rolled back on the segments, so a transaction that rolled back one after
+ * sending DDL cannot commit.
  *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
@@ -43,6 +47,7 @@
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -62,6 +67,7 @@ typedef struct GpConnection
 	PGconn	   *conn;
 	bool		busy;			/* a command runs, its result is not read */
 	bool		in_xact;		/* in a transaction of the coordinator */
+	bool		prepared;		/* has prepared the transaction as gid */
 	char	   *settings;		/* settings sent, "name\0value\0" pairs */
 	int			settings_len;	/* -1 if unknown after a rollback */
 } GpConnection;
@@ -81,7 +87,14 @@ static List *subxact_marks = NIL;
 /* The segments do not have what this transaction has sent them */
 static bool diverged = false;
 
+/* Name of the prepared transactions of the segments, if any */
+static char gid[64];
+static bool prepared_any = false;
+
 PG_FUNCTION_INFO_V1(gp_exec_on_all);
+
+static PGresult **gp_dispatch(const GpSegment *segments, GpConnection **entries,
+							  int nsegments, char **commands, const char *what);
 
 static void
 gp_connection_close(GpConnection *entry)
@@ -122,12 +135,13 @@ gp_connections_abort(void)
 }
 
 /*
- * End the transactions of the segments with COMMIT or ROLLBACK.  The
- * transaction of the coordinator has ended already, so a failure is only a
- * warning.
+ * End the transactions of the segments with a command: COMMIT or ROLLBACK
+ * those in progress, COMMIT PREPARED or ROLLBACK PREPARED the prepared
+ * ones.  The transaction of the coordinator has ended already, so a failure
+ * is only a warning.
  */
 static void
-gp_connections_finish(const char *command)
+gp_connections_finish(const char *command, bool prepared)
 {
 	HASH_SEQ_STATUS status;
 	GpConnection *entry;
@@ -137,24 +151,38 @@ gp_connections_finish(const char *command)
 
 	hash_seq_init(&status, connections);
 	while ((entry = hash_seq_search(&status)) != NULL)
-		if (entry->in_xact)
+		if (prepared ? entry->prepared : entry->in_xact)
 			entry->busy = PQsendQuery(entry->conn, command);
 
 	hash_seq_init(&status, connections);
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
 		PGresult   *res = NULL;
+		char	   *sqlstate = NULL;
 
-		if (!entry->in_xact)
+		if (!(prepared ? entry->prepared : entry->in_xact))
 			continue;
 		if (entry->busy)
 			res = libpqsrv_get_result_last(entry->conn, wait_event_result);
 		entry->busy = false;
 		entry->in_xact = false;
+		entry->prepared = false;
 
 		/* Settings sent in a rolled back transaction are gone */
-		if (strcmp(command, "ROLLBACK") == 0)
+		if (!prepared && strcmp(command, "ROLLBACK") == 0)
 			entry->settings_len = -1;
+
+		if (res != NULL)
+			sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+
+		/* A segment that failed to prepare has nothing to roll back */
+		if (prepared && sqlstate != NULL &&
+			strcmp(sqlstate, "42704") == 0 &&
+			strncmp(command, "ROLLBACK", 8) == 0)
+		{
+			PQclear(res);
+			continue;
+		}
 
 		if (res == NULL || PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
@@ -163,12 +191,74 @@ gp_connections_finish(const char *command)
 					errmsg("could not run %s on segment %d at %s:%d",
 						   command, entry->segment_id, entry->host,
 						   entry->port),
-					errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))));
+					errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))),
+					prepared ?
+					errhint("The transaction stays prepared on the segment; run %s there.",
+							command) : 0);
 			if (PQstatus(entry->conn) != CONNECTION_OK)
 				gp_connection_close(entry);
 		}
 		PQclear(res);
 	}
+}
+
+/*
+ * Prepare the transactions of the segments before the coordinator commits.
+ * A segment that cannot fails the commit, and the abort rolls back the
+ * prepared ones.
+ */
+static void
+gp_connections_prepare(void)
+{
+	HASH_SEQ_STATUS status;
+	GpConnection *entry;
+	GpSegment  *segments;
+	GpConnection **entries;
+	char	  **commands;
+	PGresult  **results;
+	char	   *command;
+	int			n = 0;
+
+	if (connections == NULL)
+		return;
+
+	segments = palloc_array(GpSegment, hash_get_num_entries(connections));
+	entries = palloc_array(GpConnection *, hash_get_num_entries(connections));
+	hash_seq_init(&status, connections);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (!entry->in_xact)
+			continue;
+		segments[n].segment_id = entry->segment_id;
+		segments[n].port = entry->port;
+		strlcpy(segments[n].host, entry->host, sizeof(segments[n].host));
+		entries[n++] = entry;
+	}
+	if (n == 0)
+		return;
+
+	prepared_any = true;
+	snprintf(gid, sizeof(gid), "gp_" UINT64_FORMAT,
+			 U64FromFullTransactionId(GetTopFullTransactionId()));
+	command = psprintf("PREPARE TRANSACTION %s", quote_literal_cstr(gid));
+	commands = palloc_array(char *, n);
+
+	/*
+	 * Count them all prepared: whether PREPARE succeeds or fails, a segment
+	 * is not in the transaction any more, and the abort tries ROLLBACK
+	 * PREPARED on each.
+	 */
+	for (int i = 0; i < n; i++)
+	{
+		commands[i] = command;
+		entries[i]->in_xact = false;
+		entries[i]->prepared = true;
+	}
+
+	results = gp_dispatch(segments, entries, n, commands,
+						  "preparing the transaction");
+	for (int i = 0; i < n; i++)
+		PQclear(results[i]);
 }
 
 static void
@@ -184,6 +274,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 						errmsg("cannot commit a transaction whose DDL the segments have lost"),
 						errdetail("A subtransaction that sent DDL to the segments was rolled back, or a connection to a segment was closed."),
 						errhint("Roll back the whole transaction."));
+			gp_connections_prepare();
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			if (diverged || ndispatched > 0)
@@ -193,12 +284,20 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
-			gp_connections_finish("COMMIT");
+			if (prepared_any)
+			{
+				INJECTION_POINT("gp-before-commit-prepared", NULL);
+				gp_connections_finish(psprintf("COMMIT PREPARED %s",
+											   quote_literal_cstr(gid)), true);
+			}
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			gp_connections_abort();
-			gp_connections_finish("ROLLBACK");
+			gp_connections_finish("ROLLBACK", false);
+			if (prepared_any)
+				gp_connections_finish(psprintf("ROLLBACK PREPARED %s",
+											   quote_literal_cstr(gid)), true);
 			break;
 		default:
 			break;
@@ -212,6 +311,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		ndispatched = 0;
 		subxact_marks = NIL;
 		diverged = false;
+		prepared_any = false;
 	}
 }
 
@@ -348,6 +448,7 @@ gp_connection_open(const GpSegment *segment)
 	entry->conn = conn;
 	entry->busy = false;
 	entry->in_xact = false;
+	entry->prepared = false;
 	entry->settings = NULL;
 	entry->settings_len = 0;
 	return entry;
@@ -567,6 +668,7 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 		char	   *primary = NULL;
 		char	   *detail = NULL;
 		char	   *hint = NULL;
+		char	   *context;
 		bool		broken;
 
 		if (res != NULL)
@@ -600,16 +702,16 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 					errmsg("lost the connection to segment %d at %s:%d",
 						   segment->segment_id, segment->host, segment->port),
 					errdetail_internal("%s", detail));
+		/* errcontext() is a comma expression: no use in a conditional one */
+		context = psprintf("%s%ssegment %d at %s:%d", what ? what : "",
+						   what ? " on " : "", segment->segment_id,
+						   segment->host, segment->port);
 		ereport(ERROR,
 				errcode(code),
 				errmsg_internal("%s", primary),
 				detail ? errdetail_internal("%s", detail) : 0,
 				hint ? errhint("%s", hint) : 0,
-				what ?
-				errcontext("%s on segment %d at %s:%d", what,
-						   segment->segment_id, segment->host, segment->port) :
-				errcontext("segment %d at %s:%d",
-						   segment->segment_id, segment->host, segment->port));
+				errcontext("%s", context));
 	}
 
 	return results;

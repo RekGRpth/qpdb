@@ -44,6 +44,9 @@ tests += {
     'runningcheck': false,
   },
   'tap': {
+    'env': {
+      'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
     'tests': [
       't/001_cluster.pl',
       't/002_gp_cluster.pl',
@@ -55,6 +58,7 @@ tests += {
       't/008_distribution.pl',
       't/009_same_oids.pl',
       't/010_ddl.pl',
+      't/011_two_phase.pl',
     ],
   },
 }

@@ -29,6 +29,7 @@ gp.segment_id = $segment_id
 gp.coordinator = 'host=${\$coordinator->host} port=${\$coordinator->port}'
 gp.host = '${\$node->host}'
 gp.register_retry_interval = 1
+max_prepared_transactions = 10
 ");
 	$node->start;
 	push @segments, $node;
