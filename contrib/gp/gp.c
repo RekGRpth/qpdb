@@ -26,6 +26,8 @@
 #include "utils/guc.h"
 #include "utils/wait_event.h"
 
+#include "gp.h"
+
 #if !defined(NEW_OID_HOOK_VERSION) || NEW_OID_HOOK_VERSION < 1
 #error "gp requires a server with new_oid_hook"
 #endif
@@ -35,14 +37,6 @@ PG_MODULE_MAGIC_EXT(
 					.version = PG_VERSION
 );
 
-/* Role of the server in the cluster */
-enum
-{
-	GP_ROLE_NONE,				/* not in a cluster */
-	GP_ROLE_COORDINATOR,
-	GP_ROLE_SEGMENT,
-};
-
 static const struct config_enum_entry gp_role_options[] = {
 	{"none", GP_ROLE_NONE, false},
 	{"coordinator", GP_ROLE_COORDINATOR, false},
@@ -51,9 +45,10 @@ static const struct config_enum_entry gp_role_options[] = {
 };
 
 /* GUC Variables */
-static int	gp_role = GP_ROLE_NONE;
-static int	gp_segment_id = 0;
-static char *gp_database = NULL;
+int			gp_role = GP_ROLE_NONE;
+int			gp_segment_id = 0;
+char	   *gp_database = NULL;
+int			gp_max_segments = 64;
 static char *gp_coordinator = NULL;
 static char *gp_host = NULL;
 static int	gp_register_retry_interval = 5;
@@ -141,6 +136,19 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("gp.max_segments",
+							"Maximum number of segments in the cluster.",
+							"The coordinator keeps the segments in shared memory of this size.",
+							&gp_max_segments,
+							64,
+							1,
+							10000,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
 	MarkGUCPrefixReserved("gp");
 
 	/* A misconfigured node does not start */
@@ -160,6 +168,9 @@ _PG_init(void)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("\"gp.coordinator\" is set, but \"gp.role\" is not \"segment\""));
+
+	if (gp_role == GP_ROLE_COORDINATOR)
+		gp_segments_init();
 
 	if (gp_role == GP_ROLE_SEGMENT)
 	{

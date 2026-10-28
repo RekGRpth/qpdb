@@ -3,6 +3,7 @@
 
 gp_sources = files(
   'gp.c',
+  'segments.c',
 )
 
 if host_system == 'windows'
@@ -44,6 +45,7 @@ tests += {
       't/002_gp_cluster.pl',
       't/003_register.pl',
       't/004_register_worker.pl',
+      't/005_cluster_segments.pl',
     ],
   },
 }

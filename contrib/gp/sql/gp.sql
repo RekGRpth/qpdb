@@ -26,6 +26,10 @@ SHOW gp.register_retry_interval;
 SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
 SELECT * FROM gp.segments;
 
+-- The coordinator keeps the segments in shared memory
+SHOW gp.max_segments;
+SELECT * FROM gp.cluster_segments();
+
 -- Segments register on the coordinator only
 SELECT gp.register_segment(1, 'localhost', 9001);
 

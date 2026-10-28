@@ -8,13 +8,32 @@
 -- segments add themselves to it with gp.register_segment().
 CREATE TABLE gp.segments (
 	segment_id int PRIMARY KEY CHECK (segment_id > 0),
-	host text NOT NULL,
+	host text NOT NULL CHECK (octet_length(host) < 256),
 	port int NOT NULL CHECK (port BETWEEN 1 AND 65535),
 	registered timestamptz NOT NULL DEFAULT now(),	-- last registration
 	UNIQUE (host, port)
 );
 
 SELECT pg_catalog.pg_extension_config_dump('gp.segments', '');
+
+-- The coordinator keeps a copy of gp.segments in shared memory, for any
+-- database.  A transaction that changes the table updates the copy when it
+-- commits.
+CREATE FUNCTION gp.segments_changed()
+RETURNS trigger
+AS 'MODULE_PATHNAME', 'gp_segments_changed'
+LANGUAGE C;
+
+CREATE TRIGGER segments_changed
+AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON gp.segments
+FOR EACH STATEMENT EXECUTE FUNCTION gp.segments_changed();
+
+-- Segments of the cluster as the coordinator knows them, from any database
+CREATE FUNCTION gp.cluster_segments(OUT segment_id int, OUT host text,
+									OUT port int)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gp_cluster_segments'
+LANGUAGE C STRICT;
 
 -- Register a segment, or confirm the registration of a known one.  A
 -- segment keeps its number and address: a number registered at another
@@ -56,6 +75,13 @@ BEGIN
 	IF FOUND THEN
 		RAISE EXCEPTION '%:% is already registered as segment %',
 			known.host, known.port, known.segment_id;
+	END IF;
+
+	IF (SELECT count(*) FROM gp.segments) >=
+		current_setting('gp.max_segments')::int THEN
+		RAISE EXCEPTION 'cannot register more than % segments',
+			current_setting('gp.max_segments')
+			USING HINT = 'Raise "gp.max_segments" on the coordinator.';
 	END IF;
 
 	INSERT INTO gp.segments (segment_id, host, port)
