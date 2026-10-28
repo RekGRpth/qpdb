@@ -6,21 +6,21 @@
 #
 # Usage: contrib/gp/tools/check-core-diff.sh [BASE]
 #
-# BASE is the mirror of upstream, origin/master by default.  The diff is
-# taken from its merge base with HEAD, so the commits of upstream that are
-# not merged yet do not count.
+# BASE is the master branch of upstream, upstream/master by default.  The
+# diff is taken from its merge base with HEAD, so the commits of upstream
+# that are not merged yet do not count.
 #
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
 set -eu
 
-base=${1:-origin/master}
+base=${1:-upstream/master}
 
 allowed='^('
 allowed="$allowed"'contrib/gp/'
 allowed="$allowed"'|contrib/Makefile$|contrib/meson\.build$'
-allowed="$allowed"'|\.github/workflows/gp\.yml$'
+allowed="$allowed"'|\.github/workflows/(gp|merge-upstream)\.yml$'
 allowed="$allowed"'|src/backend/catalog/(catalog|heap|index)\.c$'
 allowed="$allowed"'|src/include/catalog/catalog\.h$'
 allowed="$allowed"'|src/test/modules/(Makefile|meson\.build)$'
