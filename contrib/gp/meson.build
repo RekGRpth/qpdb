@@ -13,7 +13,9 @@ endif
 
 gp = shared_module('gp',
   gp_sources,
-  kwargs: contrib_mod_args,
+  kwargs: contrib_mod_args + {
+    'dependencies': contrib_mod_args['dependencies'] + [libpq],
+  },
 )
 contrib_targets += gp
 
@@ -41,6 +43,7 @@ tests += {
       't/001_cluster.pl',
       't/002_gp_cluster.pl',
       't/003_register.pl',
+      't/004_register_worker.pl',
     ],
   },
 }

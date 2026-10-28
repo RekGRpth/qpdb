@@ -35,6 +35,25 @@ SHOW gp.database;
  postgres
 (1 row)
 
+-- Only a segment connects to the coordinator, with its own host
+SHOW gp.coordinator;
+ gp.coordinator 
+----------------
+ 
+(1 row)
+
+SHOW gp.host;
+  gp.host  
+-----------
+ localhost
+(1 row)
+
+SHOW gp.register_retry_interval;
+ gp.register_retry_interval 
+----------------------------
+ 5s
+(1 row)
+
 -- Segments are dumped with the extension
 SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
    extconfig   
