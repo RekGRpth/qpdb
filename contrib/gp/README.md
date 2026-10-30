@@ -107,13 +107,22 @@ range types, domains, `ALTER TYPE ... ADD VALUE`; `CREATE` and `ALTER` of
 functions and procedures; renaming and moving to another schema; roles,
 from any database, with `GRANT role`, `ALTER ROLE ... SET`, `REASSIGN
 OWNED` and `DROP OWNED`; `GRANT` and `REVOKE` on objects and databases,
-`ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`.  Commands that cannot run
+`ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`; `CREATE`, `ALTER` and
+`DROP EXTENSION`.  Commands that cannot run
 in a transaction block are sent after the coordinator (see below); other
 statements run on the coordinator only.
 
-What stays on the coordinator: temporary objects, objects of extensions
-and the schema of `gp`; one statement may not mix them with other
-objects.  What is refused: `ALTER TABLE` that computes a column with a
+An extension goes as a whole: the segments run its script themselves, with
+the OIDs of the coordinator, so it must be installed on them in the same
+version, or the statement fails everywhere.  Its objects are then on the
+segments, and DDL on them (`GRANT`, `COMMENT`, `ALTER EXTENSION ... SET
+SCHEMA`) goes there as well.
+
+What stays on the coordinator: temporary objects, extension `gp` with its
+schema and objects; one statement may not mix them with other
+objects.  The segments need no SQL part of `gp`: its tables and functions
+are for the configuration of the cluster, and its settings come with the
+library.  What is refused: `ALTER TABLE` that computes a column with a
 non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
 identity, `ALTER COLUMN TYPE ... USING random()`), as each segment would
 compute its own values.
@@ -162,7 +171,7 @@ ends what they keep of the command, and:
 
 `VACUUM` goes without OIDs, and `VACUUM FULL` lets the segments create
 relations for the rewrite (`gp.allow_local_ddl`, so only for superusers).  A
-list of tables that mixes temporary ones or those of extensions with
+list of tables that mixes temporary ones or those of extension `gp` with
 others is refused; `ANALYZE` is not sent, as the statistics of the cluster
 are for a later step.
 
@@ -258,6 +267,7 @@ start their own clusters:
 | `011_two_phase.pl` | Two-phase commit of DDL, a segment that cannot prepare, a segment lost before `COMMIT PREPARED` |
 | `012_roles.pl` | Roles, privileges, comments and owners on the segments |
 | `013_nonxact.pl` | `CREATE DATABASE`, `DROP DATABASE`, `VACUUM` and the `CONCURRENTLY` commands on the segments, and their failures |
+| `014_extension.pl` | Extensions on the segments with the same OIDs: create, update, cascade, move, drop, a failing segment; extension `gp` stays |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -269,10 +279,9 @@ by the patch and `contrib/gp`.
 
 1. **Cluster skeleton** — done: roles, registration, the copy of segments,
    connections, settings of sessions, distribution policies.
-2. **DDL and the same OIDs** — in progress: the same OIDs, propagating DDL
-   with roles, privileges, comments and owners, its two-phase commit and
-   commands that run outside a transaction are done; next is `CREATE
-   EXTENSION` on the segments.
+2. **DDL and the same OIDs** — done: the same OIDs, propagating DDL
+   with roles, privileges, comments and owners, its two-phase commit,
+   commands that run outside a transaction and extensions.
 3. **Placing data and correct SELECT** — routing of `INSERT` and `COPY`,
    plan fragments on segments, every query correct through a gather on the
    coordinator.

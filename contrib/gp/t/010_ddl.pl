@@ -169,11 +169,6 @@ fails(
 	qr/cannot operate on objects of the coordinator and of the cluster at once/,
 	'temporary and other tables are not dropped at once');
 
-run('CREATE EXTENSION hstore');
-is( join(' ', map { $_->safe_psql('postgres', "SELECT to_regtype('hstore') IS NOT NULL") } @segments),
-	'f f',
-	'objects of an extension script stay on the coordinator');
-
 run('SET gp.dispatch_ddl = off; CREATE TABLE s.only_here (a int)');
 is(where('s.only_here'), 'f f', 'gp.dispatch_ddl = off keeps DDL on the coordinator');
 

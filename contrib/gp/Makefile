@@ -28,7 +28,8 @@ NO_INSTALLCHECK = 1
 TAP_TESTS = 1
 
 # Extensions that the TAP tests use
-EXTRA_INSTALL = contrib/hstore src/test/modules/injection_points
+EXTRA_INSTALL = contrib/cube contrib/earthdistance contrib/hstore \
+	src/test/modules/injection_points
 export enable_injection_points
 
 ifdef USE_PGXS
