@@ -21,11 +21,16 @@
 
 #include "access/hash.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "common/hashfn.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -71,6 +76,34 @@ gp_hash_proc(Oid typid)
 }
 
 /*
+ * The bucket of a key among nbuckets: the hashes of its columns combined,
+ * skipping NULLs
+ */
+int
+gp_key_bucket(int nbuckets, int nkeys, const Datum *values, const bool *nulls,
+			  const Oid *types, Oid collation)
+{
+	uint64		hash = 0;
+
+	if (!OidIsValid(collation))
+		collation = DEFAULT_COLLATION_OID;
+
+	for (int i = 0; i < nkeys; i++)
+	{
+		uint64		h;
+
+		if (nulls[i])
+			continue;
+		h = DatumGetUInt64(OidFunctionCall2Coll(gp_hash_proc(types[i]),
+												collation, values[i],
+												UInt64GetDatum(GP_HASH_SEED)));
+		hash = hash_combine64(hash, h);
+	}
+
+	return (int) (hash % (uint64) nbuckets);
+}
+
+/*
  * gp.bucket(nbuckets, VARIADIC key): the bucket of a key among nbuckets
  */
 Datum
@@ -81,8 +114,6 @@ gp_bucket(PG_FUNCTION_ARGS)
 	Oid		   *types;
 	bool	   *nulls;
 	int			nargs;
-	Oid			collation = PG_GET_COLLATION();
-	uint64		hash = 0;
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
@@ -97,22 +128,81 @@ gp_bucket(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("a key has at least one column"));
-	if (!OidIsValid(collation))
-		collation = DEFAULT_COLLATION_OID;
 
-	for (int i = 0; i < nargs; i++)
+	PG_RETURN_INT32(gp_key_bucket(nbuckets, nargs, args, nulls, types,
+								  PG_GET_COLLATION()));
+}
+
+/*
+ * The policy of a distributed table, in the current memory context; false
+ * for a table that is not distributed, or without the extension in the
+ * database.  It reads the policy as the superuser, as a user of the table
+ * need not read the tables of the extension.
+ */
+bool
+gp_policy_get(Oid relid, GpPolicy *policy)
+{
+	const char *sql =
+		"SELECT p.kind, p.key_columns, g.nbuckets, g.map "
+		"FROM gp.distribution_policy p "
+		"LEFT JOIN gp.colocation_groups g "
+		"ON g.colocation_id OPERATOR(pg_catalog.=) p.colocation_id "
+		"WHERE p.relid OPERATOR(pg_catalog.=) $1";
+	Oid			argtypes[1] = {REGCLASSOID};
+	Datum		args[1] = {ObjectIdGetDatum(relid)};
+	MemoryContext callercxt = CurrentMemoryContext;
+	Oid			saved_userid;
+	int			saved_seccontext;
+	bool		found = false;
+
+	if (!OidIsValid(get_extension_oid("gp", true)))
+		return false;
+
+	GetUserIdAndSecContext(&saved_userid, &saved_seccontext);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+						   saved_seccontext | SECURITY_LOCAL_USERID_CHANGE);
+	SPI_connect();
+	if (SPI_execute_with_args(sql, 1, argtypes, args, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the distribution policy");
+
+	if (SPI_processed == 1)
 	{
-		uint64		h;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		TupleDesc	desc = SPI_tuptable->tupdesc;
+		bool		isnull;
+		char	   *kind = TextDatumGetCString(SPI_getbinval(tuple, desc, 1, &isnull));
 
-		if (nulls[i])
-			continue;
-		h = DatumGetUInt64(OidFunctionCall2Coll(gp_hash_proc(types[i]),
-												collation, args[i],
-												UInt64GetDatum(GP_HASH_SEED)));
-		hash = hash_combine64(hash, h);
+		found = true;
+		policy->replicated = strcmp(kind, "replicated") == 0;
+		policy->nkeys = 0;
+		policy->keys = NULL;
+		policy->nbuckets = 0;
+		policy->map = NULL;
+
+		if (!policy->replicated)
+		{
+			Datum	   *elems;
+			int			n;
+
+			deconstruct_array_builtin(DatumGetArrayTypeP(SPI_getbinval(tuple, desc, 2, &isnull)),
+									  INT2OID, &elems, NULL, &n);
+			policy->nkeys = n;
+			policy->keys = MemoryContextAlloc(callercxt, sizeof(AttrNumber) * n);
+			for (int i = 0; i < n; i++)
+				policy->keys[i] = DatumGetInt16(elems[i]);
+
+			policy->nbuckets = DatumGetInt32(SPI_getbinval(tuple, desc, 3, &isnull));
+			deconstruct_array_builtin(DatumGetArrayTypeP(SPI_getbinval(tuple, desc, 4, &isnull)),
+									  INT4OID, &elems, NULL, &n);
+			policy->map = MemoryContextAlloc(callercxt, sizeof(int) * n);
+			for (int i = 0; i < n; i++)
+				policy->map[i] = DatumGetInt32(elems[i]);
+		}
 	}
 
-	PG_RETURN_INT32((int32) (hash % (uint64) nbuckets));
+	SPI_finish();
+	SetUserIdAndSecContext(saved_userid, saved_seccontext);
+	return found;
 }
 
 /*

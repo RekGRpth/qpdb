@@ -641,6 +641,11 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	char	   *oids = NULL;
 	int			mark = 0;
 
+	/* COPY into a distributed table goes to the segments instead */
+	if (IsA(parsetree, CopyStmt) && dispatch_depth == 0 && IsUnderPostmaster &&
+		gp_copy_from(pstmt, queryString, qc))
+		return;
+
 	if (gp_dispatch_ddl && dispatch_depth == 0 && !creating_extension &&
 		IsUnderPostmaster)
 		mode = gp_ddl_dispatched(parsetree);

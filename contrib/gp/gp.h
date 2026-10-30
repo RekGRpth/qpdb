@@ -15,6 +15,9 @@
 #define GP_H
 
 #include "libpq-fe.h"
+#include "access/attnum.h"
+#include "nodes/plannodes.h"
+#include "tcop/cmdtag.h"
 #include "utils/guc.h"
 
 /* Role of the server in the cluster */
@@ -46,10 +49,32 @@ extern int	gp_max_segments;
 extern void gp_segments_init(void);
 extern int	gp_segments_get(GpSegment **segments);
 
+/* How the rows of a distributed table are placed */
+typedef struct GpPolicy
+{
+	bool		replicated;
+	int			nkeys;
+	AttrNumber *keys;			/* key columns */
+	int			nbuckets;
+	int		   *map;			/* segment of each bucket */
+} GpPolicy;
+
+/* distribution.c */
+extern bool gp_policy_get(Oid relid, GpPolicy *policy);
+extern int	gp_key_bucket(int nbuckets, int nkeys, const Datum *values,
+						  const bool *nulls, const Oid *types, Oid collation);
+
+/* copy.c */
+extern bool gp_copy_from(PlannedStmt *pstmt, const char *queryString,
+						 QueryCompletion *qc);
+
 /* dispatch.c */
 extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
+extern int	gp_copy_open(const char *sql, GpSegment **segments);
+extern void gp_copy_send(int segment_id, const char *data, int len);
+extern void gp_copy_close(void);
 
 /* Segments may create objects of their own for a command out of a transaction */
 #define GP_NONXACT_LOCAL_DDL 0x01
