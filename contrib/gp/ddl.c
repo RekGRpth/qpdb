@@ -11,8 +11,11 @@
  * part of the outer statement.
  *
  * Only the statements listed in gp_ddl_dispatched() go to the segments.
- * Temporary objects and objects of extensions stay on the coordinator;
- * roles, which all databases share, go from any database.
+ * Temporary objects and objects of extension gp stay on the coordinator,
+ * where the configuration of the cluster is; the other extensions, which
+ * must be installed on the segments, go as a whole: the segments run the
+ * script of CREATE EXTENSION themselves, with the OIDs of the coordinator.
+ * Roles, which all databases share, go from any database.
  * Statements that compute a column with a non-immutable expression are
  * refused, as each segment would compute its own values.
  *
@@ -77,8 +80,20 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static int	dispatch_depth = 0;
 
 /*
+ * Whether an object is a member of extension gp, which is on the coordinator
+ * only, unlike the other extensions
+ */
+static bool
+gp_is_member_of_gp(Oid classid, Oid objid)
+{
+	Oid			ext = getExtensionOfObject(classid, objid);
+
+	return OidIsValid(ext) && ext == get_extension_oid("gp", true);
+}
+
+/*
  * Whether a relation stays on the coordinator: a temporary one, or one of
- * an extension
+ * extension gp
  */
 static bool
 gp_relation_is_local(const RangeVar *rv)
@@ -92,13 +107,13 @@ gp_relation_is_local(const RangeVar *rv)
 	relid = RangeVarGetRelid(rv, NoLock, true);
 	return OidIsValid(relid) &&
 		(get_rel_persistence(relid) == RELPERSISTENCE_TEMP ||
-		 OidIsValid(getExtensionOfObject(RelationRelationId, relid)));
+		 gp_is_member_of_gp(RelationRelationId, relid));
 }
 
 /*
- * Whether a schema stays on the coordinator: a temporary one, one of an
- * extension, or the schema of extension gp.  CREATE EXTENSION makes the
- * schema of a control file depend on the extension, but not a member of it.
+ * Whether a schema stays on the coordinator: a temporary one, one of
+ * extension gp, or the schema of its control file, which CREATE EXTENSION
+ * makes depend on the extension, but not a member of it.
  */
 static bool
 gp_schema_is_local(const char *name)
@@ -108,7 +123,7 @@ gp_schema_is_local(const char *name)
 
 	return OidIsValid(nspid) &&
 		(isAnyTempNamespace(nspid) ||
-		 OidIsValid(getExtensionOfObject(NamespaceRelationId, nspid)) ||
+		 gp_is_member_of_gp(NamespaceRelationId, nspid) ||
 		 (OidIsValid(gp) && get_extension_schema(gp) == nspid));
 }
 
@@ -142,6 +157,8 @@ gp_object_is_local(ObjectType type, Node *object)
 			}
 		case OBJECT_SCHEMA:
 			return gp_schema_is_local(strVal(object));
+		case OBJECT_EXTENSION:
+			return strcmp(strVal(object), "gp") == 0;
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
 			{
@@ -150,7 +167,7 @@ gp_object_is_local(ObjectType type, Node *object)
 				Oid			typid = LookupTypeNameOid(NULL, typname, true);
 
 				return OidIsValid(typid) &&
-					OidIsValid(getExtensionOfObject(TypeRelationId, typid));
+					gp_is_member_of_gp(TypeRelationId, typid);
 			}
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
@@ -161,7 +178,7 @@ gp_object_is_local(ObjectType type, Node *object)
 														true);
 
 				return OidIsValid(funcid) &&
-					OidIsValid(getExtensionOfObject(ProcedureRelationId, funcid));
+					gp_is_member_of_gp(ProcedureRelationId, funcid);
 			}
 		default:
 			return false;
@@ -188,7 +205,7 @@ gp_objects_dispatched(ObjectType type, List *objects)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("cannot operate on objects of the coordinator and of the cluster at once"),
-				errdetail("Temporary objects and objects of extensions are on the coordinator only."),
+				errdetail("Temporary objects and objects of extension gp are on the coordinator only."),
 				errhint("Use separate commands."));
 	return nlocal == 0;
 }
@@ -319,6 +336,7 @@ gp_drop_dispatched(DropStmt *stmt)
 		case OBJECT_SEQUENCE:
 		case OBJECT_VIEW:
 		case OBJECT_SCHEMA:
+		case OBJECT_EXTENSION:
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
 		case OBJECT_FUNCTION:
@@ -349,6 +367,7 @@ gp_object_type_dispatched(ObjectType type)
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
 		case OBJECT_SCHEMA:
+		case OBJECT_EXTENSION:
 		case OBJECT_ROLE:
 			return true;
 		default:
@@ -483,6 +502,12 @@ gp_ddl_dispatched_xact(Node *parsetree)
 			}
 		case T_GrantStmt:
 			return gp_grant_dispatched((GrantStmt *) parsetree);
+		case T_CreateExtensionStmt:
+			return strcmp(((CreateExtensionStmt *) parsetree)->extname, "gp") != 0;
+		case T_AlterExtensionStmt:
+			return strcmp(((AlterExtensionStmt *) parsetree)->extname, "gp") != 0;
+		case T_AlterExtensionContentsStmt:
+			return strcmp(((AlterExtensionContentsStmt *) parsetree)->extname, "gp") != 0;
 		case T_CreateSchemaStmt:
 		case T_CompositeTypeStmt:
 		case T_CreateEnumStmt:

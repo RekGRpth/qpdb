@@ -61,6 +61,7 @@ tests += {
       't/011_two_phase.pl',
       't/012_roles.pl',
       't/013_nonxact.pl',
+      't/014_extension.pl',
     ],
   },
 }
