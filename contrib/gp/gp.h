@@ -19,6 +19,7 @@
 #include "nodes/plannodes.h"
 #include "tcop/cmdtag.h"
 #include "utils/guc.h"
+#include "utils/relcache.h"
 
 /* Role of the server in the cluster */
 enum
@@ -67,6 +68,16 @@ extern int	gp_key_bucket(int nbuckets, int nkeys, const Datum *values,
 /* copy.c */
 extern bool gp_copy_from(PlannedStmt *pstmt, const char *queryString,
 						 QueryCompletion *qc);
+
+/* route.c */
+typedef struct GpRoute GpRoute;
+extern GpRoute *gp_route_begin(Relation rel, const GpPolicy *policy);
+extern void gp_route_row(GpRoute *route, const Datum *values,
+						 const bool *nulls);
+extern void gp_route_end(GpRoute *route);
+
+/* insert.c */
+extern void gp_insert_init(void);
 
 /* dispatch.c */
 extern void gp_dispatch_init(void);

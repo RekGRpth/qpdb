@@ -8,7 +8,9 @@ OBJS = \
 	dispatch.o \
 	distribution.o \
 	gp.o \
+	insert.o \
 	oids.o \
+	route.o \
 	segments.o
 
 EXTENSION = gp

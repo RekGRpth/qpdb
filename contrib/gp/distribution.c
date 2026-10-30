@@ -155,7 +155,7 @@ gp_policy_get(Oid relid, GpPolicy *policy)
 	int			saved_seccontext;
 	bool		found = false;
 
-	if (!OidIsValid(get_extension_oid("gp", true)))
+	if (creating_extension || !OidIsValid(get_extension_oid("gp", true)))
 		return false;
 
 	GetUserIdAndSecContext(&saved_userid, &saved_seccontext);

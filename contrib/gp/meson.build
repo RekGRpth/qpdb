@@ -7,7 +7,9 @@ gp_sources = files(
   'dispatch.c',
   'distribution.c',
   'gp.c',
+  'insert.c',
   'oids.c',
+  'route.c',
   'segments.c',
 )
 
@@ -64,6 +66,7 @@ tests += {
       't/013_nonxact.pl',
       't/014_extension.pl',
       't/015_copy.pl',
+      't/016_insert.pl',
     ],
   },
 }
