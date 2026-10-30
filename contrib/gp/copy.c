@@ -154,7 +154,7 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 
 	cstate = BeginCopyFrom(pstate, rel, NULL, stmt->filename, stmt->is_program,
 						   NULL, stmt->attlist, stmt->options);
-	route = gp_route_begin(rel, &policy);
+	route = gp_route_begin(rel, &policy, 0);
 
 	estate = CreateExecutorState();
 	econtext = GetPerTupleExprContext(estate);

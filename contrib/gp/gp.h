@@ -71,7 +71,7 @@ extern bool gp_copy_from(PlannedStmt *pstmt, const char *queryString,
 
 /* route.c */
 typedef struct GpRoute GpRoute;
-extern GpRoute *gp_route_begin(Relation rel, const GpPolicy *policy);
+extern GpRoute *gp_route_begin(Relation rel, const GpPolicy *policy, int only);
 extern void gp_route_row(GpRoute *route, const Datum *values,
 						 const bool *nulls);
 extern void gp_route_end(GpRoute *route);
@@ -83,7 +83,7 @@ extern void gp_insert_init(void);
 extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
-extern int	gp_copy_open(const char *sql, GpSegment **segments);
+extern int	gp_copy_open(const char *sql, int only, GpSegment **segments);
 extern void gp_copy_send(int segment_id, const char *data, int len);
 extern void gp_copy_close(void);
 

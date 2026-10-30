@@ -67,6 +67,7 @@ tests += {
       't/014_extension.pl',
       't/015_copy.pl',
       't/016_insert.pl',
+      't/017_direct_dispatch.pl',
     ],
   },
 }

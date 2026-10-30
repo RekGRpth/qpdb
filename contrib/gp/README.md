@@ -233,8 +233,17 @@ Triggers and constraints of the table do not run on the coordinator.
 `RETURNING`, `ON CONFLICT`, row-level security and `WITH CHECK OPTION` are
 refused, rather than the rows lost.  An `INSERT ... SELECT` is as correct as
 its `SELECT`: reading a distributed table on the coordinator gives no rows
-yet.  A row goes through the channel to all segments even when its key is a
-constant, as it does not yet go to one segment alone (*direct dispatch*).
+yet.
+
+When the source is `VALUES` or a `SELECT` without a table, and the key
+columns of every row are constants (a default, a folded expression and a
+`NULL` count), the planner computes their buckets, and if all fall in one
+segment, the plan names it: the rows go to that segment alone, and the
+others are not asked, nor opened (*direct dispatch*, as in Greengage).  The
+buckets stay in the plan, and the executor checks them against the map
+before it relies on the segment.  A key that is a parameter of a prepared
+statement, a function or a column of a source table takes the way to all
+segments.
 
 ## Trying it
 
@@ -312,6 +321,7 @@ start their own clusters:
 | `014_extension.pl` | Extensions on the segments with the same OIDs: create, update, cascade, move, drop, a failing segment; extension `gp` stays |
 | `015_copy.pl` | `COPY FROM` into distributed and replicated tables: placement by bucket, types, transactions, errors, privileges |
 | `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, what is refused, privileges |
+| `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -326,10 +336,10 @@ by the patch and `contrib/gp`.
 2. **DDL and the same OIDs** — done: the same OIDs, propagating DDL
    with roles, privileges, comments and owners, its two-phase commit,
    commands that run outside a transaction and extensions.
-3. **Placing data and correct SELECT** — in progress: `COPY` and `INSERT`
-   into distributed tables are done; next are direct dispatch of `INSERT`
-   with a constant key, plan fragments on segments, every query correct
-   through a gather on the coordinator.
+3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT` and
+   direct dispatch of `INSERT` are done; next are `gp_segment_id()`, plan
+   fragments on segments, every query correct through a gather on the
+   coordinator.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

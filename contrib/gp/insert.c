@@ -12,6 +12,11 @@
  * does, see route.c.  The segments check the constraints and compute the
  * generated columns.  The command tag counts the rows.
  *
+ * If the rows are VALUES whose keys are all constants and fall in one
+ * segment, the plan knows that segment, and the rows go to it alone, the
+ * other segments not being asked at all (direct dispatch).  The buckets of
+ * the keys go in the plan too, to check against the map at execution.
+ *
  * Triggers and constraints of the table do not run on the coordinator;
  * RETURNING, ON CONFLICT, row-level security and WITH CHECK OPTION are
  * refused rather than lost.
@@ -34,6 +39,7 @@
 #include "nodes/value.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 #include "gp.h"
@@ -45,6 +51,8 @@ typedef struct GpInsertState
 	CustomScanState css;
 	Oid			relid;
 	bool		can_set_tag;	/* the rows are counted in the command tag */
+	int			direct_segment; /* all rows go to it, 0 if not known */
+	List	   *direct_buckets; /* the buckets of the rows, for the check */
 	bool		done;
 } GpInsertState;
 
@@ -79,6 +87,7 @@ gp_insert_exec(CustomScanState *node)
 	GpPolicy	policy;
 	GpRoute    *route;
 	int			nsource = 0;
+	int			only = 0;
 
 	if (state->done)
 		return NULL;
@@ -103,7 +112,21 @@ gp_insert_exec(CustomScanState *node)
 			 nsource, RelationGetRelationName(rel),
 			 RelationGetDescr(rel)->natts);
 
-	route = gp_route_begin(rel, &policy);
+	/* The segment of the plan, unless the map is not what the plan saw */
+	if (state->direct_segment != 0 && !policy.replicated)
+	{
+		only = state->direct_segment;
+		foreach_int(bucket, state->direct_buckets)
+		{
+			if (bucket >= policy.nbuckets || policy.map[bucket] != only)
+			{
+				only = 0;
+				break;
+			}
+		}
+	}
+
+	route = gp_route_begin(rel, &policy, only);
 	for (;;)
 	{
 		TupleTableSlot *slot = ExecProcNode(child);
@@ -156,7 +179,101 @@ gp_insert_create_state(CustomScan *cscan)
 	state->css.methods = &gp_insert_exec_methods;
 	state->relid = (Oid) intVal(linitial(cscan->custom_private));
 	state->can_set_tag = boolVal(lsecond(cscan->custom_private));
+	state->direct_buckets = (List *) lthird(cscan->custom_private);
+	state->direct_segment = intVal(lfourth(cscan->custom_private));
 	return (Node *) state;
+}
+
+/*
+ * The constant that a row of the source has for a column of the table, or
+ * NULL if it is not one.  A single row is a Result, of the target list of
+ * the table; the rows of a multi-row VALUES are lists of a ValuesScan, which
+ * the target list refers to.
+ */
+static Const *
+gp_key_const(Plan *source, AttrNumber attno, int row)
+{
+	TargetEntry *tle = get_tle_by_resno(source->targetlist, attno);
+
+	if (tle == NULL)
+		return NULL;
+	if (IsA(tle->expr, Const))
+		return (Const *) tle->expr;
+	if (IsA(source, ValuesScan) && IsA(tle->expr, Var))
+	{
+		Var		   *var = (Var *) tle->expr;
+		ValuesScan *scan = (ValuesScan *) source;
+
+		if (var->varno == scan->scan.scanrelid && var->varlevelsup == 0 &&
+			var->varattno > 0)
+		{
+			Node	   *expr = list_nth(list_nth_node(List, scan->values_lists, row),
+										var->varattno - 1);
+
+			if (IsA(expr, Const))
+				return (Const *) expr;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The segment that all rows of the source go to, if their keys are all
+ * constants and in the same segment, and else 0; the buckets of the rows
+ * go to *buckets.
+ */
+static int
+gp_insert_direct_segment(Oid relid, const GpPolicy *policy, Plan *source,
+						 List **buckets)
+{
+	int			nrows;
+	int			segment = 0;
+	Oid		   *types;
+	Datum	   *values;
+	bool	   *nulls;
+
+	if (policy->replicated || source->qual != NIL)
+		return 0;
+	if (IsA(source, Result))
+	{
+		if (outerPlan(source) != NULL || ((Result *) source)->resconstantqual != NULL)
+			return 0;
+		nrows = 1;
+	}
+	else if (IsA(source, ValuesScan))
+		nrows = list_length(((ValuesScan *) source)->values_lists);
+	else
+		return 0;
+
+	types = palloc_array(Oid, policy->nkeys);
+	values = palloc_array(Datum, policy->nkeys);
+	nulls = palloc_array(bool, policy->nkeys);
+	for (int k = 0; k < policy->nkeys; k++)
+		types[k] = get_atttype(relid, policy->keys[k]);
+
+	for (int row = 0; row < nrows; row++)
+	{
+		int			bucket;
+
+		for (int k = 0; k < policy->nkeys; k++)
+		{
+			Const	   *key = gp_key_const(source, policy->keys[k], row);
+
+			if (key == NULL || key->consttype != types[k])
+				return 0;
+			values[k] = key->constvalue;
+			nulls[k] = key->constisnull;
+		}
+
+		bucket = gp_key_bucket(policy->nbuckets, policy->nkeys, values, nulls,
+							   types, InvalidOid);
+		if (row > 0 && policy->map[bucket] != segment)
+			return 0;
+		segment = policy->map[bucket];
+		*buckets = list_append_unique_int(*buckets, bucket);
+	}
+
+	return segment;
 }
 
 /*
@@ -171,6 +288,8 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 	GpPolicy	policy;
 	Plan	   *source;
 	CustomScan *cscan;
+	List	   *buckets = NIL;
+	int			segment;
 
 	if (!gp_policy_get(rte->relid, &policy))
 		return;
@@ -189,6 +308,7 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 				errmsg("row-level security and WITH CHECK OPTION are not supported on a distributed table"));
 
 	source = outerPlan(mt);
+	segment = gp_insert_direct_segment(rte->relid, &policy, source, &buckets);
 	cscan = makeNode(CustomScan);
 	cscan->scan.plan.startup_cost = mt->plan.startup_cost;
 	cscan->scan.plan.total_cost = mt->plan.total_cost;
@@ -200,8 +320,10 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 	cscan->scan.scanrelid = 0;
 	cscan->custom_plans = list_make1(source);
 	cscan->custom_scan_tlist = source->targetlist;
-	cscan->custom_private = list_make2(makeInteger((int) rte->relid),
-									   makeBoolean(mt->canSetTag));
+	cscan->custom_private = list_make4(makeInteger((int) rte->relid),
+									   makeBoolean(mt->canSetTag),
+									   buckets,
+									   makeInteger(segment));
 	cscan->methods = &gp_insert_plan_methods;
 
 	stmt->planTree = &cscan->scan.plan;
