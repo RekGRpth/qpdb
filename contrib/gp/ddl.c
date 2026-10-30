@@ -502,6 +502,9 @@ gp_ddl_dispatched_xact(Node *parsetree)
 			}
 		case T_GrantStmt:
 			return gp_grant_dispatched((GrantStmt *) parsetree);
+		case T_TruncateStmt:
+			return gp_objects_dispatched(OBJECT_TABLE,
+										 ((TruncateStmt *) parsetree)->relations);
 		case T_CreateExtensionStmt:
 			return strcmp(((CreateExtensionStmt *) parsetree)->extname, "gp") != 0;
 		case T_AlterExtensionStmt:

@@ -329,11 +329,49 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 	stmt->planTree = &cscan->scan.plan;
 }
 
+/*
+ * Refuse what would change a distributed table, and is not sent to the
+ * segments: UPDATE, DELETE and MERGE, which would find no rows on the
+ * coordinator, and a data-modifying statement in WITH, whose rows would stay
+ * there.  Only the INSERT of the statement itself is routed.
+ */
+static void
+gp_check_modifications(Query *parse, bool toplevel)
+{
+	if (parse->resultRelation > 0 &&
+		(parse->commandType == CMD_UPDATE ||
+		 parse->commandType == CMD_DELETE ||
+		 parse->commandType == CMD_MERGE ||
+		 (parse->commandType == CMD_INSERT && !toplevel)))
+	{
+		RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
+		GpPolicy	policy;
+
+		if (gp_policy_get(rte->relid, &policy))
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("%s of a distributed table is not supported yet",
+						   toplevel ? (parse->commandType == CMD_UPDATE ? "UPDATE" :
+									   parse->commandType == CMD_DELETE ? "DELETE" : "MERGE") :
+						   "a data-modifying statement in WITH"));
+	}
+
+	foreach_node(CommonTableExpr, cte, parse->cteList)
+	{
+		Query	   *query = castNode(Query, cte->ctequery);
+
+		gp_check_modifications(query, false);
+	}
+}
+
 static PlannedStmt *
 gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		   ParamListInfo boundParams, ExplainState *es)
 {
 	PlannedStmt *stmt;
+
+	if (IsUnderPostmaster)
+		gp_check_modifications(parse, true);
 
 	if (prev_planner)
 		stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
