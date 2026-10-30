@@ -1,0 +1,85 @@
+# Tests of PostgreSQL on a cluster of contrib/gp, with new tables distributed
+# by their first column.  Many of them differ from the answers of PostgreSQL
+# for now, as the cluster does not support all DDL yet, so the job never fails
+# the workflow: it shows how many tests pass and keeps the diffs.
+
+name: gp-pg-regress
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg-regress:
+    name: PG tests on a cluster
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    container:
+      image: ghcr.io/anarazel/pg-vm-images/main/linux_debian_trixie_ci:latest
+      options: --privileged --pid=host --ipc=host --ulimit memlock=-1:-1
+    env:
+      BUILD_JOBS: 4
+      PREFIX: /home/postgres/install
+      GP_CLUSTER_DIR: /home/postgres/gpc
+      GP_PORT: 19000
+    defaults:
+      run:
+        shell: su postgres -c "bash --noprofile --norc -eo pipefail {0}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          useradd -m postgres
+          chown -R postgres:postgres .
+
+      - name: Configure
+        run: |
+          meson setup \
+            --prefix=$PREFIX \
+            -Dlibdir=lib \
+            -Dcassert=true \
+            -Dinjection_points=true \
+            --buildtype=debug \
+            build
+
+      - name: Build and install
+        run: |
+          ninja -C build -j${BUILD_JOBS} all testprep
+          meson install -C build --no-rebuild
+
+      - name: Start the cluster
+        run: |
+          export PGBIN=$PREFIX/bin LD_LIBRARY_PATH=$PREFIX/lib
+          contrib/gp/tools/gp-cluster.sh init
+          contrib/gp/tools/gp-cluster.sh start
+
+      - name: Run the tests
+        run: |
+          export PGBIN=$PREFIX/bin LD_LIBRARY_PATH=$PREFIX/lib
+          export PG_REGRESS=$PWD/build/src/test/regress/pg_regress
+          export PG_SRC=$PWD/src/test/regress
+          contrib/gp/tools/gp-pg-regress.sh \
+            $(grep -v '^#' contrib/gp/tools/gp-pg-regress.tests) |
+            tee $GP_CLUSTER_DIR/regress.log |
+            grep -E '^not ok|^# [0-9]+ of|tests passed'
+
+      - name: Upload diffs
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.GP_CLUSTER_DIR }}/regress/regression.diffs
+            ${{ env.GP_CLUSTER_DIR }}/regress/regression.out
+            ${{ env.GP_CLUSTER_DIR }}/regress.log
+            ${{ env.GP_CLUSTER_DIR }}/*.log
+          if-no-files-found: ignore

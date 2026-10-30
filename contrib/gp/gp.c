@@ -44,11 +44,18 @@ static const struct config_enum_entry gp_role_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry gp_default_distribution_options[] = {
+	{"coordinator", GP_DEFAULT_COORDINATOR, false},
+	{"first_column", GP_DEFAULT_FIRST_COLUMN, false},
+	{NULL, 0, false}
+};
+
 /* GUC Variables */
 int			gp_role = GP_ROLE_NONE;
 int			gp_segment_id = 0;
 char	   *gp_database = NULL;
 int			gp_max_segments = 64;
+int			gp_default_distribution = GP_DEFAULT_COORDINATOR;
 static char *gp_coordinator = NULL;
 static char *gp_host = NULL;
 static int	gp_register_retry_interval = 5;
@@ -148,6 +155,18 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	DefineCustomEnumVariable("gp.default_distribution",
+							 "Where a new table goes if it is not distributed by hand.",
+							 "With coordinator, it stays on the coordinator; with first_column, it is distributed by its first column that can be a key.",
+							 &gp_default_distribution,
+							 GP_DEFAULT_COORDINATOR,
+							 gp_default_distribution_options,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomStringVariable("gp.dispatch_oids",
 							   "OIDs of the objects of a command from the coordinator.",

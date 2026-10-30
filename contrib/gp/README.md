@@ -103,8 +103,12 @@ coordinator.
 
 What goes to the segments: `CREATE`, `ALTER` and `DROP` of tables, indexes,
 sequences and views; `CREATE SCHEMA` and `DROP SCHEMA`; composite, enum and
-range types, domains, `ALTER TYPE ... ADD VALUE`; `CREATE` and `ALTER` of
-functions and procedures; renaming and moving to another schema; roles,
+range types, domains, `ALTER TYPE ... ADD VALUE`; base and shell types,
+operators, aggregates, casts, collations, conversions, operator classes and
+families, text search objects, transforms and access methods; `CREATE` and
+`ALTER` of functions and procedures, whose bodies the segments do not check
+(`check_function_bodies = off`), as a body may use a temporary table;
+renaming and moving to another schema; roles,
 from any database, with `GRANT role`, `ALTER ROLE ... SET`, `REASSIGN
 OWNED` and `DROP OWNED`; `GRANT` and `REVOKE` on objects and databases,
 `ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`; `CREATE`, `ALTER` and
@@ -118,9 +122,11 @@ version, or the statement fails everywhere.  Its objects are then on the
 segments, and DDL on them (`GRANT`, `COMMENT`, `ALTER EXTENSION ... SET
 SCHEMA`) goes there as well.
 
-What stays on the coordinator: temporary objects, extension `gp` with its
-schema and objects; one statement may not mix them with other
-objects.  The segments need no SQL part of `gp`: its tables and functions
+What stays on the coordinator: temporary objects (functions and types of
+`pg_temp` too), extension `gp` with its schema and objects; one statement may
+not mix them with other objects.  Not sent yet: triggers, rules, policies,
+extended statistics, materialized views, foreign data, event triggers,
+tablespaces, `ALTER DATABASE` and `REINDEX`.  The segments need no SQL part of `gp`: its tables and functions
 are for the configuration of the cluster, and its settings come with the
 library.  What is refused: `ALTER TABLE` that computes a column with a
 non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
@@ -194,6 +200,18 @@ Policies live in each database (`gp.distribution_policy`,
 `gp.colocation_groups`).  An event trigger drops the policy of a dropped
 table.
 
+By default a table stays on the coordinator, empty or not.  `SET
+gp.default_distribution = first_column` (also for a role or a database)
+distributes each new permanent table by its first column that has a hash
+function, a deterministic collation and is not generated, as
+`gp.distribute()` does; a table with no such column stays.  A partition
+goes with its table.  `CREATE TABLE AS` and `SELECT INTO` take three steps
+to make such a table: the table without rows on the coordinator, as `WITH NO
+DATA` makes it; the same table on the segments, with the same OIDs; and the
+rows by `INSERT ... SELECT`.  `CREATE TABLE AS EXECUTE`, a temporary table
+and a materialized view stay on the coordinator, and a statement with
+parameters is refused.
+
 ### COPY into distributed tables (`copy.c`)
 
 The table on the coordinator holds no rows, so `COPY ... FROM` into a
@@ -232,7 +250,9 @@ them by two-phase commit.
 Triggers and constraints of the table do not run on the coordinator.
 `RETURNING`, `ON CONFLICT`, row-level security and `WITH CHECK OPTION` are
 refused, rather than the rows lost.  An `INSERT ... SELECT` takes the rows of
-its `SELECT`, which reads distributed tables as described below.
+its `SELECT`, which reads distributed tables as described below.  As the
+source may read the segments on the very connections that the rows go on,
+`GpInsert` first reads all its rows into a store, and sends them after.
 
 When the source is `VALUES` or a `SELECT` without a table, and the key
 columns of every row are constants (a default, a folded expression and a
@@ -294,6 +314,25 @@ contrib/gp/tools/gp-cluster.sh destroy
 `GP_CLUSTER_DIR`, `GP_PORT` and `GP_SEGMENTS` change the directory
 (`~/gp-cluster`), the first port and the number of segments.
 
+To see where the cluster differs from a server on its own, run tests of
+PostgreSQL on the running cluster, with tables distributed by their first
+column:
+
+```sh
+export PG_REGRESS=/path/to/build/src/test/regress/pg_regress
+contrib/gp/tools/gp-pg-regress.sh test_setup select join aggregates
+```
+
+The diffs are in `$GP_CLUSTER_DIR/regress`.  A test needs the tables of those
+it depends on, as in the schedule, and a cluster that has not run it before:
+run `gp-cluster.sh destroy`, `init` and `start` again between runs.  Not every
+difference is a mistake: tablespaces, non-superusers and the statements listed
+above as not sent are known.
+
+CI runs the tests of `tools/gp-pg-regress.tests` this way weekly and on
+demand (`gp-pg-regress.yml`).  The job does not fail the workflow: it shows
+how many tests pass and keeps the diffs as an artifact.
+
 ## Reference
 
 ### Settings
@@ -313,6 +352,7 @@ All are set at server start unless noted.
 | `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block; superuser |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
+| `gp.default_distribution` | `coordinator` | `first_column` distributes new tables by their first column; settable by a user |
 
 ### Functions
 
@@ -355,6 +395,7 @@ start their own clusters:
 | `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, what is refused, privileges |
 | `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
 | `018_gather.pl` | `SELECT` from distributed tables against the same rows in ordinary tables: aggregates, joins, windows, rescans, replicated and partitioned tables, types, own writes, privileges, what is refused |
+| `019_default_distribution.pl` | `gp.default_distribution`: the key of a new table, partitions, temporary tables, `CREATE TABLE AS`, `SELECT INTO`, a database's setting |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -370,9 +411,11 @@ by the patch and `contrib/gp`.
    with roles, privileges, comments and owners, its two-phase commit,
    commands that run outside a transaction and extensions.
 3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT`,
-   direct dispatch of `INSERT` and `SELECT` through a gather are done; next
-   are `gp_segment_id()`, stable functions of time on the coordinator, and
-   tests against a vanilla server.
+   direct dispatch of `INSERT` and `SELECT` through a gather are done, and
+   tests of PostgreSQL run on the cluster; next are `gp_segment_id()`,
+   stable functions of time on the coordinator, the gaps that those tests
+   show (`DDL` in savepoints, materialized views, non-superusers,
+   tablespaces) and a comparison with a vanilla server.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

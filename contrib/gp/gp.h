@@ -30,6 +30,13 @@ enum
 	GP_ROLE_SEGMENT,
 };
 
+/* Where a table made by CREATE TABLE goes, if it is not distributed by hand */
+enum
+{
+	GP_DEFAULT_COORDINATOR,		/* it stays on the coordinator */
+	GP_DEFAULT_FIRST_COLUMN,	/* it is distributed by its first column that can be a key */
+};
+
 /* Longest host of a segment, with the terminating zero */
 #define GP_HOST_LEN 256
 
@@ -46,6 +53,7 @@ extern int	gp_role;
 extern int	gp_segment_id;
 extern char *gp_database;
 extern int	gp_max_segments;
+extern int	gp_default_distribution;
 
 /* segments.c */
 extern void gp_segments_init(void);
@@ -63,6 +71,7 @@ typedef struct GpPolicy
 
 /* distribution.c */
 extern bool gp_policy_get(Oid relid, GpPolicy *policy);
+extern void gp_distribute_by_default(Oid relid);
 extern int	gp_key_bucket(int nbuckets, int nkeys, const Datum *values,
 						  const bool *nulls, const Oid *types, Oid collation);
 

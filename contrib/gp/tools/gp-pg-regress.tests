@@ -1,0 +1,23 @@
+# Tests of PostgreSQL that gp-pg-regress.sh runs on a cluster in CI, in the
+# order of the schedule, which they depend on; blank and # lines are skipped.
+test_setup boolean char name varchar text int2 int4 int8 oid float4 float8
+bit numeric date time timetz timestamp timestamptz interval inet horology
+create_function_c create_misc create_operator create_procedure create_table
+create_type create_schema create_index create_view create_function_sql
+select_into portals update delete prepared_xacts brin gin gist spgist
+privileges init_privs security_label collate matview lock replica_identity
+rowsecurity object_address tablesample groupingsets drop_operator password
+identity generated_stored join_hash create_table_like alter_generic
+alter_operator misc async dbsize merge misc_functions sysviews tsrf tid
+tidscan tidrangescan incremental_sort create_role without_overlaps
+generated_virtual rules psql amutils stats_ext select_views foreign_key
+dependency guc bitmapops combocid tsearch tsdicts foreign_data window xmlmap
+functional_deps advisory_lock indirect_toast equivclass json jsonb
+json_encoding jsonpath jsonb_jsonpath sqljson plancache limit plpgsql copy2
+temp domain rangefuncs prepare conversion truncate alter_table sequence
+polymorphism rowtypes returning largeobject with xml partition_join
+partition_prune reloptions hash_part indexing partition_aggregate
+partition_info tuplesort explain memoize predicate eager_aggregate
+planner_est cluster select subselect union case join aggregates arrays
+btree_index hash_index insert copy copyselect copydml insert_conflict
+typed_table vacuum updatable_views
