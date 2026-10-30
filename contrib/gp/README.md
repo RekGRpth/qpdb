@@ -107,16 +107,16 @@ range types, domains, `ALTER TYPE ... ADD VALUE`; `CREATE` and `ALTER` of
 functions and procedures; renaming and moving to another schema; roles,
 from any database, with `GRANT role`, `ALTER ROLE ... SET`, `REASSIGN
 OWNED` and `DROP OWNED`; `GRANT` and `REVOKE` on objects and databases,
-`ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`.  Commands that run
-outside a transaction are yet to come; other statements run on the
-coordinator only.
+`ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`.  Commands that cannot run
+in a transaction block are sent after the coordinator (see below); other
+statements run on the coordinator only.
 
 What stays on the coordinator: temporary objects, objects of extensions
 and the schema of `gp`; one statement may not mix them with other
 objects.  What is refused: `ALTER TABLE` that computes a column with a
 non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
 identity, `ALTER COLUMN TYPE ... USING random()`), as each segment would
-compute its own values; and `CREATE INDEX CONCURRENTLY`.
+compute its own values.
 
 The segments run DDL in transactions that follow the transaction of the
 coordinator: the first statement opens one, and the end of the transaction
@@ -136,6 +136,35 @@ warns.  Until recovery comes, resolve it by hand: `pg_xact_status('<xid>')`
 on the coordinator tells whether to run `COMMIT PREPARED 'gp_<xid>'` or
 `ROLLBACK PREPARED 'gp_<xid>'` on the segment; `pg_prepared_xacts` there
 lists such transactions.
+
+#### Commands outside a transaction
+
+`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`
+and `DROP INDEX CONCURRENTLY` cannot run in a transaction block, so the
+coordinator runs them first and then all segments at once, each in a
+transaction of its own.  Two-phase commit does not cover them.  The
+coordinator is the first to run them, as it gives the OIDs of `CREATE
+DATABASE` and `CREATE INDEX CONCURRENTLY`.  A segment gets them by `SET
+gp.dispatch_oids` in the session, with `gp.dispatch_oids_session` on, in a
+command of its own, and both are reset after.
+
+When a segment fails, the connections to the segments are closed, which
+ends what they keep of the command, and:
+
+- `CREATE DATABASE` is dropped on the segments where it succeeded, and the
+  coordinator rolls back; its directory of files may stay there.
+- `DROP DATABASE` has removed the files on the coordinator already, so a
+  failure on a segment is a `WARNING`.  Run `DROP DATABASE IF EXISTS` again
+  to finish.
+- `CREATE INDEX CONCURRENTLY` leaves the index on the coordinator and the
+  segments that built it, and an invalid one where it failed.  Drop it with
+  `DROP INDEX`.
+
+`VACUUM` goes without OIDs, and `VACUUM FULL` lets the segments create
+relations for the rewrite (`gp.allow_local_ddl`, so only for superusers).  A
+list of tables that mixes temporary ones or those of extensions with
+others is refused; `ANALYZE` is not sent, as the statistics of the cluster
+are for a later step.
 
 ### Distribution (`distribution.c`)
 
@@ -190,6 +219,7 @@ All are set at server start unless noted.
 | `gp.register_retry_interval` | 5s | Time between attempts of a segment to register |
 | `gp.max_segments` | 64 | Size of the copy of `gp.segments` on the coordinator |
 | `gp.dispatch_oids` | | OIDs of a command from the coordinator; superuser, set per command |
+| `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block; superuser |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
 
@@ -227,6 +257,7 @@ start their own clusters:
 | `010_ddl.pl` | DDL of the coordinator on the segments: statements, transactions, what stays, what is refused |
 | `011_two_phase.pl` | Two-phase commit of DDL, a segment that cannot prepare, a segment lost before `COMMIT PREPARED` |
 | `012_roles.pl` | Roles, privileges, comments and owners on the segments |
+| `013_nonxact.pl` | `CREATE DATABASE`, `DROP DATABASE`, `VACUUM` and the `CONCURRENTLY` commands on the segments, and their failures |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -239,8 +270,9 @@ by the patch and `contrib/gp`.
 1. **Cluster skeleton** — done: roles, registration, the copy of segments,
    connections, settings of sessions, distribution policies.
 2. **DDL and the same OIDs** — in progress: the same OIDs, propagating DDL
-   with roles, privileges, comments and owners, and its two-phase commit are
-   done; next are commands that run outside a transaction.
+   with roles, privileges, comments and owners, its two-phase commit and
+   commands that run outside a transaction are done; next is `CREATE
+   EXTENSION` on the segments.
 3. **Placing data and correct SELECT** — routing of `INSERT` and `COPY`,
    plan fragments on segments, every query correct through a gather on the
    coordinator.
