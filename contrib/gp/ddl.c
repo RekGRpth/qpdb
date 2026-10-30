@@ -11,7 +11,8 @@
  * part of the outer statement.
  *
  * Only the statements listed in gp_ddl_dispatched() go to the segments.
- * Temporary objects and objects of extensions stay on the coordinator.
+ * Temporary objects and objects of extensions stay on the coordinator;
+ * roles, which all databases share, go from any database.
  * Statements that compute a column with a non-immutable expression are
  * refused, as each segment would compute its own values.
  *
@@ -30,14 +31,19 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_expr.h"
+#include "parser/parse_func.h"
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_type.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -78,6 +84,104 @@ gp_relation_is_local(const RangeVar *rv)
 	return OidIsValid(relid) &&
 		(get_rel_persistence(relid) == RELPERSISTENCE_TEMP ||
 		 OidIsValid(getExtensionOfObject(RelationRelationId, relid)));
+}
+
+/*
+ * Whether a schema stays on the coordinator: a temporary one, one of an
+ * extension, or the schema of extension gp.  CREATE EXTENSION makes the
+ * schema of a control file depend on the extension, but not a member of it.
+ */
+static bool
+gp_schema_is_local(const char *name)
+{
+	Oid			nspid = get_namespace_oid(name, true);
+	Oid			gp = get_extension_oid("gp", true);
+
+	return OidIsValid(nspid) &&
+		(isAnyTempNamespace(nspid) ||
+		 OidIsValid(getExtensionOfObject(NamespaceRelationId, nspid)) ||
+		 (OidIsValid(gp) && get_extension_schema(gp) == nspid));
+}
+
+/*
+ * Whether an object, as a statement names it, stays on the coordinator.
+ * Objects that do not exist do not: the statement fails anyway.
+ */
+static bool
+gp_object_is_local(ObjectType type, Node *object)
+{
+	if (object == NULL)
+		return false;
+	if (IsA(object, RangeVar))
+		return gp_relation_is_local((RangeVar *) object);
+
+	switch (type)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_SEQUENCE:
+		case OBJECT_VIEW:
+			return gp_relation_is_local(makeRangeVarFromNameList(castNode(List, object)));
+		case OBJECT_COLUMN:
+		case OBJECT_TABCONSTRAINT:
+			{
+				/* The name of the relation, then of the column */
+				List	   *names = castNode(List, object);
+				List	   *relname = list_copy_head(names, list_length(names) - 1);
+
+				return gp_relation_is_local(makeRangeVarFromNameList(relname));
+			}
+		case OBJECT_SCHEMA:
+			return gp_schema_is_local(strVal(object));
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			{
+				TypeName   *typname = IsA(object, TypeName) ? (TypeName *) object :
+					makeTypeNameFromNameList(castNode(List, object));
+				Oid			typid = LookupTypeNameOid(NULL, typname, true);
+
+				return OidIsValid(typid) &&
+					OidIsValid(getExtensionOfObject(TypeRelationId, typid));
+			}
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			{
+				Oid			funcid = LookupFuncWithArgs(type,
+														castNode(ObjectWithArgs, object),
+														true);
+
+				return OidIsValid(funcid) &&
+					OidIsValid(getExtensionOfObject(ProcedureRelationId, funcid));
+			}
+		default:
+			return false;
+	}
+}
+
+/*
+ * Whether a statement on several objects goes to the segments: none of
+ * them stays on the coordinator.  Objects of both kinds are an error.
+ */
+static bool
+gp_objects_dispatched(ObjectType type, List *objects)
+{
+	int			nlocal = 0;
+	ListCell   *lc;
+
+	foreach(lc, objects)
+	{
+		if (gp_object_is_local(type, lfirst(lc)))
+			nlocal++;
+	}
+
+	if (nlocal > 0 && nlocal < list_length(objects))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot operate on objects of the coordinator and of the cluster at once"),
+				errdetail("Temporary objects and objects of extensions are on the coordinator only."),
+				errhint("Use separate commands."));
+	return nlocal == 0;
 }
 
 /*
@@ -199,9 +303,6 @@ gp_check_alter_table(AlterTableStmt *stmt)
 static bool
 gp_drop_dispatched(DropStmt *stmt)
 {
-	int			nlocal = 0;
-	ListCell   *lc;
-
 	switch (stmt->removeType)
 	{
 		case OBJECT_TABLE:
@@ -210,39 +311,17 @@ gp_drop_dispatched(DropStmt *stmt)
 		case OBJECT_VIEW:
 			if (stmt->concurrent)
 				gp_ddl_unsupported("DROP INDEX CONCURRENTLY");
-			foreach(lc, stmt->objects)
-			{
-				if (gp_relation_is_local(makeRangeVarFromNameList(lfirst(lc))))
-					nlocal++;
-			}
-			break;
+			pg_fallthrough;
 		case OBJECT_SCHEMA:
-			foreach(lc, stmt->objects)
-			{
-				Oid			nspid = get_namespace_oid(strVal(lfirst(lc)), true);
-
-				if (OidIsValid(nspid) &&
-					OidIsValid(getExtensionOfObject(NamespaceRelationId, nspid)))
-					nlocal++;
-			}
-			break;
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
-			return true;
+			return gp_objects_dispatched(stmt->removeType, stmt->objects);
 		default:
 			return false;
 	}
-
-	if (nlocal > 0 && nlocal < list_length(stmt->objects))
-		ereport(ERROR,
-				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				errmsg("cannot drop objects of the coordinator and of the cluster at once"),
-				errdetail("Temporary objects and objects of extensions are on the coordinator only."),
-				errhint("Drop them in separate commands."));
-	return nlocal == 0;
 }
 
 /* Object types that rename and set schema go to the segments for */
@@ -264,10 +343,49 @@ gp_object_type_dispatched(ObjectType type)
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
 		case OBJECT_SCHEMA:
+		case OBJECT_ROLE:
 			return true;
 		default:
 			return false;
 	}
+}
+
+/*
+ * Whether GRANT or REVOKE on objects goes to the segments
+ */
+static bool
+gp_grant_dispatched(GrantStmt *stmt)
+{
+	switch (stmt->objtype)
+	{
+		case OBJECT_TABLE:
+		case OBJECT_SEQUENCE:
+		case OBJECT_SCHEMA:
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+		case OBJECT_FUNCTION:
+		case OBJECT_PROCEDURE:
+		case OBJECT_ROUTINE:
+			break;
+		case OBJECT_DATABASE:
+		case OBJECT_LANGUAGE:
+		case OBJECT_PARAMETER_ACL:
+			return true;
+		default:
+			return false;
+	}
+
+	/* ALL ... IN SCHEMA names schemas */
+	if (stmt->targtype == ACL_TARGET_ALL_IN_SCHEMA)
+		return gp_objects_dispatched(OBJECT_SCHEMA, stmt->objects);
+	return gp_objects_dispatched(stmt->objtype, stmt->objects);
+}
+
+/* Object types that COMMENT and OWNER TO go to the segments for */
+static bool
+gp_comment_type_dispatched(ObjectType type)
+{
+	return gp_object_type_dispatched(type) || type == OBJECT_DATABASE;
 }
 
 /*
@@ -312,18 +430,43 @@ gp_ddl_dispatched(Node *parsetree)
 			{
 				RenameStmt *stmt = (RenameStmt *) parsetree;
 
-				return gp_object_type_dispatched(stmt->renameType) &&
-					(stmt->relation == NULL ||
-					 !gp_relation_is_local(stmt->relation));
+				if (!gp_object_type_dispatched(stmt->renameType))
+					return false;
+				if (stmt->relation != NULL)
+					return !gp_relation_is_local(stmt->relation);
+				if (stmt->renameType == OBJECT_SCHEMA)
+					return !gp_schema_is_local(stmt->subname);
+				return !gp_object_is_local(stmt->renameType, stmt->object);
 			}
 		case T_AlterObjectSchemaStmt:
 			{
 				AlterObjectSchemaStmt *stmt = (AlterObjectSchemaStmt *) parsetree;
 
-				return gp_object_type_dispatched(stmt->objectType) &&
-					(stmt->relation == NULL ||
-					 !gp_relation_is_local(stmt->relation));
+				if (!gp_object_type_dispatched(stmt->objectType))
+					return false;
+				if (stmt->relation != NULL)
+					return !gp_relation_is_local(stmt->relation);
+				return !gp_object_is_local(stmt->objectType, stmt->object);
 			}
+		case T_AlterOwnerStmt:
+			{
+				AlterOwnerStmt *stmt = (AlterOwnerStmt *) parsetree;
+
+				if (!gp_comment_type_dispatched(stmt->objectType))
+					return false;
+				if (stmt->relation != NULL)
+					return !gp_relation_is_local(stmt->relation);
+				return !gp_object_is_local(stmt->objectType, stmt->object);
+			}
+		case T_CommentStmt:
+			{
+				CommentStmt *stmt = (CommentStmt *) parsetree;
+
+				return gp_comment_type_dispatched(stmt->objtype) &&
+					!gp_object_is_local(stmt->objtype, stmt->object);
+			}
+		case T_GrantStmt:
+			return gp_grant_dispatched((GrantStmt *) parsetree);
 		case T_CreateSchemaStmt:
 		case T_CompositeTypeStmt:
 		case T_CreateEnumStmt:
@@ -332,6 +475,14 @@ gp_ddl_dispatched(Node *parsetree)
 		case T_CreateDomainStmt:
 		case T_CreateFunctionStmt:
 		case T_AlterFunctionStmt:
+		case T_CreateRoleStmt:
+		case T_AlterRoleStmt:
+		case T_AlterRoleSetStmt:
+		case T_DropRoleStmt:
+		case T_GrantRoleStmt:
+		case T_ReassignOwnedStmt:
+		case T_DropOwnedStmt:
+		case T_AlterDefaultPrivilegesStmt:
 			return true;
 		default:
 			return false;
