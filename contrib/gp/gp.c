@@ -218,6 +218,7 @@ _PG_init(void)
 		gp_segments_init();
 		gp_dispatch_init();
 		gp_ddl_init();
+		gp_insert_init();
 	}
 
 	gp_oids_init();

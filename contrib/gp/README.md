@@ -216,6 +216,26 @@ A failure of a row on a segment, or in the input, fails the statement
 everywhere.  The hook does not call the hooks that were set before it for
 such a `COPY`.
 
+### INSERT into distributed tables (`insert.c`, `route.c`)
+
+The planner hook takes the plan of an `INSERT` into a distributed table
+that the standard planner has made, and puts a custom scan, `GpInsert`, in
+place of the `ModifyTable` on top.  The source of the rows stays as it is:
+`VALUES`, a `SELECT`, `DEFAULT VALUES`, the defaults of the columns and the
+functions in them run on the coordinator, so `now()` and `nextval()` give
+one value for all segments.  `GpInsert` takes each row, finds the segment
+of its bucket, and sends it as `COPY` does (`route.c` is what the two share).
+The segments check the constraints and compute the generated columns.  The
+command tag counts the rows, and the transaction of the coordinator covers
+them by two-phase commit.
+
+Triggers and constraints of the table do not run on the coordinator.
+`RETURNING`, `ON CONFLICT`, row-level security and `WITH CHECK OPTION` are
+refused, rather than the rows lost.  An `INSERT ... SELECT` is as correct as
+its `SELECT`: reading a distributed table on the coordinator gives no rows
+yet.  A row goes through the channel to all segments even when its key is a
+constant, as it does not yet go to one segment alone (*direct dispatch*).
+
 ## Trying it
 
 Build the tree with Meson or make; `contrib/gp` is built with the rest.
@@ -291,6 +311,7 @@ start their own clusters:
 | `013_nonxact.pl` | `CREATE DATABASE`, `DROP DATABASE`, `VACUUM` and the `CONCURRENTLY` commands on the segments, and their failures |
 | `014_extension.pl` | Extensions on the segments with the same OIDs: create, update, cascade, move, drop, a failing segment; extension `gp` stays |
 | `015_copy.pl` | `COPY FROM` into distributed and replicated tables: placement by bucket, types, transactions, errors, privileges |
+| `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, what is refused, privileges |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -305,9 +326,10 @@ by the patch and `contrib/gp`.
 2. **DDL and the same OIDs** — done: the same OIDs, propagating DDL
    with roles, privileges, comments and owners, its two-phase commit,
    commands that run outside a transaction and extensions.
-3. **Placing data and correct SELECT** — in progress: `COPY` into
-   distributed tables is done; next are `INSERT ... VALUES`, plan fragments
-   on segments, every query correct through a gather on the coordinator.
+3. **Placing data and correct SELECT** — in progress: `COPY` and `INSERT`
+   into distributed tables are done; next are direct dispatch of `INSERT`
+   with a constant key, plan fragments on segments, every query correct
+   through a gather on the coordinator.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

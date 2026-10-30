@@ -48,12 +48,6 @@
 
 #include "gp.h"
 
-/* A buffer of a segment is sent when it grows to this size */
-#define GP_COPY_FLUSH 65536
-
-/* Header of the binary format: the signature, then no flags and no extension */
-static const char binary_signature[11] = "PGCOPY\n\377\r\n\0";
-
 /*
  * The checks that DoCopy() makes of a COPY FROM: files and programs,
  * privileges on the columns, row-level security
@@ -132,24 +126,11 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	Relation	rel;
 	GpPolicy	policy;
 	ParseState *pstate;
-	TupleDesc	tupDesc;
 	int			natts;
-	int			nsend = 0;
-	int		   *sendatt;
-	FmgrInfo   *sendfn;
-	StringInfoData collist;
-	Oid		   *keytypes;
-	Datum	   *keyvalues;
-	bool	   *keynulls;
-	char	   *copysql;
 	CopyFromState cstate;
 	EState	   *estate;
 	ExprContext *econtext;
-	GpSegment  *segments;
-	int			nsegments;
-	int		   *bucket_pos = NULL;
-	StringInfoData *buffers;
-	StringInfoData tuple;
+	GpRoute    *route;
 	Datum	   *values;
 	bool	   *nulls;
 	uint64		processed = 0;
@@ -169,77 +150,11 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	pstate->p_sourcetext = queryString;
 	gp_copy_check(pstate, stmt, rel);
 
-	tupDesc = RelationGetDescr(rel);
-	natts = tupDesc->natts;
-
-	/* The columns that go to the segments; they compute the generated ones */
-	sendatt = palloc_array(int, natts);
-	sendfn = palloc_array(FmgrInfo, natts);
-	initStringInfo(&collist);
-	for (int i = 0; i < natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(tupDesc, i);
-		Oid			sendoid;
-		bool		isvarlena;
-
-		if (att->attisdropped || att->attgenerated)
-			continue;
-		getTypeBinaryOutputInfo(att->atttypid, &sendoid, &isvarlena);
-		fmgr_info(sendoid, &sendfn[nsend]);
-		sendatt[nsend++] = i;
-		appendStringInfo(&collist, "%s%s", collist.len > 0 ? ", " : "",
-						 quote_identifier(NameStr(att->attname)));
-	}
-	copysql = psprintf("COPY %s (%s) FROM STDIN (FORMAT binary)",
-					   quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-												  RelationGetRelationName(rel)),
-					   collist.data);
-
-	keytypes = palloc_array(Oid, Max(policy.nkeys, 1));
-	keyvalues = palloc_array(Datum, Max(policy.nkeys, 1));
-	keynulls = palloc_array(bool, Max(policy.nkeys, 1));
-	for (int k = 0; k < policy.nkeys; k++)
-		keytypes[k] = TupleDescAttr(tupDesc, policy.keys[k] - 1)->atttypid;
+	natts = RelationGetDescr(rel)->natts;
 
 	cstate = BeginCopyFrom(pstate, rel, NULL, stmt->filename, stmt->is_program,
 						   NULL, stmt->attlist, stmt->options);
-
-	nsegments = gp_copy_open(copysql, &segments);
-	if (nsegments == 0)
-		ereport(ERROR,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("the cluster has no segments"));
-
-	/* The segment of each bucket, as a position in segments */
-	if (!policy.replicated)
-	{
-		bucket_pos = palloc_array(int, policy.nbuckets);
-		for (int b = 0; b < policy.nbuckets; b++)
-		{
-			int			pos = -1;
-
-			for (int i = 0; i < nsegments && pos < 0; i++)
-				if (segments[i].segment_id == policy.map[b])
-					pos = i;
-			if (pos < 0)
-				ereport(ERROR,
-						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("bucket %d of table \"%s\" is on segment %d, which is not registered",
-							   b, RelationGetRelationName(rel), policy.map[b]));
-			bucket_pos[b] = pos;
-		}
-	}
-
-	buffers = palloc_array(StringInfoData, nsegments);
-	for (int i = 0; i < nsegments; i++)
-	{
-		initStringInfo(&buffers[i]);
-		appendBinaryStringInfo(&buffers[i], binary_signature,
-							   sizeof(binary_signature));
-		pq_sendint32(&buffers[i], 0);	/* flags */
-		pq_sendint32(&buffers[i], 0);	/* length of the header extension */
-	}
-	initStringInfo(&tuple);
+	route = gp_route_begin(rel, &policy);
 
 	estate = CreateExecutorState();
 	econtext = GetPerTupleExprContext(estate);
@@ -254,8 +169,6 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 	for (;;)
 	{
 		MemoryContext oldcontext;
-		int			first;
-		int			last;
 
 		CHECK_FOR_INTERRUPTS();
 		ResetPerTupleExprContext(estate);
@@ -267,51 +180,7 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 			break;
 		}
 
-		/* The row in the binary format */
-		resetStringInfo(&tuple);
-		pq_sendint16(&tuple, nsend);
-		for (int k = 0; k < nsend; k++)
-		{
-			int			i = sendatt[k];
-
-			if (nulls[i])
-				pq_sendint32(&tuple, (uint32) -1);
-			else
-			{
-				bytea	   *data = SendFunctionCall(&sendfn[k], values[i]);
-
-				pq_sendint32(&tuple, VARSIZE_ANY_EXHDR(data));
-				pq_sendbytes(&tuple, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data));
-			}
-		}
-
-		if (policy.replicated)
-		{
-			first = 0;
-			last = nsegments - 1;
-		}
-		else
-		{
-			for (int k = 0; k < policy.nkeys; k++)
-			{
-				keyvalues[k] = values[policy.keys[k] - 1];
-				keynulls[k] = nulls[policy.keys[k] - 1];
-			}
-			first = last = bucket_pos[gp_key_bucket(policy.nbuckets, policy.nkeys,
-													keyvalues, keynulls, keytypes,
-													InvalidOid)];
-		}
-
-		for (int i = first; i <= last; i++)
-		{
-			appendBinaryStringInfo(&buffers[i], tuple.data, tuple.len);
-			if (buffers[i].len >= GP_COPY_FLUSH)
-			{
-				gp_copy_send(segments[i].segment_id, buffers[i].data,
-							 buffers[i].len);
-				resetStringInfo(&buffers[i]);
-			}
-		}
+		gp_route_row(route, values, nulls);
 
 		MemoryContextSwitchTo(oldcontext);
 		processed++;
@@ -319,12 +188,7 @@ gp_copy_from(PlannedStmt *pstmt, const char *queryString, QueryCompletion *qc)
 
 	error_context_stack = errcallback.previous;
 
-	for (int i = 0; i < nsegments; i++)
-	{
-		pq_sendint16(&buffers[i], (uint16) -1);	/* the trailer */
-		gp_copy_send(segments[i].segment_id, buffers[i].data, buffers[i].len);
-	}
-	gp_copy_close();
+	gp_route_end(route);
 
 	EndCopyFrom(cstate);
 	FreeExecutorState(estate);
