@@ -41,6 +41,7 @@
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/tuplestore.h"
 
 #include "gp.h"
 
@@ -86,6 +87,8 @@ gp_insert_exec(CustomScanState *node)
 	Relation	rel;
 	GpPolicy	policy;
 	GpRoute    *route;
+	Tuplestorestate *buffer;
+	TupleTableSlot *bslot;
 	int			nsource = 0;
 	int			only = 0;
 
@@ -126,25 +129,39 @@ gp_insert_exec(CustomScanState *node)
 		}
 	}
 
-	route = gp_route_begin(rel, &policy, only);
+	/*
+	 * The rows of the source first: it may read the segments itself, on the
+	 * connections that the rows are going to be sent on
+	 */
+	buffer = tuplestore_begin_heap(false, false, work_mem);
 	for (;;)
 	{
 		TupleTableSlot *slot = ExecProcNode(child);
-		MemoryContext oldcontext;
 
 		if (TupIsNull(slot))
 			break;
-		slot_getallattrs(slot);
+		tuplestore_puttupleslot(buffer, slot);
+	}
+	bslot = MakeSingleTupleTableSlot(ExecGetResultType(child), &TTSOpsMinimalTuple);
+
+	route = gp_route_begin(rel, &policy, only);
+	while (tuplestore_gettupleslot(buffer, true, false, bslot))
+	{
+		MemoryContext oldcontext;
+
+		slot_getallattrs(bslot);
 
 		ResetExprContext(econtext);
 		oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-		gp_route_row(route, slot->tts_values, slot->tts_isnull);
+		gp_route_row(route, bslot->tts_values, bslot->tts_isnull);
 		MemoryContextSwitchTo(oldcontext);
 
 		if (state->can_set_tag)
 			estate->es_processed++;
 	}
 	gp_route_end(route);
+	ExecDropSingleTupleTableSlot(bslot);
+	tuplestore_end(buffer);
 
 	table_close(rel, NoLock);
 	return NULL;

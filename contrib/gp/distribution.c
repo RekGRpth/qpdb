@@ -20,9 +20,12 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "access/relation.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
@@ -37,6 +40,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "gp.h"
@@ -158,11 +162,22 @@ gp_policy_load(Oid relid, GpPolicy *policy)
 	Oid			saved_userid;
 	int			saved_seccontext;
 	bool		found = false;
+	bool		fresh;
 
 	GetUserIdAndSecContext(&saved_userid, &saved_seccontext);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
 						   saved_seccontext | SECURITY_LOCAL_USERID_CHANGE);
 	SPI_connect();
+
+	/*
+	 * The snapshot of the statement may be older than the policy that the
+	 * same transaction has just made, when a function plans its next
+	 * statement: it makes a table and fills it.  A parallel operation cannot
+	 * take a snapshot, and writes nothing.
+	 */
+	fresh = !IsInParallelMode();
+	if (fresh)
+		PushActiveSnapshot(GetLatestSnapshot());
 	if (SPI_execute_with_args(sql, 1, argtypes, args, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the distribution policy");
 
@@ -201,6 +216,8 @@ gp_policy_load(Oid relid, GpPolicy *policy)
 		}
 	}
 
+	if (fresh)
+		PopActiveSnapshot();
 	SPI_finish();
 	SetUserIdAndSecContext(saved_userid, saved_seccontext);
 	return found;
@@ -358,6 +375,62 @@ gp_policy_changed(PG_FUNCTION_ARGS)
 {
 	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
 	PG_RETURN_VOID();
+}
+
+/*
+ * Distribute a new table by its first column that can be a key: one with a
+ * hash function that is not generated and does not have a nondeterministic
+ * collation.  A table without such a column stays on the coordinator.  It
+ * is what gp.default_distribution = first_column wants of CREATE TABLE.
+ */
+void
+gp_distribute_by_default(Oid relid)
+{
+	const char *sql = "SELECT gp.distribute($1, ARRAY[$2::pg_catalog.name])";
+	Oid			argtypes[2] = {REGCLASSOID, TEXTOID};
+	Datum		args[2];
+	Relation	rel;
+	TupleDesc	tupdesc;
+	char	   *column = NULL;
+	Oid			saved_userid;
+	int			saved_seccontext;
+
+	if (creating_extension || !OidIsValid(get_extension_oid("gp", true)))
+		return;
+
+	rel = relation_open(relid, NoLock);
+	tupdesc = RelationGetDescr(rel);
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		for (int i = 0; i < tupdesc->natts && column == NULL; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+			if (att->attisdropped || att->attgenerated ||
+				!OidIsValid(GetDefaultOpClass(att->atttypid, HASH_AM_OID)) ||
+				(OidIsValid(att->attcollation) &&
+				 !get_collation_isdeterministic(att->attcollation)))
+				continue;
+			column = pstrdup(NameStr(att->attname));
+		}
+	}
+	relation_close(rel, NoLock);
+	if (column == NULL)
+		return;
+
+	args[0] = ObjectIdGetDatum(relid);
+	args[1] = CStringGetTextDatum(column);
+
+	/* gp.distribute() is for superusers */
+	GetUserIdAndSecContext(&saved_userid, &saved_seccontext);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+						   saved_seccontext | SECURITY_LOCAL_USERID_CHANGE);
+	SPI_connect();
+	if (SPI_execute_with_args(sql, 2, argtypes, args, NULL, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not distribute the new table");
+	SPI_finish();
+	SetUserIdAndSecContext(saved_userid, saved_seccontext);
 }
 
 /*

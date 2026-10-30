@@ -40,6 +40,7 @@
 #include "access/relation.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
@@ -47,6 +48,7 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
+#include "executor/spi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
@@ -60,6 +62,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 
 #include "gp.h"
 
@@ -89,6 +92,22 @@ gp_is_member_of_gp(Oid classid, Oid objid)
 	Oid			ext = getExtensionOfObject(classid, objid);
 
 	return OidIsValid(ext) && ext == get_extension_oid("gp", true);
+}
+
+static bool gp_schema_is_local(const char *name);
+
+/*
+ * Whether a name that a statement gives to a function or a type has a
+ * schema that stays on the coordinator: pg_temp.f
+ */
+static bool
+gp_names_are_local(List *names)
+{
+	if (list_length(names) < 2)
+		return false;
+	if (strncmp(strVal(linitial(names)), "pg_temp", 7) == 0)
+		return true;
+	return gp_schema_is_local(strVal(linitial(names)));
 }
 
 /*
@@ -164,8 +183,11 @@ gp_object_is_local(ObjectType type, Node *object)
 			{
 				TypeName   *typname = IsA(object, TypeName) ? (TypeName *) object :
 					makeTypeNameFromNameList(castNode(List, object));
-				Oid			typid = LookupTypeNameOid(NULL, typname, true);
+				Oid			typid;
 
+				if (gp_names_are_local(typname->names))
+					return true;
+				typid = LookupTypeNameOid(NULL, typname, true);
 				return OidIsValid(typid) &&
 					gp_is_member_of_gp(TypeRelationId, typid);
 			}
@@ -173,10 +195,12 @@ gp_object_is_local(ObjectType type, Node *object)
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
 			{
-				Oid			funcid = LookupFuncWithArgs(type,
-														castNode(ObjectWithArgs, object),
-														true);
+				ObjectWithArgs *owa = castNode(ObjectWithArgs, object);
+				Oid			funcid;
 
+				if (gp_names_are_local(owa->objname))
+					return true;
+				funcid = LookupFuncWithArgs(type, owa, true);
 				return OidIsValid(funcid) &&
 					gp_is_member_of_gp(ProcedureRelationId, funcid);
 			}
@@ -342,6 +366,19 @@ gp_drop_dispatched(DropStmt *stmt)
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
+		case OBJECT_OPERATOR:
+		case OBJECT_AGGREGATE:
+		case OBJECT_CAST:
+		case OBJECT_COLLATION:
+		case OBJECT_CONVERSION:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+		case OBJECT_TRANSFORM:
+		case OBJECT_ACCESS_METHOD:
+		case OBJECT_TSCONFIGURATION:
+		case OBJECT_TSDICTIONARY:
+		case OBJECT_TSPARSER:
+		case OBJECT_TSTEMPLATE:
 			return gp_objects_dispatched(stmt->removeType, stmt->objects);
 		default:
 			return false;
@@ -366,6 +403,17 @@ gp_object_type_dispatched(ObjectType type)
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
 		case OBJECT_ROUTINE:
+		case OBJECT_OPERATOR:
+		case OBJECT_AGGREGATE:
+		case OBJECT_COLLATION:
+		case OBJECT_CONVERSION:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+		case OBJECT_TSCONFIGURATION:
+		case OBJECT_TSDICTIONARY:
+		case OBJECT_TSPARSER:
+		case OBJECT_TSTEMPLATE:
+		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_SCHEMA:
 		case OBJECT_EXTENSION:
 		case OBJECT_ROLE:
@@ -511,14 +559,36 @@ gp_ddl_dispatched_xact(Node *parsetree)
 			return strcmp(((AlterExtensionStmt *) parsetree)->extname, "gp") != 0;
 		case T_AlterExtensionContentsStmt:
 			return strcmp(((AlterExtensionContentsStmt *) parsetree)->extname, "gp") != 0;
-		case T_CreateSchemaStmt:
 		case T_CompositeTypeStmt:
+			return !gp_relation_is_local(((CompositeTypeStmt *) parsetree)->typevar);
 		case T_CreateEnumStmt:
-		case T_AlterEnumStmt:
+			return !gp_names_are_local(((CreateEnumStmt *) parsetree)->typeName);
 		case T_CreateRangeStmt:
+			return !gp_names_are_local(((CreateRangeStmt *) parsetree)->typeName);
 		case T_CreateDomainStmt:
+			return !gp_names_are_local(((CreateDomainStmt *) parsetree)->domainname);
 		case T_CreateFunctionStmt:
+			return !gp_names_are_local(((CreateFunctionStmt *) parsetree)->funcname);
 		case T_AlterFunctionStmt:
+			return !gp_object_is_local(((AlterFunctionStmt *) parsetree)->objtype,
+									   (Node *) ((AlterFunctionStmt *) parsetree)->func);
+		case T_DefineStmt:
+			return !gp_names_are_local(((DefineStmt *) parsetree)->defnames);
+		case T_CreateSchemaStmt:
+		case T_AlterEnumStmt:
+		case T_AlterDomainStmt:
+		case T_CreateCastStmt:
+		case T_CreateConversionStmt:
+		case T_CreateTransformStmt:
+		case T_CreateOpClassStmt:
+		case T_CreateOpFamilyStmt:
+		case T_AlterOpFamilyStmt:
+		case T_AlterOperatorStmt:
+		case T_AlterTypeStmt:
+		case T_AlterCollationStmt:
+		case T_AlterTSDictionaryStmt:
+		case T_AlterTSConfigurationStmt:
+		case T_CreateAmStmt:
 		case T_CreateRoleStmt:
 		case T_AlterRoleStmt:
 		case T_AlterRoleSetStmt:
@@ -632,6 +702,134 @@ gp_dispatch_nonxact_stmt(Node *parsetree, const char *sql, const char *oids)
 	gp_dispatch_nonxact(sql, oids, undo, flags);
 }
 
+/*
+ * The DDL that makes a table of CREATE TABLE AS on the segments: its columns
+ * as they are, and no rows
+ */
+static char *
+gp_table_ddl(Oid relid)
+{
+	Relation	rel = relation_open(relid, NoLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData buf;
+	bool		first = true;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "CREATE %sTABLE %s (",
+					 rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED ? "UNLOGGED " : "",
+					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												RelationGetRelationName(rel)));
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+		appendStringInfo(&buf, "%s%s %s", first ? "" : ", ",
+						 quote_identifier(NameStr(att->attname)),
+						 format_type_with_typemod(att->atttypid, att->atttypmod));
+		if (OidIsValid(att->attcollation) &&
+			att->attcollation != get_typcollation(att->atttypid))
+			appendStringInfo(&buf, " COLLATE %s",
+							 generate_collation_name(att->attcollation));
+		first = false;
+	}
+	appendStringInfoChar(&buf, ')');
+	if (OidIsValid(rel->rd_rel->relam) && rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		appendStringInfo(&buf, " USING %s",
+						 quote_identifier(get_am_name(rel->rd_rel->relam)));
+	relation_close(rel, NoLock);
+	return buf.data;
+}
+
+/*
+ * CREATE TABLE AS and SELECT INTO, in three steps: the table of the query
+ * without rows, as WITH NO DATA makes it; the same table on the segments
+ * with the same OIDs; and the rows of the query as INSERT ... SELECT, which
+ * goes to the segments if the table is distributed.  Returns false for what
+ * stays as it is: a temporary table, a materialized view, one that exists.
+ */
+static bool
+gp_create_table_as(PlannedStmt *pstmt, const char *queryString,
+				   bool readOnlyTree, ProcessUtilityContext context,
+				   ParamListInfo params, QueryEnvironment *queryEnv,
+				   DestReceiver *dest, QueryCompletion *qc)
+{
+	CreateTableAsStmt *stmt = (CreateTableAsStmt *) pstmt->utilityStmt;
+	IntoClause *into = stmt->into;
+	CreateTableAsStmt *empty;
+	IntoClause *into_empty;
+	PlannedStmt *pstmt_empty;
+	Oid			relid;
+	int			mark;
+	uint64		processed = 0;
+
+	/* The query of EXECUTE is a utility command: no text to run again */
+	if (stmt->objtype != OBJECT_TABLE || !IsA(stmt->query, Query) ||
+		castNode(Query, stmt->query)->commandType == CMD_UTILITY ||
+		gp_relation_is_local(into->rel))
+		return false;
+	if (stmt->if_not_exists &&
+		OidIsValid(RangeVarGetRelid(into->rel, NoLock, true)))
+		return false;
+	if (params != NULL && params->numParams > 0)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("CREATE TABLE AS with parameters is not supported on a cluster yet"));
+
+	empty = makeNode(CreateTableAsStmt);
+	*empty = *stmt;
+	into_empty = makeNode(IntoClause);
+	*into_empty = *into;
+	into_empty->skipData = true;
+	empty->into = into_empty;
+	pstmt_empty = makeNode(PlannedStmt);
+	*pstmt_empty = *pstmt;
+	pstmt_empty->utilityStmt = (Node *) empty;
+
+	mark = gp_oids_mark();
+	dispatch_depth++;
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt_empty, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt_empty, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		dispatch_depth--;
+	}
+	PG_END_TRY();
+
+	relid = RangeVarGetRelid(into->rel, NoLock, false);
+	gp_dispatch_xact(psprintf("SET LOCAL gp.dispatch_oids = %s; %s",
+							  quote_literal_cstr(gp_oids_since(mark)),
+							  gp_table_ddl(relid)));
+	if (gp_default_distribution != GP_DEFAULT_COORDINATOR)
+		gp_distribute_by_default(relid);
+
+	if (!into->skipData)
+	{
+		char	   *sql = psprintf("INSERT INTO %s %s",
+								   quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+															  get_rel_name(relid)),
+								   pg_get_querydef(castNode(Query, stmt->query), false));
+
+		SPI_connect();
+		if (SPI_execute(sql, false, 0) != SPI_OK_INSERT)
+			elog(ERROR, "could not fill the table of CREATE TABLE AS");
+		processed = SPI_processed;
+		SPI_finish();
+	}
+
+	if (qc != NULL)
+		SetQueryCompletion(qc, CMDTAG_SELECT, processed);
+	return true;
+}
+
 static void
 gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 				   bool readOnlyTree, ProcessUtilityContext context,
@@ -647,6 +845,13 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	/* COPY into a distributed table goes to the segments instead */
 	if (IsA(parsetree, CopyStmt) && dispatch_depth == 0 && IsUnderPostmaster &&
 		gp_copy_from(pstmt, queryString, qc))
+		return;
+
+	/* CREATE TABLE AS makes its table on the segments too */
+	if (IsA(parsetree, CreateTableAsStmt) && gp_dispatch_ddl &&
+		dispatch_depth == 0 && !creating_extension && IsUnderPostmaster &&
+		gp_create_table_as(pstmt, queryString, readOnlyTree, context, params,
+						   queryEnv, dest, qc))
 		return;
 
 	if (gp_dispatch_ddl && dispatch_depth == 0 && !creating_extension &&
@@ -691,13 +896,22 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 		gp_relation_is_local(((ViewStmt *) parsetree)->view))
 		mode = GP_DISPATCH_NONE;
 
+	/* The body of a function may use what stays on the coordinator, as a temporary table */
 	if (mode == GP_DISPATCH_XACT)
-		gp_dispatch_xact(psprintf("SET LOCAL gp.dispatch_oids = %s; %s",
+		gp_dispatch_xact(psprintf("SET LOCAL gp.dispatch_oids = %s; %s%s",
 								  quote_literal_cstr(gp_oids_since(mark)),
+								  IsA(parsetree, CreateFunctionStmt) ?
+								  "SET LOCAL check_function_bodies = off; " : "",
 								  gp_statement_text(pstmt, queryString)));
 	else if (mode == GP_DISPATCH_NONXACT)
 		gp_dispatch_nonxact_stmt(parsetree,
 								 gp_statement_text(pstmt, queryString), oids);
+
+	/* A new table that the setting sends to the segments; a partition goes with its table */
+	if (mode == GP_DISPATCH_XACT && gp_default_distribution != GP_DEFAULT_COORDINATOR &&
+		IsA(parsetree, CreateStmt) && ((CreateStmt *) parsetree)->partbound == NULL)
+		gp_distribute_by_default(RangeVarGetRelid(((CreateStmt *) parsetree)->relation,
+												  NoLock, false));
 }
 
 /*
