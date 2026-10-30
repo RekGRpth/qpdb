@@ -1925,6 +1925,24 @@ select * from
 
 rollback;
 
+-- nestloop parameter PHV whose ph_eval_at mentions an outer join that is
+-- computed in the rels supplying the parameters
+explain (verbose, costs off)
+select v.k from (select 1) d
+  left join (select t1.f1, 1 from int4_tbl t1, onerow t2
+               left join onerow t3 on true) s(x, y) on true
+  left join lateral (select s.y from onerow t4) v(k) on true
+where v.k > s.x;
+
+-- likewise, where an upper nestloop could wrongly claim the parameter
+explain (verbose, costs off)
+select v.k, g from (select 1) d
+  left join (select t1.f1, 1 from int4_tbl t1, onerow t2
+               left join onerow t3 on true) s(x, y) on true
+  left join lateral (select s.y from onerow t4) v(k) on true,
+  lateral generate_series(v.k, 1) g
+where v.k > s.x;
+
 -- PHVs containing SubLinks are quite tricky to get right
 explain (verbose, costs off)
 select *
@@ -2566,6 +2584,23 @@ select count(*) from int4_tbl t1 left join
   left join lateral
     (select c.f1 as cnt from int4_tbl c where c.f1 = t2.one offset 0) t3
     on t2.bx = t3.cnt;
+
+-- but a function scan can compute the PHV's expression itself, so the join
+-- is allowed
+explain (costs off)
+select count(*), sum(f) from int8_tbl d left join
+  (select coalesce(t2.q1, 0) as x, t2.q1 as q
+   from int8_tbl t1 left join int8_tbl t2 on true) ss
+    on true
+  left join lateral generate_series(ss.x, 124) f
+    on ss.q = 123;
+
+select count(*), sum(f) from int8_tbl d left join
+  (select coalesce(t2.q1, 0) as x, t2.q1 as q
+   from int8_tbl t1 left join int8_tbl t2 on true) ss
+    on true
+  left join lateral generate_series(ss.x, 124) f
+    on ss.q = 123;
 
 --
 -- check that a join is disallowed when its lateral reference can only be
