@@ -46,16 +46,19 @@ struct GpRoute
 	GpSegment  *segments;
 	int			nsegments;
 	int		   *bucket_pos;		/* segment of each bucket, as a position */
+	bool		direct;			/* all rows go to the one segment of the route */
 	StringInfoData *buffers;	/* one for each segment */
 	StringInfoData tuple;		/* the row that is being sent */
 };
 
 /*
  * Start a route to the segments for rows of a table; the memory of the
- * route is that of the caller until gp_route_end()
+ * route is that of the caller until gp_route_end().  With a segment other
+ * than 0, the route goes to it alone, and all rows to it, whatever their
+ * buckets: the caller knows that they belong there.
  */
 GpRoute *
-gp_route_begin(Relation rel, const GpPolicy *policy)
+gp_route_begin(Relation rel, const GpPolicy *policy, int only)
 {
 	GpRoute    *route = palloc0_object(GpRoute);
 	TupleDesc	tupDesc = RelationGetDescr(rel);
@@ -94,14 +97,15 @@ gp_route_begin(Relation rel, const GpPolicy *policy)
 	for (int k = 0; k < policy->nkeys; k++)
 		route->keytypes[k] = TupleDescAttr(tupDesc, policy->keys[k] - 1)->atttypid;
 
-	route->nsegments = gp_copy_open(copysql, &route->segments);
+	route->direct = only != 0;
+	route->nsegments = gp_copy_open(copysql, only, &route->segments);
 	if (route->nsegments == 0)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("the cluster has no segments"));
 
 	/* The segment of each bucket, as a position in the segments */
-	if (!policy->replicated)
+	if (!policy->replicated && !route->direct)
 	{
 		route->bucket_pos = palloc_array(int, policy->nbuckets);
 		for (int b = 0; b < policy->nbuckets; b++)
@@ -168,6 +172,8 @@ gp_route_row(GpRoute *route, const Datum *values, const bool *nulls)
 		first = 0;
 		last = route->nsegments - 1;
 	}
+	else if (route->direct)
+		first = last = 0;
 	else
 	{
 		for (int k = 0; k < policy->nkeys; k++)

@@ -756,10 +756,11 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 }
 
 /*
- * Connections to all segments, with the settings of the session
+ * Connections to all segments, or to the segment `only` if it is not 0,
+ * with the settings of the session
  */
 static int
-gp_connections_ready(GpSegment **segments, GpConnection ***entries)
+gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 {
 	int			nsegments = gp_segments_get(segments);
 	char	  **commands;
@@ -767,6 +768,20 @@ gp_connections_ready(GpSegment **segments, GpConnection ***entries)
 	StringInfoData settings;
 
 	gp_connections_forget(*segments, nsegments);
+	if (only != 0)
+	{
+		int			pos = -1;
+
+		for (int i = 0; i < nsegments && pos < 0; i++)
+			if ((*segments)[i].segment_id == only)
+				pos = i;
+		if (pos < 0)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("segment %d is not registered", only));
+		(*segments)[0] = (*segments)[pos];
+		nsegments = 1;
+	}
 	*entries = palloc_array(GpConnection *, nsegments);
 	for (int i = 0; i < nsegments; i++)
 		(*entries)[i] = gp_connection_open(&(*segments)[i]);
@@ -802,7 +817,7 @@ gp_dispatch_xact(const char *sql)
 {
 	GpSegment  *segments;
 	GpConnection **entries;
-	int			nsegments = gp_connections_ready(&segments, &entries);
+	int			nsegments = gp_connections_ready(&segments, &entries, 0);
 	char	  **commands = palloc_array(char *, nsegments);
 	PGresult  **results;
 
@@ -820,16 +835,17 @@ gp_dispatch_xact(const char *sql)
 }
 
 /*
- * Start COPY ... FROM STDIN on all segments, in the transactions that follow
- * the transaction of the coordinator, and return the segments.
+ * Start COPY ... FROM STDIN on all segments, or on the segment `only` if it
+ * is not 0, in the transactions that follow the transaction of the
+ * coordinator, and return the segments.
  * gp_copy_send() then sends the data, and gp_copy_close() ends the COPY.
  * The connections stay busy until then, so an abort cancels the COPY.
  */
 int
-gp_copy_open(const char *sql, GpSegment **segments)
+gp_copy_open(const char *sql, int only, GpSegment **segments)
 {
 	GpConnection **entries;
-	int			nsegments = gp_connections_ready(segments, &entries);
+	int			nsegments = gp_connections_ready(segments, &entries, only);
 	char	  **commands = palloc_array(char *, nsegments);
 	PGresult  **results;
 
@@ -994,7 +1010,7 @@ gp_dispatch_nonxact(const char *sql, const char *oids, const char *undo,
 						 cleanup.len > 0 ? "; " : "");
 	}
 
-	nsegments = gp_connections_ready(&segments, &entries);
+	nsegments = gp_connections_ready(&segments, &entries, 0);
 
 	PG_TRY();
 	{
@@ -1090,7 +1106,7 @@ gp_exec_on_all(PG_FUNCTION_ARGS)
 	PGresult  **results;
 
 	InitMaterializedSRF(fcinfo, 0);
-	nsegments = gp_connections_ready(&segments, &entries);
+	nsegments = gp_connections_ready(&segments, &entries, 0);
 
 	commands = palloc_array(char *, nsegments);
 	for (int i = 0; i < nsegments; i++)
