@@ -13,6 +13,12 @@
  * A segment creates no objects of its own unless gp.allow_local_ddl is on:
  * they would take OIDs that the coordinator may assign later.
  *
+ * A command that cannot run in a transaction block gets its OIDs by SET in
+ * a session, not SET LOCAL, with gp.dispatch_oids_session on.  The
+ * transaction of that SET does not check that the OIDs are used; those of
+ * the command do.  On the coordinator, such a command may commit several
+ * times, so its OIDs are kept beyond a transaction while gp_oids_keep() is on.
+ *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
  *
@@ -52,12 +58,17 @@ typedef struct GpOidList
 
 /* GUC variables */
 char	   *gp_dispatch_oids = NULL;
+bool		gp_dispatch_oids_session = false;
 bool		gp_allow_local_ddl = false;
 
-/* Coordinator: OIDs of the current transaction, in TopTransactionContext */
+/*
+ * Coordinator: OIDs of the current transaction, in TopTransactionContext,
+ * or in TopMemoryContext while kept
+ */
 static GpOid *recorded = NULL;
 static int	nrecorded = 0;
 static int	maxrecorded = 0;
+static bool keeping = false;
 
 /* Coordinator: GetNewOidWithIndex() is called from the hook */
 static bool recording = false;
@@ -65,6 +76,9 @@ static bool recording = false;
 /* Segment: OIDs from the coordinator, and how many are used */
 static GpOidList *dispatched = NULL;
 static int	nused = 0;
+
+/* Segment: the OIDs were set in this transaction for the next ones */
+static bool skip_check = false;
 
 PG_FUNCTION_INFO_V1(gp_recorded_oids);
 
@@ -92,7 +106,8 @@ gp_new_oid_coordinator(Relation relation, Oid indexId, AttrNumber oidcolumn)
 		if (recorded == NULL)
 		{
 			maxrecorded = 64;
-			recorded = MemoryContextAlloc(TopTransactionContext,
+			recorded = MemoryContextAlloc(keeping ? TopMemoryContext :
+										  TopTransactionContext,
 										  sizeof(GpOid) * maxrecorded);
 		}
 		else
@@ -159,7 +174,7 @@ gp_oids_xact_callback(XactEvent event, void *arg)
 			 * Not in a parallel worker: it gets gp.dispatch_oids from the
 			 * leader, but creates no catalog rows
 			 */
-			if (dispatched != NULL && nused < dispatched->count)
+			if (dispatched != NULL && !skip_check && nused < dispatched->count)
 				ereport(ERROR,
 						errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("the coordinator assigned %d OIDs, but the segment used %d",
@@ -171,9 +186,13 @@ gp_oids_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
-			/* TopTransactionContext is gone with the list */
-			recorded = NULL;
-			nrecorded = maxrecorded = 0;
+			skip_check = false;
+			if (!keeping)
+			{
+				/* TopTransactionContext is gone with the list */
+				recorded = NULL;
+				nrecorded = maxrecorded = 0;
+			}
 			break;
 		default:
 			break;
@@ -262,6 +281,38 @@ gp_assign_dispatch_oids(const char *newval, void *extra)
 {
 	dispatched = (GpOidList *) extra;
 	nused = 0;
+	skip_check = gp_dispatch_oids_session;
+}
+
+/*
+ * Coordinator: keep the OIDs recorded from now on beyond the transaction,
+ * for a command that commits on its own, until called with false
+ */
+void
+gp_oids_keep(bool keep)
+{
+	if (keep == keeping)
+		return;
+	keeping = keep;
+
+	if (keep)
+	{
+		if (recorded != NULL)
+		{
+			GpOid	   *copy = MemoryContextAlloc(TopMemoryContext,
+												  sizeof(GpOid) * maxrecorded);
+
+			memcpy(copy, recorded, sizeof(GpOid) * nrecorded);
+			recorded = copy;
+		}
+	}
+	else
+	{
+		if (recorded != NULL)
+			pfree(recorded);
+		recorded = NULL;
+		nrecorded = maxrecorded = 0;
+	}
 }
 
 /*

@@ -160,6 +160,17 @@ _PG_init(void)
 							   gp_assign_dispatch_oids,
 							   NULL);
 
+	DefineCustomBoolVariable("gp.dispatch_oids_session",
+							 "Keeps the OIDs of gp.dispatch_oids for the next transaction.",
+							 "Set with gp.dispatch_oids on a segment, for a command that cannot run in a transaction block.",
+							 &gp_dispatch_oids_session,
+							 false,
+							 PGC_SUSET,
+							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomBoolVariable("gp.allow_local_ddl",
 							 "Allows a segment to create objects of its own.",
 							 "Objects of a segment get their OIDs from the coordinator, so this is for maintenance only.",

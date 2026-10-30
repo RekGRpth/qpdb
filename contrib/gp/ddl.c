@@ -16,6 +16,14 @@
  * Statements that compute a column with a non-immutable expression are
  * refused, as each segment would compute its own values.
  *
+ * CREATE DATABASE, DROP DATABASE, VACUUM and the CONCURRENTLY commands
+ * cannot run in a transaction block, so they run on the segments one by one
+ * after the coordinator, each segment in a transaction of its own, and 2PC
+ * does not cover them.  If CREATE DATABASE fails on a segment, it is dropped
+ * on the others and the coordinator rolls back.  DROP DATABASE has removed
+ * the files on the coordinator by then, so a failure on a segment is a
+ * WARNING.
+ *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
  *
@@ -33,6 +41,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "miscadmin.h"
@@ -54,18 +63,18 @@
 /* GUC variables */
 bool		gp_dispatch_ddl = true;
 
+/* How a statement goes to the segments */
+typedef enum GpDispatch
+{
+	GP_DISPATCH_NONE,
+	GP_DISPATCH_XACT,			/* in the transaction of the coordinator */
+	GP_DISPATCH_NONXACT,		/* after it, in a transaction of its own */
+} GpDispatch;
+
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
 /* Depth of dispatched statements being run on the coordinator */
 static int	dispatch_depth = 0;
-
-static void
-gp_ddl_unsupported(const char *what)
-{
-	ereport(ERROR,
-			errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("%s is not supported on a cluster yet", what));
-}
 
 /*
  * Whether a relation stays on the coordinator: a temporary one, or one of
@@ -309,9 +318,6 @@ gp_drop_dispatched(DropStmt *stmt)
 		case OBJECT_INDEX:
 		case OBJECT_SEQUENCE:
 		case OBJECT_VIEW:
-			if (stmt->concurrent)
-				gp_ddl_unsupported("DROP INDEX CONCURRENTLY");
-			pg_fallthrough;
 		case OBJECT_SCHEMA:
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
@@ -389,37 +395,47 @@ gp_comment_type_dispatched(ObjectType type)
 }
 
 /*
- * Whether a statement goes to the segments.  It errors out for statements
- * that should, but cannot.
+ * Whether VACUUM goes to the segments: not ANALYZE, which is for the
+ * statistics of the cluster, and not when all tables stay on the coordinator
  */
 static bool
-gp_ddl_dispatched(Node *parsetree)
+gp_vacuum_dispatched(VacuumStmt *stmt)
+{
+	List	   *relations = NIL;
+	ListCell   *lc;
+
+	if (!stmt->is_vacuumcmd)
+		return false;
+	if (stmt->rels == NIL)
+		return true;
+
+	foreach(lc, stmt->rels)
+		relations = lappend(relations, lfirst_node(VacuumRelation, lc)->relation);
+	return gp_objects_dispatched(OBJECT_TABLE, relations);
+}
+
+/* Whether the options of VACUUM have FULL, which creates relations */
+static bool
+gp_vacuum_is_full(VacuumStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *opt = lfirst_node(DefElem, lc);
+
+		if (strcmp(opt->defname, "full") == 0 && defGetBoolean(opt))
+			return true;
+	}
+	return false;
+}
+
+/* Whether a statement that runs in a transaction goes to the segments */
+static bool
+gp_ddl_dispatched_xact(Node *parsetree)
 {
 	switch (nodeTag(parsetree))
 	{
-		case T_CreateStmt:
-			return !gp_relation_is_local(((CreateStmt *) parsetree)->relation);
-		case T_IndexStmt:
-			{
-				IndexStmt  *stmt = (IndexStmt *) parsetree;
-
-				if (gp_relation_is_local(stmt->relation))
-					return false;
-				if (stmt->concurrent)
-					gp_ddl_unsupported("CREATE INDEX CONCURRENTLY");
-				return true;
-			}
-		case T_AlterTableStmt:
-			{
-				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
-
-				if (gp_relation_is_local(stmt->relation))
-					return false;
-				gp_check_alter_table(stmt);
-				return true;
-			}
-		case T_DropStmt:
-			return gp_drop_dispatched((DropStmt *) parsetree);
 		case T_CreateSeqStmt:
 			return !gp_relation_is_local(((CreateSeqStmt *) parsetree)->sequence);
 		case T_AlterSeqStmt:
@@ -489,6 +505,55 @@ gp_ddl_dispatched(Node *parsetree)
 	}
 }
 
+/*
+ * How a statement goes to the segments.  It errors out for statements that
+ * should, but cannot.
+ */
+static GpDispatch
+gp_ddl_dispatched(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+			return gp_relation_is_local(((CreateStmt *) parsetree)->relation) ?
+				GP_DISPATCH_NONE : GP_DISPATCH_XACT;
+		case T_IndexStmt:
+			{
+				IndexStmt  *stmt = (IndexStmt *) parsetree;
+
+				if (gp_relation_is_local(stmt->relation))
+					return GP_DISPATCH_NONE;
+				return stmt->concurrent ? GP_DISPATCH_NONXACT : GP_DISPATCH_XACT;
+			}
+		case T_AlterTableStmt:
+			{
+				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+
+				if (gp_relation_is_local(stmt->relation))
+					return GP_DISPATCH_NONE;
+				gp_check_alter_table(stmt);
+				return GP_DISPATCH_XACT;
+			}
+		case T_DropStmt:
+			{
+				DropStmt   *stmt = (DropStmt *) parsetree;
+
+				if (!gp_drop_dispatched(stmt))
+					return GP_DISPATCH_NONE;
+				return stmt->concurrent ? GP_DISPATCH_NONXACT : GP_DISPATCH_XACT;
+			}
+		case T_CreatedbStmt:
+		case T_DropdbStmt:
+			return GP_DISPATCH_NONXACT;
+		case T_VacuumStmt:
+			return gp_vacuum_dispatched((VacuumStmt *) parsetree) ?
+				GP_DISPATCH_NONXACT : GP_DISPATCH_NONE;
+		default:
+			return gp_ddl_dispatched_xact(parsetree) ?
+				GP_DISPATCH_XACT : GP_DISPATCH_NONE;
+	}
+}
+
 /* The text of the statement, cut out of the query string */
 static char *
 gp_statement_text(PlannedStmt *pstmt, const char *queryString)
@@ -507,6 +572,38 @@ gp_statement_text(PlannedStmt *pstmt, const char *queryString)
 	return pnstrdup(queryString + location, len);
 }
 
+/*
+ * Run a statement that cannot run in a transaction block on the segments,
+ * with the OIDs of its objects on the coordinator
+ */
+static void
+gp_dispatch_nonxact_stmt(Node *parsetree, const char *sql, const char *oids)
+{
+	const char *undo = NULL;
+	int			flags = 0;
+
+	switch (nodeTag(parsetree))
+	{
+		case T_CreatedbStmt:
+			undo = psprintf("DROP DATABASE %s",
+							quote_identifier(((CreatedbStmt *) parsetree)->dbname));
+			break;
+		case T_DropdbStmt:
+			flags = GP_NONXACT_WARN;
+			break;
+		case T_VacuumStmt:
+			/* The relations of VACUUM FULL are transient: no OIDs to share */
+			oids = NULL;
+			if (gp_vacuum_is_full((VacuumStmt *) parsetree))
+				flags = GP_NONXACT_LOCAL_DDL;
+			break;
+		default:
+			break;
+	}
+
+	gp_dispatch_nonxact(sql, oids, undo, flags);
+}
+
 static void
 gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 				   bool readOnlyTree, ProcessUtilityContext context,
@@ -514,17 +611,23 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 				   DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
-	bool		dispatch = false;
+	GpDispatch	mode = GP_DISPATCH_NONE;
+	MemoryContext oldcontext = CurrentMemoryContext;
+	char	   *oids = NULL;
 	int			mark = 0;
 
 	if (gp_dispatch_ddl && dispatch_depth == 0 && !creating_extension &&
 		IsUnderPostmaster)
-		dispatch = gp_ddl_dispatched(parsetree);
-	if (dispatch)
+		mode = gp_ddl_dispatched(parsetree);
+	if (mode != GP_DISPATCH_NONE)
 	{
 		mark = gp_oids_mark();
 		dispatch_depth++;
 	}
+
+	/* The command commits on its own, maybe several times */
+	if (mode == GP_DISPATCH_NONXACT)
+		gp_oids_keep(true);
 
 	PG_TRY();
 	{
@@ -534,23 +637,34 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 		else
 			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 									params, queryEnv, dest, qc);
+
+		if (mode == GP_DISPATCH_NONXACT)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			oids = gp_oids_since(mark);
+		}
 	}
 	PG_FINALLY();
 	{
-		if (dispatch)
+		if (mode != GP_DISPATCH_NONE)
 			dispatch_depth--;
+		if (mode == GP_DISPATCH_NONXACT)
+			gp_oids_keep(false);
 	}
 	PG_END_TRY();
 
 	/* A view of a temporary table is temporary itself */
-	if (dispatch && IsA(parsetree, ViewStmt) &&
+	if (mode == GP_DISPATCH_XACT && IsA(parsetree, ViewStmt) &&
 		gp_relation_is_local(((ViewStmt *) parsetree)->view))
-		dispatch = false;
+		mode = GP_DISPATCH_NONE;
 
-	if (dispatch)
+	if (mode == GP_DISPATCH_XACT)
 		gp_dispatch_xact(psprintf("SET LOCAL gp.dispatch_oids = %s; %s",
 								  quote_literal_cstr(gp_oids_since(mark)),
 								  gp_statement_text(pstmt, queryString)));
+	else if (mode == GP_DISPATCH_NONXACT)
+		gp_dispatch_nonxact_stmt(parsetree,
+								 gp_statement_text(pstmt, queryString), oids);
 }
 
 /*

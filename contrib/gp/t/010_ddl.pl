@@ -196,9 +196,8 @@ run('CREATE TABLE s.dflt (a int, at timestamptz DEFAULT now())');
 run('ALTER TABLE s.dflt ALTER COLUMN a SET DEFAULT random()');
 is(where('s.dflt'), 't t',
 	'defaults that are only stored are allowed');
-fails('CREATE INDEX CONCURRENTLY ON s.t (c)',
-	qr/CREATE INDEX CONCURRENTLY is not supported on a cluster yet/,
-	'CREATE INDEX CONCURRENTLY');
+run('CREATE INDEX CONCURRENTLY ON s.t (c)');
+is(where('s.t_c_idx'), 't t', 'CREATE INDEX CONCURRENTLY goes to the segments');
 
 # The end
 run('DROP SCHEMA s, s2, s3 CASCADE');

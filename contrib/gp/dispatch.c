@@ -26,6 +26,9 @@
  * rolled back on the segments, so a transaction that rolled back one after
  * sending DDL cannot commit.
  *
+ * A command that cannot run in a transaction block runs on the segments in
+ * transactions of their own, outside this scheme: see gp_dispatch_nonxact().
+ *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
  *
@@ -626,16 +629,12 @@ gp_settings_remember(GpConnection *entry, const StringInfo settings)
 
 /*
  * Send each connection its command, none for NULL, then wait for all, so
- * the segments work in parallel.  If a segment fails, report the error of
- * the first one by number once all have answered; what says what the
- * commands do, NULL for a command of the user.
+ * the segments work in parallel
  */
 static PGresult **
-gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
-			char **commands, const char *what)
+gp_dispatch_wait(GpConnection **entries, int nsegments, char **commands)
 {
 	PGresult  **results = palloc0_array(PGresult *, nsegments);
-	int			failed = -1;
 
 	for (int i = 0; i < nsegments; i++)
 		if (commands[i] != NULL)
@@ -648,6 +647,21 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 											  wait_event_result);
 		entries[i]->busy = false;
 	}
+
+	return results;
+}
+
+/*
+ * Report the failure of the first segment by number, once all have
+ * answered, at elevel; what says what the commands do, NULL for a command of
+ * the user.  Connections that broke are closed.
+ */
+static void
+gp_dispatch_check(const GpSegment *segments, GpConnection **entries,
+				  int nsegments, char **commands, PGresult **results,
+				  const char *what, int elevel)
+{
+	int			failed = -1;
 
 	for (int i = 0; i < nsegments && failed < 0; i++)
 	{
@@ -697,23 +711,40 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 				gp_connection_close(entries[i]);
 
 		if (broken)
-			ereport(ERROR,
+		{
+			ereport(elevel,
 					errcode(ERRCODE_CONNECTION_FAILURE),
 					errmsg("lost the connection to segment %d at %s:%d",
 						   segment->segment_id, segment->host, segment->port),
 					errdetail_internal("%s", detail));
+			return;
+		}
 		/* errcontext() is a comma expression: no use in a conditional one */
 		context = psprintf("%s%ssegment %d at %s:%d", what ? what : "",
 						   what ? " on " : "", segment->segment_id,
 						   segment->host, segment->port);
-		ereport(ERROR,
+		ereport(elevel,
 				errcode(code),
 				errmsg_internal("%s", primary),
 				detail ? errdetail_internal("%s", detail) : 0,
 				hint ? errhint("%s", hint) : 0,
 				errcontext("%s", context));
 	}
+}
 
+/*
+ * Send each connection its command, none for NULL, then wait for all, so
+ * the segments work in parallel.  If a segment fails, report the error of
+ * the first one by number once all have answered.
+ */
+static PGresult **
+gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
+			char **commands, const char *what)
+{
+	PGresult  **results = gp_dispatch_wait(entries, nsegments, commands);
+
+	gp_dispatch_check(segments, entries, nsegments, commands, results, what,
+					  ERROR);
 	return results;
 }
 
@@ -779,6 +810,148 @@ gp_dispatch_xact(const char *sql)
 	results = gp_dispatch(segments, entries, nsegments, commands, NULL);
 	for (int i = 0; i < nsegments; i++)
 		PQclear(results[i]);
+}
+
+/* Run a command on all segments, and drop its results */
+static void
+gp_dispatch_same(const GpSegment *segments, GpConnection **entries,
+				 int nsegments, const char *sql, const char *what)
+{
+	char	  **commands = palloc_array(char *, nsegments);
+	PGresult  **results;
+
+	for (int i = 0; i < nsegments; i++)
+		commands[i] = (char *) sql;
+	results = gp_dispatch(segments, entries, nsegments, commands, what);
+	for (int i = 0; i < nsegments; i++)
+		PQclear(results[i]);
+}
+
+/* Close all connections, as their segments may keep settings of a command */
+static void
+gp_connections_close_all(void)
+{
+	HASH_SEQ_STATUS status;
+	GpConnection *entry;
+
+	if (connections == NULL)
+		return;
+
+	hash_seq_init(&status, connections);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		gp_connection_close(entry);
+}
+
+/*
+ * Run a command that cannot run in a transaction block on all segments,
+ * each in a transaction of its own.  The OIDs of the coordinator, if any,
+ * and the leave to create objects go in a command before and are reset in
+ * one after.  If a segment fails, undo, if not NULL, runs on the segments
+ * that did not, and the failure is an ERROR, or a WARNING with
+ * GP_NONXACT_WARN.  After a failure the connections are closed, which ends
+ * what the segments keep of the command.
+ */
+void
+gp_dispatch_nonxact(const char *sql, const char *oids, const char *undo,
+					int flags)
+{
+	GpSegment  *segments;
+	GpConnection **entries;
+	int			nsegments;
+	StringInfoData setup;
+	StringInfoData cleanup;
+
+	initStringInfo(&setup);
+	initStringInfo(&cleanup);
+	if (oids != NULL && oids[0] != '\0')
+	{
+		appendStringInfo(&setup, "SET gp.dispatch_oids_session = on; SET gp.dispatch_oids = %s",
+						 quote_literal_cstr(oids));
+		appendStringInfoString(&cleanup,
+							   "RESET gp.dispatch_oids; RESET gp.dispatch_oids_session");
+	}
+	if (flags & GP_NONXACT_LOCAL_DDL)
+	{
+		appendStringInfo(&setup, "%sSET gp.allow_local_ddl = on",
+						 setup.len > 0 ? "; " : "");
+		appendStringInfo(&cleanup, "%sRESET gp.allow_local_ddl",
+						 cleanup.len > 0 ? "; " : "");
+	}
+
+	nsegments = gp_connections_ready(&segments, &entries);
+
+	PG_TRY();
+	{
+		char	  **commands = palloc_array(char *, nsegments);
+		PGresult  **results;
+		bool		failed = false;
+
+		if (setup.len > 0)
+			gp_dispatch_same(segments, entries, nsegments, setup.data,
+							 "setting the parameters of the command");
+
+		for (int i = 0; i < nsegments; i++)
+			commands[i] = (char *) sql;
+		results = gp_dispatch_wait(entries, nsegments, commands);
+
+		for (int i = 0; i < nsegments; i++)
+			if (results[i] == NULL ||
+				PQresultStatus(results[i]) != PGRES_COMMAND_OK)
+				failed = true;
+
+		if (failed)
+		{
+			if (undo != NULL)
+			{
+				char	  **undos = palloc0_array(char *, nsegments);
+				PGresult  **undone;
+				bool		any = false;
+
+				for (int i = 0; i < nsegments; i++)
+					if (results[i] != NULL &&
+						PQresultStatus(results[i]) == PGRES_COMMAND_OK)
+					{
+						undos[i] = (char *) undo;
+						any = true;
+					}
+				if (any)
+				{
+					undone = gp_dispatch_wait(entries, nsegments, undos);
+					for (int i = 0; i < nsegments; i++)
+					{
+						if (undos[i] == NULL)
+							continue;
+						if (undone[i] == NULL ||
+							PQresultStatus(undone[i]) != PGRES_COMMAND_OK)
+							ereport(WARNING,
+									errcode(ERRCODE_CONNECTION_FAILURE),
+									errmsg("could not undo the command on segment %d at %s:%d",
+										   segments[i].segment_id,
+										   segments[i].host, segments[i].port),
+									errdetail_internal("%s", pchomp(PQerrorMessage(entries[i]->conn))),
+									errhint("Run %s there.", undo));
+					}
+				}
+			}
+			gp_dispatch_check(segments, entries, nsegments, commands, results,
+							  NULL, (flags & GP_NONXACT_WARN) ? WARNING : ERROR);
+			gp_connections_close_all();
+		}
+		else
+		{
+			for (int i = 0; i < nsegments; i++)
+				PQclear(results[i]);
+			if (cleanup.len > 0)
+				gp_dispatch_same(segments, entries, nsegments, cleanup.data,
+								 "resetting the parameters of the command");
+		}
+	}
+	PG_CATCH();
+	{
+		gp_connections_close_all();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*

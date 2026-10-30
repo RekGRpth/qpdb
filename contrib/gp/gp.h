@@ -51,14 +51,23 @@ extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
 
+/* Segments may create objects of their own for a command out of a transaction */
+#define GP_NONXACT_LOCAL_DDL 0x01
+/* A failure on a segment is a WARNING: the coordinator cannot undo the command */
+#define GP_NONXACT_WARN 0x02
+extern void gp_dispatch_nonxact(const char *sql, const char *oids,
+								const char *undo, int flags);
+
 /* oids.c */
 extern char *gp_dispatch_oids;
+extern bool gp_dispatch_oids_session;
 extern bool gp_allow_local_ddl;
 extern void gp_oids_init(void);
 extern bool gp_check_dispatch_oids(char **newval, void **extra,
 								   GucSource source);
 extern void gp_assign_dispatch_oids(const char *newval, void *extra);
 extern int	gp_oids_mark(void);
+extern void gp_oids_keep(bool keep);
 extern char *gp_oids_since(int mark);
 
 /* ddl.c */
