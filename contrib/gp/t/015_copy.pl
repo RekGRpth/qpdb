@@ -77,7 +77,8 @@ my ($ret, $stdout, $stderr) = $coordinator->psql('postgres',
 COPY t (a) FROM PROGRAM 'seq 1 1000';
 GET DIAGNOSTICS n = ROW_COUNT; RAISE NOTICE 'rows %', n; END $$});
 like($stderr, qr/NOTICE:  rows 1000/, 'the number of rows is that of the input');
-is(run('SELECT count(*) FROM t'), 0, 'the coordinator has no rows');
+is(run(q{SELECT pg_relation_size('t')}), 0, 'the coordinator has no rows of its own');
+is(run('SELECT count(*) FROM t'), 1000, 'and a SELECT finds them on the segments');
 my $by_segment = q{
 SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, g)),
 	   string_agg(g::text, ',' ORDER BY g)

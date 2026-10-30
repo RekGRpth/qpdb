@@ -108,7 +108,7 @@ functions and procedures; renaming and moving to another schema; roles,
 from any database, with `GRANT role`, `ALTER ROLE ... SET`, `REASSIGN
 OWNED` and `DROP OWNED`; `GRANT` and `REVOKE` on objects and databases,
 `ALTER DEFAULT PRIVILEGES`; `COMMENT`; `OWNER TO`; `CREATE`, `ALTER` and
-`DROP EXTENSION`.  Commands that cannot run
+`DROP EXTENSION`; `TRUNCATE`.  Commands that cannot run
 in a transaction block are sent after the coordinator (see below); other
 statements run on the coordinator only.
 
@@ -231,9 +231,8 @@ them by two-phase commit.
 
 Triggers and constraints of the table do not run on the coordinator.
 `RETURNING`, `ON CONFLICT`, row-level security and `WITH CHECK OPTION` are
-refused, rather than the rows lost.  An `INSERT ... SELECT` is as correct as
-its `SELECT`: reading a distributed table on the coordinator gives no rows
-yet.
+refused, rather than the rows lost.  An `INSERT ... SELECT` takes the rows of
+its `SELECT`, which reads distributed tables as described below.
 
 When the source is `VALUES` or a `SELECT` without a table, and the key
 columns of every row are constants (a default, a folded expression and a
@@ -244,6 +243,38 @@ buckets stay in the plan, and the executor checks them against the map
 before it relies on the segment.  A key that is a parameter of a prepared
 statement, a function or a column of a source table takes the way to all
 segments.
+
+### SELECT from distributed tables (`gather.c`)
+
+The rows of a distributed table are on the segments, so a query cannot read
+the table on the coordinator.  The hook of the paths of a relation makes
+the only path to a distributed table a custom scan, `GpGather`, and the
+planner plans the rest, the joins, the aggregates, the sorts and the
+windows, on the coordinator as for any table.  `GpGather` sends `SELECT
+columns FROM table` to all segments at once and reads their rows in the
+binary format, which takes every type as it is, into a tuplestore, from which
+the rows go up the plan; a rescan, as in a nested loop, reads them from the
+store again.  The conditions of the query and the projection run on the
+coordinator, so the result is always correct, if not always cheap: all rows
+of the table come, none is chosen on the segments, and the planner does not
+yet know how many that is.  A replicated table has all its rows on every
+segment, so only one of them is asked, by the process number.  A partitioned
+table is read as a whole, the partitions of the coordinator being empty.
+`EXPLAIN (VERBOSE)` shows the query that the segments run.
+
+A segment that the transaction has written to answers in that transaction,
+so it shows what the transaction has written.  The segments answer at their
+own moments, as there is no distributed snapshot yet: a transaction that is
+committing may show on some segments and not on others.  `FOR UPDATE` and
+`TABLESAMPLE` on a distributed table are refused, and so are `UPDATE`,
+`DELETE` and `MERGE` of one, and a data-modifying statement of `WITH` on
+one, which would otherwise change nothing on the coordinator and say
+nothing: they wait for the distributed `DML`.  `TRUNCATE` goes to the
+segments with the other DDL.
+
+The policy of a table is read once, by a session, from `gp.distribution_policy`,
+and kept; `gp.distribute()` and the drop of a table invalidate it through
+the relcache entry of the table, and a change of an extension drops it.
 
 ## Trying it
 
@@ -294,6 +325,7 @@ All are set at server start unless noted.
 | `gp.distribute(table, key, colocate_with)` | Distribute an empty table by hash of `key`, or replicate it |
 | `gp.bucket(nbuckets, VARIADIC key)` | Bucket of a key |
 | `gp.bucket_segment(colocation_id, bucket)` | Segment of a bucket of a colocation group |
+| `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |
 
 `gp.register_segment()`, `gp.exec_on_all()` and `gp.distribute()` are for
 superusers only.
@@ -322,6 +354,7 @@ start their own clusters:
 | `015_copy.pl` | `COPY FROM` into distributed and replicated tables: placement by bucket, types, transactions, errors, privileges |
 | `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, what is refused, privileges |
 | `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
+| `018_gather.pl` | `SELECT` from distributed tables against the same rows in ordinary tables: aggregates, joins, windows, rescans, replicated and partitioned tables, types, own writes, privileges, what is refused |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -336,10 +369,10 @@ by the patch and `contrib/gp`.
 2. **DDL and the same OIDs** — done: the same OIDs, propagating DDL
    with roles, privileges, comments and owners, its two-phase commit,
    commands that run outside a transaction and extensions.
-3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT` and
-   direct dispatch of `INSERT` are done; next are `gp_segment_id()`, plan
-   fragments on segments, every query correct through a gather on the
-   coordinator.
+3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT`,
+   direct dispatch of `INSERT` and `SELECT` through a gather are done; next
+   are `gp_segment_id()`, stable functions of time on the coordinator, and
+   tests against a vanilla server.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

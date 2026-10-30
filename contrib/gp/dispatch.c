@@ -944,6 +944,94 @@ gp_copy_close(void)
 	copy_nsegments = 0;
 }
 
+/* A query that runs on the segments, and its rows in the order of segments */
+struct GpQuery
+{
+	GpSegment  *segments;
+	int			nsegments;
+	int			current;		/* the segment whose rows come now */
+};
+
+/*
+ * Start a query on all segments, or on the segment `only` if it is not 0,
+ * each on its connection; they run at once.  The rows come in the binary
+ * format, one in a result, by gp_query_next(), until it returns NULL.  A
+ * connection serves one query at a time, so the caller reads all rows
+ * before it runs another command on the segments.  A connection in a
+ * transaction of the coordinator runs it there and sees what the
+ * transaction has written.
+ */
+GpQuery *
+gp_query_start(const char *sql, int only)
+{
+	GpQuery    *query = palloc0_object(GpQuery);
+	GpConnection **entries;
+
+	query->nsegments = gp_connections_ready(&query->segments, &entries, only);
+	for (int i = 0; i < query->nsegments; i++)
+	{
+		PGconn	   *conn = entries[i]->conn;
+
+		entries[i]->busy = PQsendQueryParams(conn, sql, 0, NULL, NULL, NULL,
+											 NULL, 1);
+		if (!entries[i]->busy || !PQsetSingleRowMode(conn))
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("lost the connection to segment %d at %s:%d",
+						   query->segments[i].segment_id,
+						   query->segments[i].host, query->segments[i].port),
+					errdetail_internal("%s", pchomp(PQerrorMessage(conn))));
+	}
+	return query;
+}
+
+/*
+ * The next row of a query as a result, to be cleared by the caller, or NULL
+ * when all segments are done
+ */
+PGresult *
+gp_query_next(GpQuery *query)
+{
+	while (query->current < query->nsegments)
+	{
+		const GpSegment *segment = &query->segments[query->current];
+		GpConnection *entry = hash_search(connections, &segment->segment_id,
+										  HASH_FIND, NULL);
+		PGresult   *res;
+		char	   *command = "SELECT";
+
+		if (entry == NULL)
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("no connection to segment %d", segment->segment_id));
+
+		res = libpqsrv_get_result(entry->conn, wait_event_result);
+		if (res == NULL)
+		{
+			/* All results of the segment are read */
+			entry->busy = false;
+			query->current++;
+			continue;
+		}
+
+		switch (PQresultStatus(res))
+		{
+			case PGRES_SINGLE_TUPLE:
+				return res;
+			case PGRES_TUPLES_OK:
+				PQclear(res);
+				continue;
+			default:
+				gp_dispatch_check(segment, &entry, 1, &command, &res,
+								  "reading rows", ERROR);
+				elog(ERROR, "unexpected result of a query on segment %d",
+					 segment->segment_id);
+		}
+	}
+
+	return NULL;
+}
+
 /* Run a command on all segments, and drop its results */
 static void
 gp_dispatch_same(const GpSegment *segments, GpConnection **entries,

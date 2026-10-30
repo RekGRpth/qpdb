@@ -7,6 +7,7 @@ OBJS = \
 	ddl.o \
 	dispatch.o \
 	distribution.o \
+	gather.o \
 	gp.o \
 	insert.o \
 	oids.o \

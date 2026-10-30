@@ -14,7 +14,8 @@
 #ifndef GP_H
 #define GP_H
 
-#include "libpq-fe.h"
+/* The results of libpq are wrapped, as libpq-be-fe-helpers.h wants them */
+#include "libpq/libpq-be-fe.h"
 #include "access/attnum.h"
 #include "nodes/plannodes.h"
 #include "tcop/cmdtag.h"
@@ -79,6 +80,9 @@ extern void gp_route_end(GpRoute *route);
 /* insert.c */
 extern void gp_insert_init(void);
 
+/* gather.c */
+extern void gp_gather_init(void);
+
 /* dispatch.c */
 extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
@@ -86,6 +90,9 @@ extern void gp_dispatch_xact(const char *sql);
 extern int	gp_copy_open(const char *sql, int only, GpSegment **segments);
 extern void gp_copy_send(int segment_id, const char *data, int len);
 extern void gp_copy_close(void);
+typedef struct GpQuery GpQuery;
+extern GpQuery *gp_query_start(const char *sql, int only);
+extern PGresult *gp_query_next(GpQuery *query);
 
 /* Segments may create objects of their own for a command out of a transaction */
 #define GP_NONXACT_LOCAL_DDL 0x01

@@ -6,6 +6,7 @@ gp_sources = files(
   'ddl.c',
   'dispatch.c',
   'distribution.c',
+  'gather.c',
   'gp.c',
   'insert.c',
   'oids.c',
@@ -68,6 +69,7 @@ tests += {
       't/015_copy.pl',
       't/016_insert.pl',
       't/017_direct_dispatch.pl',
+      't/018_gather.pl',
     ],
   },
 }

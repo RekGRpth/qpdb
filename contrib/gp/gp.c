@@ -219,6 +219,7 @@ _PG_init(void)
 		gp_dispatch_init();
 		gp_ddl_init();
 		gp_insert_init();
+		gp_gather_init();
 	}
 
 	gp_oids_init();

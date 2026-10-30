@@ -157,6 +157,12 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'gp_check_distribution_key'
 LANGUAGE C STRICT;
 
+-- Make every session read the policy of a table again
+CREATE FUNCTION gp.policy_changed(relation regclass)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_policy_changed'
+LANGUAGE C STRICT;
+
 -- Distribute an empty table by hash of the key columns, or replicate it to
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key
@@ -200,6 +206,7 @@ BEGIN
 		END IF;
 		INSERT INTO gp.distribution_policy (relid, kind)
 		VALUES (relation, 'replicated');
+		PERFORM gp.policy_changed(relation);
 		RETURN;
 	END IF;
 
@@ -259,6 +266,7 @@ BEGIN
 
 	INSERT INTO gp.distribution_policy (relid, kind, key_columns, colocation_id)
 	VALUES (relation, 'hash', attnums, group_id);
+	PERFORM gp.policy_changed(relation);
 END
 $$;
 

@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "access/transam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation_d.h"
@@ -33,7 +34,10 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/syscache.h"
 
 #include "gp.h"
 
@@ -134,13 +138,13 @@ gp_bucket(PG_FUNCTION_ARGS)
 }
 
 /*
- * The policy of a distributed table, in the current memory context; false
- * for a table that is not distributed, or without the extension in the
- * database.  It reads the policy as the superuser, as a user of the table
- * need not read the tables of the extension.
+ * Read the policy of a distributed table, in the current memory context;
+ * false for a table that is not distributed.  It reads the policy as the
+ * superuser, as a user of the table need not read the tables of the
+ * extension.
  */
-bool
-gp_policy_get(Oid relid, GpPolicy *policy)
+static bool
+gp_policy_load(Oid relid, GpPolicy *policy)
 {
 	const char *sql =
 		"SELECT p.kind, p.key_columns, g.nbuckets, g.map "
@@ -154,9 +158,6 @@ gp_policy_get(Oid relid, GpPolicy *policy)
 	Oid			saved_userid;
 	int			saved_seccontext;
 	bool		found = false;
-
-	if (creating_extension || !OidIsValid(get_extension_oid("gp", true)))
-		return false;
 
 	GetUserIdAndSecContext(&saved_userid, &saved_seccontext);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
@@ -203,6 +204,160 @@ gp_policy_get(Oid relid, GpPolicy *policy)
 	SPI_finish();
 	SetUserIdAndSecContext(saved_userid, saved_seccontext);
 	return found;
+}
+
+/*
+ * The policies read so far, by the OID of the table, with those tables that
+ * have none.  A table is distributed by gp.distribute(), which invalidates
+ * the relcache entry of the table, and the entry of a dropped table goes
+ * the same way; a change of an extension drops them all.
+ */
+typedef struct GpPolicyEntry
+{
+	Oid			relid;			/* hash key */
+	bool		distributed;
+	GpPolicy	policy;
+} GpPolicyEntry;
+
+static MemoryContext policy_cxt = NULL;
+static HTAB *policy_cache = NULL;
+static bool policy_callbacks = false;
+
+/* The planner of the query that reads a policy asks for policies as well */
+static bool policy_loading = false;
+
+PG_FUNCTION_INFO_V1(gp_policy_changed);
+
+static void
+gp_policy_cache_reset(void)
+{
+	if (policy_cxt != NULL)
+		MemoryContextDelete(policy_cxt);
+	policy_cxt = NULL;
+	policy_cache = NULL;
+}
+
+static void
+gp_policy_relcache_callback(Datum arg, Oid relid)
+{
+	if (policy_cache == NULL)
+		return;
+	if (!OidIsValid(relid))
+		gp_policy_cache_reset();
+	else
+		hash_search(policy_cache, &relid, HASH_REMOVE, NULL);
+}
+
+static void
+gp_policy_syscache_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+	gp_policy_cache_reset();
+}
+
+static void
+gp_policy_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	if (!policy_callbacks)
+	{
+		CacheRegisterRelcacheCallback(gp_policy_relcache_callback, (Datum) 0);
+		CacheRegisterSyscacheCallback(EXTENSIONOID, gp_policy_syscache_callback,
+									  (Datum) 0);
+		policy_callbacks = true;
+	}
+	if (policy_cache != NULL)
+		return;
+
+	policy_cxt = AllocSetContextCreate(CacheMemoryContext, "gp policies",
+									   ALLOCSET_DEFAULT_SIZES);
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(GpPolicyEntry);
+	ctl.hcxt = policy_cxt;
+	policy_cache = hash_create("gp policies", 64, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * The policy of a distributed table, in the current memory context; false
+ * for a table that is not distributed, or without the extension in the
+ * database
+ */
+bool
+gp_policy_get(Oid relid, GpPolicy *policy)
+{
+	GpPolicyEntry *entry;
+
+	/* Tables of the system are never distributed */
+	if (policy_loading || creating_extension || relid < FirstNormalObjectId ||
+		!OidIsValid(get_extension_oid("gp", true)))
+		return false;
+
+	gp_policy_cache_init();
+	entry = hash_search(policy_cache, &relid, HASH_FIND, NULL);
+	if (entry == NULL)
+	{
+		GpPolicy	loaded;
+		bool		distributed;
+
+		policy_loading = true;
+		PG_TRY();
+		{
+			distributed = gp_policy_load(relid, &loaded);
+		}
+		PG_FINALLY();
+		{
+			policy_loading = false;
+		}
+		PG_END_TRY();
+		/* The load may have dropped the cache by what it invalidated */
+		gp_policy_cache_init();
+		entry = hash_search(policy_cache, &relid, HASH_ENTER, NULL);
+		entry->distributed = distributed;
+		memset(&entry->policy, 0, sizeof(GpPolicy));
+		if (distributed)
+		{
+			entry->policy = loaded;
+			if (loaded.keys != NULL)
+			{
+				entry->policy.keys = MemoryContextAlloc(policy_cxt, sizeof(AttrNumber) * loaded.nkeys);
+				memcpy(entry->policy.keys, loaded.keys, sizeof(AttrNumber) * loaded.nkeys);
+			}
+			if (loaded.map != NULL)
+			{
+				entry->policy.map = MemoryContextAlloc(policy_cxt, sizeof(int) * loaded.nbuckets);
+				memcpy(entry->policy.map, loaded.map, sizeof(int) * loaded.nbuckets);
+			}
+		}
+	}
+
+	if (!entry->distributed)
+		return false;
+
+	/* A copy, as an invalidation may drop the entry while the caller works */
+	*policy = entry->policy;
+	if (policy->keys != NULL)
+	{
+		policy->keys = palloc(sizeof(AttrNumber) * policy->nkeys);
+		memcpy(policy->keys, entry->policy.keys, sizeof(AttrNumber) * policy->nkeys);
+	}
+	if (policy->map != NULL)
+	{
+		policy->map = palloc(sizeof(int) * policy->nbuckets);
+		memcpy(policy->map, entry->policy.map, sizeof(int) * policy->nbuckets);
+	}
+	return true;
+}
+
+/*
+ * gp.policy_changed(relation): make every session read the policy of a table
+ * again, as the table is distributed now
+ */
+Datum
+gp_policy_changed(PG_FUNCTION_ARGS)
+{
+	CacheInvalidateRelcacheByRelid(PG_GETARG_OID(0));
+	PG_RETURN_VOID();
 }
 
 /*
