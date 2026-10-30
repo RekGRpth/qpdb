@@ -3,6 +3,7 @@
 MODULE_big = gp
 OBJS = \
 	$(WIN32RES) \
+	copy.o \
 	ddl.o \
 	dispatch.o \
 	distribution.o \

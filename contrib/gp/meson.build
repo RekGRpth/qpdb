@@ -2,6 +2,7 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 gp_sources = files(
+  'copy.c',
   'ddl.c',
   'dispatch.c',
   'distribution.c',
@@ -62,6 +63,7 @@ tests += {
       't/012_roles.pl',
       't/013_nonxact.pl',
       't/014_extension.pl',
+      't/015_copy.pl',
     ],
   },
 }

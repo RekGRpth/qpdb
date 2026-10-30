@@ -94,6 +94,10 @@ static bool diverged = false;
 static char gid[64];
 static bool prepared_any = false;
 
+/* The segments a COPY goes to, from gp_copy_open() to gp_copy_close() */
+static GpSegment *copy_segments = NULL;
+static int	copy_nsegments = 0;
+
 PG_FUNCTION_INFO_V1(gp_exec_on_all);
 
 static PGresult **gp_dispatch(const GpSegment *segments, GpConnection **entries,
@@ -315,6 +319,8 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		subxact_marks = NIL;
 		diverged = false;
 		prepared_any = false;
+		copy_segments = NULL;
+		copy_nsegments = 0;
 	}
 }
 
@@ -670,7 +676,8 @@ gp_dispatch_check(const GpSegment *segments, GpConnection **entries,
 		if (commands[i] == NULL)
 			continue;
 		status = results[i] ? PQresultStatus(results[i]) : PGRES_FATAL_ERROR;
-		if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK)
+		if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK &&
+			status != PGRES_COPY_IN)
 			failed = i;
 	}
 
@@ -810,6 +817,115 @@ gp_dispatch_xact(const char *sql)
 	results = gp_dispatch(segments, entries, nsegments, commands, NULL);
 	for (int i = 0; i < nsegments; i++)
 		PQclear(results[i]);
+}
+
+/*
+ * Start COPY ... FROM STDIN on all segments, in the transactions that follow
+ * the transaction of the coordinator, and return the segments.
+ * gp_copy_send() then sends the data, and gp_copy_close() ends the COPY.
+ * The connections stay busy until then, so an abort cancels the COPY.
+ */
+int
+gp_copy_open(const char *sql, GpSegment **segments)
+{
+	GpConnection **entries;
+	int			nsegments = gp_connections_ready(segments, &entries);
+	char	  **commands = palloc_array(char *, nsegments);
+	PGresult  **results;
+
+	for (int i = 0; i < nsegments; i++)
+	{
+		commands[i] = entries[i]->in_xact ? NULL : "BEGIN";
+		entries[i]->in_xact = true;
+	}
+	ndispatched++;
+	results = gp_dispatch(*segments, entries, nsegments, commands, NULL);
+	for (int i = 0; i < nsegments; i++)
+		PQclear(results[i]);
+
+	results = palloc0_array(PGresult *, nsegments);
+	for (int i = 0; i < nsegments; i++)
+	{
+		commands[i] = (char *) sql;
+		entries[i]->busy = PQsendQuery(entries[i]->conn, sql);
+	}
+	for (int i = 0; i < nsegments; i++)
+		if (entries[i]->busy)
+			results[i] = libpqsrv_get_result(entries[i]->conn,
+											 wait_event_result);
+	gp_dispatch_check(*segments, entries, nsegments, commands, results,
+					  "starting COPY", ERROR);
+
+	copy_segments = *segments;
+	copy_nsegments = nsegments;
+	return nsegments;
+}
+
+/*
+ * Send data of a COPY to a segment
+ */
+void
+gp_copy_send(int segment_id, const char *data, int len)
+{
+	GpConnection *entry = hash_search(connections, &segment_id, HASH_FIND, NULL);
+
+	if (entry == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("no connection to segment %d", segment_id));
+	if (PQputCopyData(entry->conn, data, len) != 1)
+		ereport(ERROR,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("lost the connection to segment %d at %s:%d",
+					   segment_id, entry->host, entry->port),
+				errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))));
+}
+
+/*
+ * End the COPY on all segments, and wait for them to apply the data
+ */
+void
+gp_copy_close(void)
+{
+	int			n = copy_nsegments;
+	GpConnection **entries = palloc_array(GpConnection *, n);
+	char	  **commands = palloc_array(char *, n);
+	PGresult  **results = palloc0_array(PGresult *, n);
+
+	for (int i = 0; i < n; i++)
+	{
+		entries[i] = hash_search(connections, &copy_segments[i].segment_id,
+								 HASH_FIND, NULL);
+		if (entries[i] == NULL)
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("no connection to segment %d",
+						   copy_segments[i].segment_id));
+		commands[i] = "COPY";
+	}
+	for (int i = 0; i < n; i++)
+		if (PQputCopyEnd(entries[i]->conn, NULL) != 1)
+			commands[i] = NULL;
+	for (int i = 0; i < n; i++)
+	{
+		if (commands[i] == NULL)
+			continue;
+		results[i] = libpqsrv_get_result_last(entries[i]->conn,
+											  wait_event_result);
+		entries[i]->busy = false;
+	}
+
+	/* A segment that could not end the COPY is a lost connection */
+	for (int i = 0; i < n; i++)
+		if (commands[i] == NULL)
+			commands[i] = "COPY";
+	gp_dispatch_check(copy_segments, entries, n, commands, results,
+					  "copying data", ERROR);
+
+	for (int i = 0; i < n; i++)
+		PQclear(results[i]);
+	copy_segments = NULL;
+	copy_nsegments = 0;
 }
 
 /* Run a command on all segments, and drop its results */
