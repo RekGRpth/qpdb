@@ -57,6 +57,13 @@ mkdir -p "$OUTDIR"
 	-c "SELECT count(*) FROM gp.cluster_segments()" >/dev/null ||
 	die "the cluster is not running, start it with gp-cluster.sh start"
 
+# test_setup makes a tablespace, which outlives the database that pg_regress
+# drops and remakes; without this a second run on the same cluster fails there
+"$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
+	-p "${GP_PORT:-9000}" -d postgres \
+	-c "DROP TABLESPACE IF EXISTS regress_tblspace" ||
+	die "could not drop the tablespace of the previous run"
+
 # Every session of the tests takes new tables to the segments
 PGOPTIONS="${PGOPTIONS:-} -c gp.default_distribution=first_column"
 export PGOPTIONS
