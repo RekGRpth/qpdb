@@ -129,8 +129,12 @@ segments, and DDL on them (`GRANT`, `COMMENT`, `ALTER EXTENSION ... SET
 SCHEMA`) goes there as well.
 
 What stays on the coordinator: temporary objects (functions and types of
-`pg_temp` too), extension `gp` with its schema and objects; one statement may
-not mix them with other objects.  Not sent yet: triggers, rules, policies,
+`pg_temp` too), extension `gp` with its schema and objects, and an object
+that depends on a temporary one, which stays with it — a function of a
+temporary sequence or type, a domain of a temporary type; one statement may
+not mix them with other objects.  A table `LIKE` a temporary one takes its
+columns on the coordinator, and the segments make it as the coordinator
+sees it.  Not sent yet: triggers, rules, policies,
 extended statistics, materialized views, foreign data, event triggers,
 tablespaces, `ALTER DATABASE` and `REINDEX`.  The segments need no SQL part of `gp`: its tables and functions
 are for the configuration of the cluster, and its settings come with the

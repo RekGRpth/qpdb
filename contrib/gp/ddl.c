@@ -130,6 +130,39 @@ gp_relation_is_local(const RangeVar *rv)
 }
 
 /*
+ * Whether an object depends on a temporary one, as pg_depend tells: a
+ * function of a temporary sequence or type, a domain of a temporary type.
+ * Such an object stays with what it depends on on the coordinator.
+ */
+static bool
+gp_object_depends_on_temp(Oid classid, Oid objid)
+{
+	bool		dependent;
+
+	SPI_connect();
+	dependent = SPI_execute(psprintf(
+								 "SELECT 1 FROM pg_catalog.pg_depend d "
+								 "WHERE d.classid OPERATOR(pg_catalog.=) %u "
+								 "AND d.objid OPERATOR(pg_catalog.=) %u "
+								 "AND (EXISTS (SELECT 1 FROM pg_catalog.pg_class t "
+								 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+								 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::regclass "
+								 "AND t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+								 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t "
+								 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+								 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::regclass "
+								 "AND t.typnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+								 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc t "
+								 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+								 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::regclass "
+								 "AND t.pronamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()))",
+								 classid, objid),
+							true, 1) == SPI_OK_SELECT && SPI_processed > 0;
+	SPI_finish();
+	return dependent;
+}
+
+/*
  * Whether a schema stays on the coordinator: a temporary one, one of
  * extension gp, or the schema of its control file, which CREATE EXTENSION
  * makes depend on the extension, but not a member of it.
@@ -189,7 +222,8 @@ gp_object_is_local(ObjectType type, Node *object)
 					return true;
 				typid = LookupTypeNameOid(NULL, typname, true);
 				return OidIsValid(typid) &&
-					gp_is_member_of_gp(TypeRelationId, typid);
+					(gp_is_member_of_gp(TypeRelationId, typid) ||
+					 gp_object_depends_on_temp(TypeRelationId, typid));
 			}
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
@@ -202,7 +236,8 @@ gp_object_is_local(ObjectType type, Node *object)
 					return true;
 				funcid = LookupFuncWithArgs(type, owa, true);
 				return OidIsValid(funcid) &&
-					gp_is_member_of_gp(ProcedureRelationId, funcid);
+					(gp_is_member_of_gp(ProcedureRelationId, funcid) ||
+					 gp_object_depends_on_temp(ProcedureRelationId, funcid));
 			}
 		default:
 			return false;
@@ -229,7 +264,7 @@ gp_objects_dispatched(ObjectType type, List *objects)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("cannot operate on objects of the coordinator and of the cluster at once"),
-				errdetail("Temporary objects and objects of extension gp are on the coordinator only."),
+				errdetail("Temporary objects, objects of extension gp and objects that depend on a temporary one are on the coordinator only."),
 				errhint("Use separate commands."));
 	return nlocal == 0;
 }
@@ -703,6 +738,31 @@ gp_dispatch_nonxact_stmt(Node *parsetree, const char *sql, const char *oids)
 }
 
 /*
+ * Whether CREATE TABLE has a LIKE clause of a relation that stays on the
+ * coordinator: the segments cannot run it, and take the table as the
+ * coordinator sees it instead
+ */
+static bool
+gp_create_like_local(CreateStmt *stmt)
+{
+	ListCell   *lc;
+
+	/*
+	 * Before the statement runs: its tree still has the LIKE clauses, as
+	 * transformCreateStmt() of the run replaces them with the columns
+	 */
+	foreach(lc, stmt->tableElts)
+	{
+		Node	   *elt = lfirst(lc);
+
+		if (IsA(elt, TableLikeClause) &&
+			gp_relation_is_local(((TableLikeClause *) elt)->relation))
+			return true;
+	}
+	return false;
+}
+
+/*
  * The DDL that makes a table of CREATE TABLE AS on the segments: its columns
  * as they are, and no rows
  */
@@ -732,6 +792,8 @@ gp_table_ddl(Oid relid)
 			att->attcollation != get_typcollation(att->atttypid))
 			appendStringInfo(&buf, " COLLATE %s",
 							 generate_collation_name(att->attcollation));
+		if (att->attnotnull)
+			appendStringInfoString(&buf, " NOT NULL");
 		first = false;
 	}
 	appendStringInfoChar(&buf, ')');
@@ -841,6 +903,7 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	MemoryContext oldcontext = CurrentMemoryContext;
 	char	   *oids = NULL;
 	int			mark = 0;
+	bool		like_local = false;
 
 	/* COPY into a distributed table goes to the segments instead */
 	if (IsA(parsetree, CopyStmt) && dispatch_depth == 0 && IsUnderPostmaster &&
@@ -857,6 +920,14 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (gp_dispatch_ddl && dispatch_depth == 0 && !creating_extension &&
 		IsUnderPostmaster)
 		mode = gp_ddl_dispatched(parsetree);
+
+	/*
+	 * Before the statement runs: its tree still has the LIKE clauses, as
+	 * the run replaces them with the columns it read
+	 */
+	like_local = mode == GP_DISPATCH_XACT && IsA(parsetree, CreateStmt) &&
+		gp_create_like_local((CreateStmt *) parsetree);
+
 	if (mode != GP_DISPATCH_NONE)
 	{
 		mark = gp_oids_mark();
@@ -896,13 +967,32 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 		gp_relation_is_local(((ViewStmt *) parsetree)->view))
 		mode = GP_DISPATCH_NONE;
 
-	/* The body of a function may use what stays on the coordinator, as a temporary table */
+	/*
+	 * An object that depends on a temporary one stays with it on the
+	 * coordinator, like such a view: a function of a temporary sequence
+	 * or type, a domain of a temporary type
+	 */
+	if (mode == GP_DISPATCH_XACT && gp_oids_depend_on_temp(mark))
+		mode = GP_DISPATCH_NONE;
+
+	/*
+	 * The body of a function may use what stays on the coordinator, as a
+	 * temporary table.  A table LIKE one that stays there cannot run on the
+	 * segments as it is: they make the table as the coordinator sees it.
+	 */
 	if (mode == GP_DISPATCH_XACT)
+	{
+		const char *sql = gp_statement_text(pstmt, queryString);
+
+		if (like_local)
+			sql = gp_table_ddl(RangeVarGetRelid(((CreateStmt *) parsetree)->relation,
+												NoLock, false));
 		gp_dispatch_xact(psprintf("SET LOCAL gp.dispatch_oids = %s; %s%s",
 								  quote_literal_cstr(gp_oids_since(mark)),
 								  IsA(parsetree, CreateFunctionStmt) ?
 								  "SET LOCAL check_function_bodies = off; " : "",
-								  gp_statement_text(pstmt, queryString)));
+								  sql));
+	}
 	else if (mode == GP_DISPATCH_NONXACT)
 		gp_dispatch_nonxact_stmt(parsetree,
 								 gp_statement_text(pstmt, queryString), oids);

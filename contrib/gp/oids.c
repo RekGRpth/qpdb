@@ -31,6 +31,7 @@
 
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -335,6 +336,61 @@ gp_oids_since(int mark)
 		appendStringInfo(&buf, "%s%u:%u", i > mark ? "," : "",
 						 recorded[i].catalog, recorded[i].oid);
 	return buf.data;
+}
+
+/*
+ * Coordinator: whether an object made since the mark depends on a
+ * temporary one, as pg_depend tells.  Such an object stays with what it
+ * depends on on the coordinator.
+ */
+bool
+gp_oids_depend_on_temp(int mark)
+{
+	StringInfoData sql;
+	bool		dependent;
+	bool		fresh;
+
+	if (nrecorded == mark)
+		return false;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT 1 FROM pg_catalog.pg_depend d "
+					 "WHERE ROW (d.classid, d.objid) IN (VALUES ");
+	for (int i = mark; i < nrecorded; i++)
+		appendStringInfo(&sql, "%s(%u::pg_catalog.oid, %u::pg_catalog.oid)",
+						 i > mark ? ", " : "",
+						 recorded[i].catalog, recorded[i].oid);
+	appendStringInfo(&sql,
+					 ") AND (EXISTS (SELECT 1 FROM pg_catalog.pg_class t "
+					 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+					 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::regclass "
+					 "AND t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+					 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t "
+					 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+					 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::regclass "
+					 "AND t.typnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+					 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc t "
+					 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
+					 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::regclass "
+					 "AND t.pronamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()))");
+
+	/*
+	 * The rows of the statement are newer than its snapshot, as it may run
+	 * inside a function that has planned the next statement already; a
+	 * parallel operation cannot take a snapshot, and writes nothing
+	 */
+	fresh = !IsInParallelMode();
+	SPI_connect();
+	if (fresh)
+		PushActiveSnapshot(GetLatestSnapshot());
+	dependent = SPI_execute(sql.data, true, 1) == SPI_OK_SELECT &&
+		SPI_processed > 0;
+	if (fresh)
+		PopActiveSnapshot();
+	SPI_finish();
+	pfree(sql.data);
+	return dependent;
 }
 
 /*

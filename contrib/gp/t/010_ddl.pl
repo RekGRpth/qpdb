@@ -172,6 +172,37 @@ fails(
 run('SET gp.dispatch_ddl = off; CREATE TABLE s.only_here (a int)');
 is(where('s.only_here'), 'f f', 'gp.dispatch_ddl = off keeps DDL on the coordinator');
 
+# A table LIKE a temporary one takes its columns on the coordinator: the
+# segments cannot read the source, and make the table as it came out
+run(q{CREATE TEMP TABLE tt_src (a int primary key);
+CREATE TABLE s.like_src (LIKE tt_src)});
+is( $coordinator->safe_psql('postgres', "SELECT to_regclass('s.like_src') IS NOT NULL")
+	  . ' ' . where('s.like_src'),
+	't t t',
+	'a table LIKE a temporary one goes to the segments with its columns');
+run(q{ALTER TABLE s.like_src ADD COLUMN b int;
+CREATE INDEX like_src_idx ON s.like_src (a);
+TRUNCATE s.like_src;
+DROP TABLE s.like_src});
+pass('a table LIKE a temporary one takes its DDL after it');
+
+# Objects that depend on a temporary one stay with it on the coordinator
+run(q{CREATE TEMP SEQUENCE tsq;
+CREATE FUNCTION s.f_temp_seq() RETURNS int LANGUAGE sql RETURN nextval('tsq');
+SELECT s.f_temp_seq();
+DROP FUNCTION s.f_temp_seq()});
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT to_regprocedure('s.f_temp_seq()') IS NOT NULL") } @segments),
+	'f f',
+	'a function of a temporary sequence stays on the coordinator');
+
+run(q{CREATE TEMP TABLE t_arg (a int);
+CREATE FUNCTION s.f_temp_arg(v t_arg) RETURNS int LANGUAGE sql RETURN v.a;
+CREATE DOMAIN s.d_temp AS t_arg[];
+DROP FUNCTION s.f_temp_arg(t_arg);
+DROP DOMAIN s.d_temp});
+pass('functions and domains of a temporary type stay on the coordinator');
+
 # What is refused
 fails('ALTER TABLE s.t ADD COLUMN at timestamptz DEFAULT now()',
 	qr/cannot compute column "at" with a non-immutable expression on a cluster/,
