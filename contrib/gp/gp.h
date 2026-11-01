@@ -121,7 +121,7 @@ extern void gp_assign_dispatch_oids(const char *newval, void *extra);
 extern int	gp_oids_mark(void);
 extern void gp_oids_keep(bool keep);
 extern char *gp_oids_since(int mark);
-extern bool gp_oids_depend_on_temp(int mark);
+extern bool gp_oids_depend_on_local(int mark);
 
 /* ddl.c */
 extern bool gp_dispatch_ddl;
