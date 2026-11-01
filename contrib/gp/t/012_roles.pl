@@ -144,6 +144,50 @@ fails('GRANT USAGE ON SCHEMA gp, s TO g1',
 	qr/cannot operate on objects of the coordinator and of the cluster at once/,
 	'objects of both kinds in one GRANT');
 
+# A role of the session, a role that cannot log in and a SECURITY DEFINER
+# function: the segments run the commands as the same user as the
+# coordinator, and the objects get the same owner everywhere
+run('CREATE ROLE u1 LOGIN');
+run('GRANT USAGE, CREATE ON SCHEMA s TO u1');
+run(q{SET ROLE u1;
+CREATE TABLE s.u1t (a int);
+GRANT SELECT ON s.u1t TO PUBLIC;
+RESET ROLE});
+same(q{SELECT relowner::regrole FROM pg_class WHERE oid = 's.u1t'::regclass},
+	'a table of a role of the session has the same owner on the segments');
+run('SET ROLE u1;
+DROP TABLE s.u1t;
+RESET ROLE');
+
+run('CREATE ROLE a1');
+run('GRANT USAGE, CREATE ON SCHEMA s TO a1');
+run(q{SET SESSION AUTHORIZATION a1;
+CREATE TABLE s.a1t (a int);
+RESET SESSION AUTHORIZATION});
+same(q{SELECT relowner::regrole FROM pg_class WHERE oid = 's.a1t'::regclass},
+	'a table of a role that cannot log in has the same owner on the segments');
+run('SET SESSION AUTHORIZATION a1;
+DROP TABLE s.a1t;
+RESET SESSION AUTHORIZATION');
+
+run('CREATE ROLE d1');
+run('CREATE ROLE m1 LOGIN');
+run('GRANT USAGE ON SCHEMA s TO m1, d1');
+run('ALTER TABLE s.t OWNER TO d1');
+run('CREATE FUNCTION s.definer() RETURNS void LANGUAGE sql SECURITY DEFINER
+	AS $$ GRANT SELECT ON s.t TO m1 $$');
+run('ALTER FUNCTION s.definer() OWNER TO d1');
+run('SET ROLE m1;
+SELECT s.definer();
+RESET ROLE');
+same(q{SELECT relacl FROM pg_class WHERE oid = 's.t'::regclass},
+	'a grant of a SECURITY DEFINER function is the same on the segments');
+run('REVOKE SELECT ON s.t FROM m1');
+run('DROP FUNCTION s.definer()');
+run('ALTER TABLE s.t OWNER TO CURRENT_USER');
+run('DROP OWNED BY u1, a1, d1, m1');
+run('DROP ROLE u1, a1, d1, m1');
+
 # Roles go away
 run('REASSIGN OWNED BY r2 TO CURRENT_USER');
 run('DROP OWNED BY r2, g1');

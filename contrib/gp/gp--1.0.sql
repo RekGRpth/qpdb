@@ -273,10 +273,12 @@ $$;
 REVOKE ALL ON FUNCTION gp.distribute(regclass, name[], regclass) FROM PUBLIC;
 
 -- A dropped table loses its policy, lest a new table get its OID and the
--- policy with it
+-- policy with it.  Defined as SECURITY DEFINER: a user that drops a table
+-- of its own has no business with the policy tables of the extension.
 CREATE FUNCTION gp.drop_distribution_policy()
 RETURNS event_trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN

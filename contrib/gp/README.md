@@ -59,13 +59,19 @@ address, or an address under another number, is refused.
 
 A session of the coordinator opens a connection to a segment when it needs
 it first and keeps it until it ends.  It connects to the database of the
-session as the session user, without a password: segments trust the
-coordinator by `pg_hba.conf`, certificates or a password file.
+session as the user that logged in, without a password: segments trust the
+coordinator by `pg_hba.conf`, certificates or a password file.  `SET
+SESSION AUTHORIZATION` may take the session to a role that cannot log in,
+so the connection always takes the login user.
 
 Before a command, the segments get the settings of the session: those a
 user may change, set for the database, the role, the client or the session
-rather than in the configuration of the server, and `SET ROLE`.  A
-connection remembers what it has got and gets only the difference.
+rather than in the configuration of the server, and the role of the
+commands, which follows `SET ROLE`, `SET SESSION AUTHORIZATION` and
+`SECURITY DEFINER` functions alike, so a command runs on the segments as
+the same user as on the coordinator and the objects it creates get the
+same owner.  A connection remembers what it has got and gets only the
+difference.
 
 `gp.exec_on_all(sql)` sends a command to all segments at once and returns
 the command status of each.  Each segment runs it in a transaction of its
@@ -324,10 +330,11 @@ contrib/gp/tools/gp-pg-regress.sh test_setup select join aggregates
 ```
 
 The diffs are in `$GP_CLUSTER_DIR/regress`.  A test needs the tables of those
-it depends on, as in the schedule, and a cluster that has not run it before:
-run `gp-cluster.sh destroy`, `init` and `start` again between runs.  Not every
-difference is a mistake: tablespaces, non-superusers and the statements listed
-above as not sent are known.
+it depends on, as in the schedule.  The script drops the tablespace of the
+previous run, so a rerun on the same cluster works when the previous run
+succeeded; roles of a failed run linger, and call for `gp-cluster.sh destroy`,
+`init` and `start` again.  Not every difference is a mistake: tablespaces,
+materialized views and the statements listed above as not sent are known.
 
 CI runs the tests of `tools/gp-pg-regress.tests` this way weekly and on
 demand (`gp-pg-regress.yml`).  The job does not fail the workflow: it shows
@@ -348,8 +355,8 @@ All are set at server start unless noted.
 | `gp.host` | `localhost` | Host of a segment for the other servers |
 | `gp.register_retry_interval` | 5s | Time between attempts of a segment to register |
 | `gp.max_segments` | 64 | Size of the copy of `gp.segments` on the coordinator |
-| `gp.dispatch_oids` | | OIDs of a command from the coordinator; superuser, set per command |
-| `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block; superuser |
+| `gp.dispatch_oids` | | OIDs of a command from the coordinator; set per command by the coordinator, not in the configuration of a server |
+| `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
 | `gp.dispatch_ddl` | on | Sends DDL of the coordinator to the segments; superuser, for maintenance |
 | `gp.default_distribution` | `coordinator` | `first_column` distributes new tables by their first column; settable by a user |
@@ -412,10 +419,14 @@ by the patch and `contrib/gp`.
    commands that run outside a transaction and extensions.
 3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT`,
    direct dispatch of `INSERT` and `SELECT` through a gather are done, and
-   tests of PostgreSQL run on the cluster; next are `gp_segment_id()`,
-   stable functions of time on the coordinator, the gaps that those tests
-   show (`DDL` in savepoints, materialized views, non-superusers,
-   tablespaces) and a comparison with a vanilla server.
+   tests of PostgreSQL run on the cluster, 132 of the 156 of the schedule
+   passing: what fails is known — materialized views, rules, extended
+   statistics, foreign data and `REINDEX` stay on the coordinator while
+   commands around them go to the segments, temporary objects in a command
+   of the cluster, and the refusals of non-immutable expressions; next are
+   `gp_segment_id()`, stable functions of time on the coordinator, a
+   comparison with a vanilla server and answers of our own for the tests
+   that differ on purpose.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

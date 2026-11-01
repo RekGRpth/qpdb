@@ -5,16 +5,18 @@
  *
  * A session opens a connection to a segment when it needs it first, and
  * keeps it until the session ends.  It connects to the database of the
- * session as its session user, without a password: the segments trust the
- * coordinator by pg_hba.conf, certificates or a password file.  A
- * connection to a segment that has left gp.segments or moved is closed,
+ * session as the user that logged in, without a password: the segments
+ * trust the coordinator by pg_hba.conf, certificates or a password file.
+ * A connection to a segment that has left gp.segments or moved is closed,
  * and a broken one is dropped, to be opened again on the next use.
  *
  * Before a command, the segments get the settings of the session: those a
  * user may change, set for the database, the role, the client or the
- * session rather than in the configuration of the server.  A connection
- * remembers what it has got, and gets the difference only when the
- * settings change.
+ * session rather than in the configuration of the server, and the role of
+ * the commands, which follows SET ROLE, SET SESSION AUTHORIZATION and
+ * SECURITY DEFINER functions alike, so a segment runs a command as the
+ * same user as the coordinator.  A connection remembers what it has got,
+ * and gets the difference only when the settings change.
  *
  * DDL runs on the segments in transactions that follow the transaction of
  * the coordinator: the first command opens one, and the end of the
@@ -48,6 +50,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/guc_tables.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
@@ -429,7 +432,7 @@ gp_connection_open(const GpSegment *segment)
 	values[0] = segment->host;
 	values[1] = port;
 	values[2] = get_database_name(MyDatabaseId);
-	values[3] = GetUserNameFromId(GetSessionUserId(), false);
+	values[3] = GetConfigOptionResetString("session_authorization");
 	values[4] = "gp coordinator";
 	values[5] = GetDatabaseEncodingName();
 	values[6] = NULL;
@@ -496,8 +499,11 @@ gp_setting_synced(const struct config_generic *var, bool superuser)
 			return false;
 	}
 
-	/* Settings of a transaction or of the session user, but SET ROLE */
-	if ((var->flags & GUC_NO_RESET_ALL) && strcmp(var->name, "role") != 0)
+	/*
+	 * Settings of a transaction or of the session user, which the connection
+	 * keeps getting back; the identity of the session is not a setting here
+	 */
+	if (var->flags & GUC_NO_RESET_ALL)
 		return false;
 
 	/* The connection sets these itself */
@@ -518,7 +524,12 @@ gp_setting_cmp(const void *a, const void *b)
 
 /*
  * The settings of the session that the segments get, as "name\0value\0"
- * pairs sorted by name
+ * pairs in a fixed order.  The pair "role", when the commands run as
+ * another user than the one that logged in, carries that user: SET ROLE,
+ * SET SESSION AUTHORIZATION and a SECURITY DEFINER function all change it,
+ * and a segment runs its command as the same user, so that objects get the
+ * same owner and a command of a role (CREATE ROLE gives the creator the
+ * ADMIN membership) takes the same path everywhere.
  */
 static void
 gp_settings_collect(StringInfo settings)
@@ -543,6 +554,17 @@ gp_settings_collect(StringInfo settings)
 		appendBinaryStringInfo(settings, value, strlen(value) + 1);
 	}
 	pfree(synced);
+
+	{
+		const char *effective = GetUserNameFromId(GetUserId(), false);
+
+		if (strcmp(effective,
+				   GetConfigOptionResetString("session_authorization")) != 0)
+		{
+			appendBinaryStringInfo(settings, "role", strlen("role") + 1);
+			appendBinaryStringInfo(settings, effective, strlen(effective) + 1);
+		}
+	}
 }
 
 static bool
@@ -578,6 +600,10 @@ gp_append_setting_name(StringInfo buf, const char *name)
  * The command that gives a connection the settings wanted: RESET of those
  * it has got but are not wanted any more, set_config() of the others, which
  * parses a list like search_path as SET does.  NULL if it has them already.
+ *
+ * The role comes off first, so that the settings run as the user that
+ * logged in and may reset what only a superuser can, and back last, as the
+ * user the commands of the session run as.
  */
 static char *
 gp_settings_command(const GpConnection *entry, const StringInfo wanted)
@@ -592,9 +618,12 @@ gp_settings_command(const GpConnection *entry, const StringInfo wanted)
 
 	initStringInfo(&cmd);
 
+	/* The settings run as the user that logged in, not as the role before */
+	appendStringInfoString(&cmd, "RESET role; ");
+
 	/* After a rollback, start from the settings of the server */
 	if (entry->settings_len < 0)
-		appendStringInfoString(&cmd, "RESET ALL; RESET role; ");
+		appendStringInfoString(&cmd, "RESET ALL; ");
 
 	for (const char *p = sent; p < sent + Max(entry->settings_len, 0);)
 	{
@@ -602,7 +631,8 @@ gp_settings_command(const GpConnection *entry, const StringInfo wanted)
 
 		p += strlen(p) + 1;
 		p += strlen(p) + 1;
-		if (gp_settings_has(wanted->data, wanted->len, name))
+		if (strcmp(name, "role") == 0 ||
+			gp_settings_has(wanted->data, wanted->len, name))
 			continue;
 		appendStringInfoString(&cmd, "RESET ");
 		gp_append_setting_name(&cmd, name);
@@ -614,9 +644,26 @@ gp_settings_command(const GpConnection *entry, const StringInfo wanted)
 		const char *value = (p += strlen(p) + 1);
 
 		p += strlen(p) + 1;
+		if (strcmp(name, "role") == 0)
+			continue;
 		appendStringInfo(&cmd, "%s pg_catalog.set_config(%s, %s, false)",
 						 first ? "SELECT" : ",",
 						 quote_literal_cstr(name), quote_literal_cstr(value));
+		first = false;
+	}
+
+	/* The role last, as the user the commands of the session run as */
+	for (const char *p = wanted->data; p < wanted->data + wanted->len;)
+	{
+		const char *name = p;
+		const char *value = (p += strlen(p) + 1);
+
+		p += strlen(p) + 1;
+		if (strcmp(name, "role") != 0)
+			continue;
+		appendStringInfo(&cmd, "%s pg_catalog.set_config('role', %s, false)",
+						 first ? "SELECT" : ",",
+						 quote_literal_cstr(value));
 		first = false;
 	}
 	return cmd.data;
