@@ -2,9 +2,12 @@
 # order of the schedule, which they depend on; blank and # lines are skipped.
 test_setup boolean char name varchar text int2 int4 int8 oid float4 float8
 bit numeric date time timetz timestamp timestamptz interval inet horology
-create_function_c create_misc create_operator create_procedure create_table
-create_type create_schema create_index create_view create_function_sql
+point lseg line box path polygon circle geometry
+create_aggregate create_function_c create_misc create_operator create_procedure create_table
+create_type create_schema create_index create_index_spgist create_view
+create_function_sql create_am
 select_into portals update delete prepared_xacts brin gin gist spgist
+hash_index
 privileges init_privs security_label collate matview lock replica_identity
 rowsecurity object_address tablesample groupingsets drop_operator password
 identity generated_stored join_hash create_table_like alter_generic
@@ -19,5 +22,5 @@ polymorphism rowtypes returning largeobject with xml partition_join
 partition_prune reloptions hash_part indexing partition_aggregate
 partition_info tuplesort explain memoize predicate eager_aggregate
 planner_est cluster select subselect union case join aggregates arrays
-btree_index hash_index insert copy copyselect copydml insert_conflict
+btree_index insert copy copyselect copydml insert_conflict
 typed_table vacuum updatable_views
