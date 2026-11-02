@@ -68,6 +68,30 @@ mkdir -p "$OUTDIR"
 PGOPTIONS="${PGOPTIONS:-} -c gp.default_distribution=first_column"
 export PGOPTIONS
 
+# Answers of our own: a test that differs on purpose keeps a copy of its
+# output as pgtests/expected/foo.gp.out, which takes the place of the answer
+# of PostgreSQL.  The numbered answers of such a test go away, so a cluster
+# answer cannot hide behind one of them, and neither can an answer of
+# PostgreSQL show up as the cluster one by mistake.
+ANSWERS=$(dirname "$0")/../pgtests/expected
+EXPECTED="$OUTDIR/expected"
+found=false
+for answer in "$ANSWERS"/*.gp.out; do
+	[ -e "$answer" ] || continue
+	if ! $found; then
+		found=true
+		rm -rf "$EXPECTED"
+		mkdir -p "$EXPECTED/expected"
+		cp "$PG_SRC"/expected/*.out "$EXPECTED/expected/"
+	fi
+	test=$(basename "$answer" .gp.out)
+	cp "$answer" "$EXPECTED/expected/$test.out"
+	rm -f "$EXPECTED/expected/${test}"_[0-9]*.out
+done
+if $found; then
+	set -- --expecteddir="$EXPECTED" "$@"
+fi
+
 exec "$PG_REGRESS" --host=localhost --port="${GP_PORT:-9000}" \
 	--bindir="$PGBIN" --inputdir="$PG_SRC" --outputdir="$OUTDIR" \
 	--dlpath="$DLPATH" --dbname=regression "$@"

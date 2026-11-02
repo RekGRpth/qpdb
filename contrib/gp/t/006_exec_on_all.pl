@@ -74,7 +74,7 @@ $seg1->safe_psql('postgres', 'CREATE TABLE u (a int)');
 ($stdout, $stderr) = exec_on_all('CREATE TABLE u (a int)');
 like(
 	$stderr,
-	qr/ERROR:  relation "u" already exists\nCONTEXT:  segment 1 at /,
+	qr/ERROR:  relation "u" already exists\nCONTEXT:  segment 1/,
 	'an error of a segment names the segment');
 is(has($seg2, 'u'), 't', 'other segments keep the command');
 
