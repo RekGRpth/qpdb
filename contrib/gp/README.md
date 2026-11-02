@@ -111,7 +111,8 @@ What goes to the segments: `CREATE`, `ALTER` and `DROP` of tables, indexes,
 sequences and views; `CREATE SCHEMA` and `DROP SCHEMA`; composite, enum and
 range types, domains, `ALTER TYPE ... ADD VALUE`; base and shell types,
 operators, aggregates, casts, collations, conversions, operator classes and
-families, text search objects, transforms and access methods; `CREATE` and
+families, text search objects, transforms and access methods; extended
+statistics, which hold no rows of their own; `CREATE` and
 `ALTER` of functions and procedures, whose bodies the segments do not check
 (`check_function_bodies = off`), as a body may use a temporary table;
 renaming and moving to another schema; roles,
@@ -134,9 +135,12 @@ that depends on a temporary one, which stays with it — a function of a
 temporary sequence or type, a domain of a temporary type; one statement may
 not mix them with other objects.  A table `LIKE` a temporary one takes its
 columns on the coordinator, and the segments make it as the coordinator
-sees it.  Not sent yet: triggers, rules, policies,
-extended statistics, materialized views, foreign data, event triggers,
-tablespaces, `ALTER DATABASE` and `REINDEX`.  The segments need no SQL part of `gp`: its tables and functions
+sees it.  Materialized views and foreign tables never go to the segments,
+and the commands on them — an index, `ALTER`, `GRANT`, `COMMENT`,
+`REFRESH` — stay on the coordinator with them.  Not sent yet: triggers,
+policies, event triggers, tablespaces and `ALTER DATABASE`.  What is
+refused, as it would stay on the coordinator while the commands around
+it go to the segments: rules on tables of the cluster.  The segments need no SQL part of `gp`: its tables and functions
 are for the configuration of the cluster, and its settings come with the
 library.  What is refused: `ALTER TABLE` that computes a column with a
 non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
@@ -164,10 +168,10 @@ lists such transactions.
 
 #### Commands outside a transaction
 
-`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `CREATE INDEX CONCURRENTLY`
-and `DROP INDEX CONCURRENTLY` cannot run in a transaction block, so the
-coordinator runs them first and then all segments at once, each in a
-transaction of its own.  Two-phase commit does not cover them.  The
+`CREATE DATABASE`, `DROP DATABASE`, `VACUUM`, `REINDEX`, `CREATE INDEX
+CONCURRENTLY` and `DROP INDEX CONCURRENTLY` cannot run in a transaction
+block, so the coordinator runs them first and then all segments at once,
+each in a transaction of its own.  Two-phase commit does not cover them.  The
 coordinator is the first to run them, as it gives the OIDs of `CREATE
 DATABASE` and `CREATE INDEX CONCURRENTLY`.  A segment gets them by `SET
 gp.dispatch_oids` in the session, with `gp.dispatch_oids_session` on, in a

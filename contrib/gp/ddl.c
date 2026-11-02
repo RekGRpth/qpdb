@@ -37,6 +37,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/relation.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
@@ -44,6 +45,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_rewrite.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -63,6 +65,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/syscache.h"
 
 #include "gp.h"
 
@@ -129,13 +132,39 @@ gp_relation_is_local(const RangeVar *rv)
 		 gp_is_member_of_gp(RelationRelationId, relid));
 }
 
+static bool gp_view_is_local(const RangeVar *rv);
+
 /*
- * Whether an object depends on a temporary one, as pg_depend tells: a
- * function of a temporary sequence or type, a domain of a temporary type.
- * Such an object stays with what it depends on on the coordinator.
+ * Whether a table stays on the coordinator: a relation that does, or one
+ * of the kinds that never go to the segments, whose commands then stay
+ * with them there.  A view stays with what it reads.
  */
 static bool
-gp_object_depends_on_temp(Oid classid, Oid objid)
+gp_table_is_local(const RangeVar *rv)
+{
+	Oid			relid;
+	char		relkind;
+
+	if (gp_relation_is_local(rv))
+		return true;
+
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (!OidIsValid(relid))
+		return false;
+	relkind = get_rel_relkind(relid);
+	if (relkind == RELKIND_VIEW)
+		return gp_view_is_local(rv);
+	return relkind == RELKIND_MATVIEW || relkind == RELKIND_FOREIGN_TABLE;
+}
+
+/*
+ * Whether an object depends on what the segments do not have, as pg_depend
+ * tells: a function of a temporary sequence or type, a domain of a
+ * temporary type, a view of a materialized view.  Such an object stays
+ * with what it depends on on the coordinator.
+ */
+static bool
+gp_object_depends_on_local(Oid classid, Oid objid)
 {
 	bool		dependent;
 
@@ -147,7 +176,8 @@ gp_object_depends_on_temp(Oid classid, Oid objid)
 								 "AND (EXISTS (SELECT 1 FROM pg_catalog.pg_class t "
 								 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
 								 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::regclass "
-								 "AND t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+								 "AND (t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema() "
+								 "OR t.relkind IN ('m', 'f'))) "
 								 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t "
 								 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
 								 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::regclass "
@@ -180,6 +210,30 @@ gp_schema_is_local(const char *name)
 }
 
 /*
+ * Whether a view depends on what the segments do not have: a temporary
+ * table, a materialized view.  Its dependencies hang on its rule, and the
+ * view stays with what it reads.
+ */
+static bool
+gp_view_is_local(const RangeVar *rv)
+{
+	Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+	HeapTuple	rule;
+	bool		local;
+
+	if (!OidIsValid(relid))
+		return false;
+	rule = SearchSysCache2(RULERELNAME, ObjectIdGetDatum(relid),
+						   CStringGetDatum("_RETURN"));
+	if (!HeapTupleIsValid(rule))
+		return false;
+	local = gp_object_depends_on_local(RewriteRelationId,
+									   ((Form_pg_rewrite) GETSTRUCT(rule))->oid);
+	ReleaseSysCache(rule);
+	return local;
+}
+
+/*
  * Whether an object, as a statement names it, stays on the coordinator.
  * Objects that do not exist do not: the statement fails anyway.
  */
@@ -189,15 +243,23 @@ gp_object_is_local(ObjectType type, Node *object)
 	if (object == NULL)
 		return false;
 	if (IsA(object, RangeVar))
+	{
+		if (type == OBJECT_TABLE)
+			return gp_table_is_local((RangeVar *) object);
+		if (type == OBJECT_VIEW)
+			return gp_view_is_local((RangeVar *) object);
 		return gp_relation_is_local((RangeVar *) object);
+	}
 
 	switch (type)
 	{
 		case OBJECT_TABLE:
+			return gp_table_is_local(makeRangeVarFromNameList(castNode(List, object)));
 		case OBJECT_INDEX:
 		case OBJECT_SEQUENCE:
-		case OBJECT_VIEW:
 			return gp_relation_is_local(makeRangeVarFromNameList(castNode(List, object)));
+		case OBJECT_VIEW:
+			return gp_view_is_local(makeRangeVarFromNameList(castNode(List, object)));
 		case OBJECT_COLUMN:
 		case OBJECT_TABCONSTRAINT:
 			{
@@ -205,10 +267,12 @@ gp_object_is_local(ObjectType type, Node *object)
 				List	   *names = castNode(List, object);
 				List	   *relname = list_copy_head(names, list_length(names) - 1);
 
-				return gp_relation_is_local(makeRangeVarFromNameList(relname));
+				return gp_table_is_local(makeRangeVarFromNameList(relname));
 			}
 		case OBJECT_SCHEMA:
 			return gp_schema_is_local(strVal(object));
+		case OBJECT_STATISTIC_EXT:
+			return gp_names_are_local(castNode(List, object));
 		case OBJECT_EXTENSION:
 			return strcmp(strVal(object), "gp") == 0;
 		case OBJECT_TYPE:
@@ -223,7 +287,7 @@ gp_object_is_local(ObjectType type, Node *object)
 				typid = LookupTypeNameOid(NULL, typname, true);
 				return OidIsValid(typid) &&
 					(gp_is_member_of_gp(TypeRelationId, typid) ||
-					 gp_object_depends_on_temp(TypeRelationId, typid));
+					 gp_object_depends_on_local(TypeRelationId, typid));
 			}
 		case OBJECT_FUNCTION:
 		case OBJECT_PROCEDURE:
@@ -237,7 +301,7 @@ gp_object_is_local(ObjectType type, Node *object)
 				funcid = LookupFuncWithArgs(type, owa, true);
 				return OidIsValid(funcid) &&
 					(gp_is_member_of_gp(ProcedureRelationId, funcid) ||
-					 gp_object_depends_on_temp(ProcedureRelationId, funcid));
+					 gp_object_depends_on_local(ProcedureRelationId, funcid));
 			}
 		default:
 			return false;
@@ -409,6 +473,7 @@ gp_drop_dispatched(DropStmt *stmt)
 		case OBJECT_OPCLASS:
 		case OBJECT_OPFAMILY:
 		case OBJECT_TRANSFORM:
+		case OBJECT_STATISTIC_EXT:
 		case OBJECT_ACCESS_METHOD:
 		case OBJECT_TSCONFIGURATION:
 		case OBJECT_TSDICTIONARY:
@@ -449,6 +514,7 @@ gp_object_type_dispatched(ObjectType type)
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
 		case OBJECT_DOMCONSTRAINT:
+		case OBJECT_STATISTIC_EXT:
 		case OBJECT_SCHEMA:
 		case OBJECT_EXTENSION:
 		case OBJECT_ROLE:
@@ -609,6 +675,31 @@ gp_ddl_dispatched_xact(Node *parsetree)
 									   (Node *) ((AlterFunctionStmt *) parsetree)->func);
 		case T_DefineStmt:
 			return !gp_names_are_local(((DefineStmt *) parsetree)->defnames);
+		case T_CreateStatsStmt:
+			{
+				CreateStatsStmt *stmt = (CreateStatsStmt *) parsetree;
+				ListCell   *lc;
+
+				if (gp_names_are_local(stmt->defnames))
+					return false;
+
+				/*
+				 * The table the statistics are on stays on the
+				 * coordinator: the statistics stay with it.  The list
+				 * knows a subquery as well, which stays untransformed
+				 * until the statement runs.
+				 */
+				foreach(lc, stmt->relations)
+				{
+					Node	   *n = lfirst(lc);
+
+					if (IsA(n, RangeVar) && gp_relation_is_local((RangeVar *) n))
+						return false;
+				}
+				return true;
+			}
+		case T_AlterStatsStmt:
+			return !gp_names_are_local(((AlterStatsStmt *) parsetree)->defnames);
 		case T_CreateSchemaStmt:
 		case T_AlterEnumStmt:
 		case T_AlterDomainStmt:
@@ -654,16 +745,32 @@ gp_ddl_dispatched(Node *parsetree)
 			{
 				IndexStmt  *stmt = (IndexStmt *) parsetree;
 
-				if (gp_relation_is_local(stmt->relation))
+				if (gp_table_is_local(stmt->relation))
 					return GP_DISPATCH_NONE;
 				return stmt->concurrent ? GP_DISPATCH_NONXACT : GP_DISPATCH_XACT;
 			}
 		case T_AlterTableStmt:
 			{
 				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+				ListCell   *lc;
 
-				if (gp_relation_is_local(stmt->relation))
+				if (gp_table_is_local(stmt->relation))
 					return GP_DISPATCH_NONE;
+
+				/*
+				 * A rule stays on the coordinator, and so does a command
+				 * that only turns one on or off
+				 */
+				foreach(lc, stmt->cmds)
+				{
+					AlterTableCmd *cmd = lfirst(lc);
+
+					if (cmd->subtype == AT_EnableRule ||
+						cmd->subtype == AT_EnableReplicaRule ||
+						cmd->subtype == AT_EnableAlwaysRule ||
+						cmd->subtype == AT_DisableRule)
+						return GP_DISPATCH_NONE;
+				}
 				gp_check_alter_table(stmt);
 				return GP_DISPATCH_XACT;
 			}
@@ -678,6 +785,43 @@ gp_ddl_dispatched(Node *parsetree)
 		case T_CreatedbStmt:
 		case T_DropdbStmt:
 			return GP_DISPATCH_NONXACT;
+		case T_ReindexStmt:
+			{
+				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+				bool		concurrently = false;
+				ListCell   *lc;
+				Oid			relid;
+
+				/* The system catalogs are those of the coordinator */
+				if (stmt->kind == REINDEX_OBJECT_SYSTEM)
+					return GP_DISPATCH_NONE;
+				foreach(lc, stmt->params)
+				{
+					DefElem    *def = lfirst(lc);
+
+					if (strcmp(def->defname, "concurrently") == 0)
+						concurrently = defGetBoolean(def);
+				}
+				if (stmt->kind != REINDEX_OBJECT_INDEX &&
+					stmt->kind != REINDEX_OBJECT_TABLE)
+					return GP_DISPATCH_NONXACT;
+				if (gp_table_is_local(stmt->relation))
+					return GP_DISPATCH_NONE;
+
+				/*
+				 * A partitioned index or table runs CONCURRENTLY by
+				 * making a statement of its own for each partition, whose
+				 * OIDs the segments would take another way: it stays here
+				 */
+				if (!concurrently)
+					return GP_DISPATCH_NONXACT;
+				relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+				if (!OidIsValid(relid))
+					return GP_DISPATCH_NONXACT;
+				return get_rel_relkind(relid) == RELKIND_PARTITIONED_INDEX ||
+					get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE ?
+					GP_DISPATCH_NONE : GP_DISPATCH_NONXACT;
+			}
 		case T_VacuumStmt:
 			return gp_vacuum_dispatched((VacuumStmt *) parsetree) ?
 				GP_DISPATCH_NONXACT : GP_DISPATCH_NONE;
@@ -729,6 +873,13 @@ gp_dispatch_nonxact_stmt(Node *parsetree, const char *sql, const char *oids)
 			oids = NULL;
 			if (gp_vacuum_is_full((VacuumStmt *) parsetree))
 				flags = GP_NONXACT_LOCAL_DDL;
+			break;
+		case T_ReindexStmt:
+			/*
+			 * REINDEX CONCURRENTLY makes a transient index of its own:
+			 * its OIDs go the way of CREATE INDEX CONCURRENTLY, while a
+			 * plain REINDEX makes none
+			 */
 			break;
 		default:
 			break;
@@ -929,10 +1080,17 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 		gp_create_like_local((CreateStmt *) parsetree);
 
 	if (mode != GP_DISPATCH_NONE)
-	{
 		mark = gp_oids_mark();
+
+	/*
+	 * The run of a statement that makes a table counts as being dispatched
+	 * even when it is not, so that a statement it runs inside itself — LIKE
+	 * makes one for the statistics it copies — stays on the coordinator,
+	 * with its text, which is the text of the statement around it
+	 */
+	if (mode != GP_DISPATCH_NONE || IsA(parsetree, CreateStmt) ||
+		IsA(parsetree, CreateForeignTableStmt))
 		dispatch_depth++;
-	}
 
 	/* The command commits on its own, maybe several times */
 	if (mode == GP_DISPATCH_NONXACT)
@@ -955,7 +1113,8 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	}
 	PG_FINALLY();
 	{
-		if (mode != GP_DISPATCH_NONE)
+		if (mode != GP_DISPATCH_NONE || IsA(parsetree, CreateStmt) ||
+			IsA(parsetree, CreateForeignTableStmt))
 			dispatch_depth--;
 		if (mode == GP_DISPATCH_NONXACT)
 			gp_oids_keep(false);
@@ -972,7 +1131,7 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	 * coordinator, like such a view: a function of a temporary sequence
 	 * or type, a domain of a temporary type
 	 */
-	if (mode == GP_DISPATCH_XACT && gp_oids_depend_on_temp(mark))
+	if (mode == GP_DISPATCH_XACT && gp_oids_depend_on_local(mark))
 		mode = GP_DISPATCH_NONE;
 
 	/*

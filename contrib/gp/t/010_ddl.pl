@@ -203,6 +203,40 @@ DROP FUNCTION s.f_temp_arg(t_arg);
 DROP DOMAIN s.d_temp});
 pass('functions and domains of a temporary type stay on the coordinator');
 
+# Materialized views and foreign data stay on the coordinator, and the
+# commands around them stay there too
+run(q{CREATE MATERIALIZED VIEW s.mv AS SELECT 1 AS c;
+CREATE UNIQUE INDEX s_mv_idx ON s.mv (c);
+REFRESH MATERIALIZED VIEW s.mv;
+GRANT SELECT ON s.mv TO PUBLIC;
+DROP MATERIALIZED VIEW s.mv});
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT count(*) FROM pg_class WHERE relname IN ('mv', 's_mv_idx')") } @segments),
+	'0 0',
+	'a materialized view stays on the coordinator with its commands');
+run(q{CREATE FOREIGN DATA WRAPPER fdw_dummy;
+CREATE SERVER s_dummy FOREIGN DATA WRAPPER fdw_dummy;
+CREATE FOREIGN TABLE s.ft (a int) SERVER s_dummy;
+ALTER FOREIGN TABLE s.ft ADD COLUMN b int;
+GRANT SELECT ON s.ft TO PUBLIC;
+COMMENT ON FOREIGN TABLE s.ft IS 'a foreign table';
+DROP FOREIGN TABLE s.ft;
+DROP SERVER s_dummy;
+DROP FOREIGN DATA WRAPPER fdw_dummy});
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT count(*) FROM pg_class WHERE relname = 'ft'") } @segments),
+	'0 0',
+	'foreign tables stay on the coordinator with their commands');
+
+# A rule stays on the coordinator, and so does the command that turns one
+# on or off
+run('CREATE RULE t_r AS ON INSERT TO s.t DO INSTEAD NOTHING');
+run('ALTER TABLE s.t DISABLE RULE t_r');
+run('ALTER TABLE s.t ENABLE RULE t_r');
+run(q{CREATE TEMP TABLE rule_t (a int);
+CREATE RULE rule_t_r AS ON INSERT TO rule_t DO INSTEAD NOTHING});
+pass('rules stay on the coordinator with the commands that touch them');
+
 # What is refused
 fails('ALTER TABLE s.t ADD COLUMN at timestamptz DEFAULT now()',
 	qr/cannot compute column "at" with a non-immutable expression on a cluster/,
@@ -224,6 +258,27 @@ is(where('s.dflt'), 't t',
 	'defaults that are only stored are allowed');
 run('CREATE INDEX CONCURRENTLY ON s.t (c)');
 is(where('s.t_c_idx'), 't t', 'CREATE INDEX CONCURRENTLY goes to the segments');
+
+# Extended statistics go to the segments, as they hold no rows to differ
+run('CREATE STATISTICS s.st ON a, c FROM s.t');
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'st'") } @segments),
+	'1 1',
+	'CREATE STATISTICS goes to the segments with the OIDs of the coordinator');
+run('ALTER STATISTICS s.st SET STATISTICS 200');
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT stxstattarget FROM pg_statistic_ext WHERE stxname = 'st'") } @segments),
+	'200 200',
+	'ALTER STATISTICS goes to the segments');
+run('DROP STATISTICS s.st');
+is( join(' ', map { $_->safe_psql('postgres',
+		"SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'st'") } @segments),
+	'0 0',
+	'DROP STATISTICS goes to the segments');
+
+run('REINDEX TABLE s.t');
+run('REINDEX INDEX s.t_c_idx');
+pass('REINDEX goes to the segments');
 
 # The end
 run('DROP SCHEMA s, s2, s3 CASCADE');

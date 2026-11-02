@@ -339,12 +339,13 @@ gp_oids_since(int mark)
 }
 
 /*
- * Coordinator: whether an object made since the mark depends on a
- * temporary one, as pg_depend tells.  Such an object stays with what it
- * depends on on the coordinator.
+ * Coordinator: whether an object made since the mark depends on what the
+ * segments do not have, as pg_depend tells: a temporary object, or a
+ * materialized view or a foreign table, which never leave the coordinator.
+ * Such an object stays with what it depends on on the coordinator.
  */
 bool
-gp_oids_depend_on_temp(int mark)
+gp_oids_depend_on_local(int mark)
 {
 	StringInfoData sql;
 	bool		dependent;
@@ -365,7 +366,8 @@ gp_oids_depend_on_temp(int mark)
 					 ") AND (EXISTS (SELECT 1 FROM pg_catalog.pg_class t "
 					 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
 					 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::regclass "
-					 "AND t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema()) "
+					 "AND (t.relnamespace OPERATOR(pg_catalog.=) pg_catalog.pg_my_temp_schema() "
+					 "OR t.relkind IN ('m', 'f')))"
 					 "OR EXISTS (SELECT 1 FROM pg_catalog.pg_type t "
 					 "WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid "
 					 "AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::regclass "
