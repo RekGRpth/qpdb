@@ -163,6 +163,13 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'gp_policy_changed'
 LANGUAGE C STRICT;
 
+-- The segment this server is: 0 on the coordinator, and its number on a
+-- segment.  A row of a distributed table keeps its segment there, and
+-- answers per row come with the pushdown of the MPP planner.
+CREATE FUNCTION gp.segment_id() RETURNS int4
+AS 'MODULE_PATHNAME', 'gp_segment_id_fn'
+LANGUAGE C VOLATILE;
+
 -- Distribute an empty table by hash of the key columns, or replicate it to
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key

@@ -224,6 +224,13 @@ fails('SELECT * FROM d TABLESAMPLE SYSTEM (10)',
 	qr/TABLESAMPLE is not supported on a distributed table/, 'TABLESAMPLE');
 is(run('SELECT count(*) FROM d'), 510, 'and they leave the rows as they were');
 
+# The segment this server is: the coordinator answers 0, and a segment its
+# own number.  Rows do not tell their segment yet: that comes with the
+# pushdown of the MPP planner.
+is(run('SELECT gp.segment_id()'), 0, 'the coordinator is segment 0');
+is(run('SELECT count(*) FROM d WHERE gp.segment_id() = 0'), 510,
+	'a query reads a distributed table with the function in it');
+
 $_->stop foreach (@segments, $coordinator);
 
 done_testing();
