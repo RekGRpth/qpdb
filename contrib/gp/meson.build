@@ -73,6 +73,7 @@ tests += {
       't/019_default_distribution.pl',
       't/020_dtx_snapshot.pl',
       't/021_one_phase.pl',
+      't/022_unique_key.pl',
     ],
   },
 }
