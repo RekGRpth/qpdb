@@ -159,6 +159,14 @@ segments yet, so a transaction that rolled back one after sending DDL
 cannot commit.  `gp.dispatch_ddl = off` keeps DDL on the coordinator, for
 maintenance.
 
+The commit of a transaction that the segments take part in keeps one lock
+of the coordinator, which a query that reads the segments takes as well:
+from the moment the segments prepare to the moment they all hear `COMMIT
+PREPARED`, the query either waits or sees its snapshots taken with no
+transaction in between, so every query sees a distributed transaction in
+full or not at all.  This makes the commits run one at a time, and a
+query wait out the one that is running; a faster scheme can come later.
+
 A segment lost between the commit of the coordinator and `COMMIT PREPARED`
 keeps its transaction prepared, holding its locks, and the coordinator
 warns.  Until recovery comes, resolve it by hand: `pg_xact_status('<xid>')`

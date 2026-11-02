@@ -49,6 +49,8 @@
 #include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
@@ -100,6 +102,21 @@ static bool prepared_any = false;
 /* The segments a COPY goes to, from gp_copy_open() to gp_copy_close() */
 static GpSegment *copy_segments = NULL;
 static int	copy_nsegments = 0;
+
+/* The lock of the distributed snapshot, and whether this backend holds it */
+static struct
+{
+	LWLock		lock;
+}		   *dtx_shared = NULL;
+static bool dtx_held = false;
+
+static void gp_dispatch_shmem_request(void *arg);
+static void gp_dispatch_shmem_init(void *arg);
+
+static const ShmemCallbacks gp_dispatch_shmem_callbacks = {
+	.request_fn = gp_dispatch_shmem_request,
+	.init_fn = gp_dispatch_shmem_init,
+};
 
 PG_FUNCTION_INFO_V1(gp_exec_on_all);
 
@@ -272,6 +289,21 @@ gp_connections_prepare(void)
 }
 
 static void
+gp_dispatch_shmem_request(void *arg)
+{
+	ShmemRequestStruct(.name = "gp dtx",
+					   .size = sizeof(*dtx_shared),
+					   .ptr = (void **) &dtx_shared,
+		);
+}
+
+static void
+gp_dispatch_shmem_init(void *arg)
+{
+	LWLockInitialize(&dtx_shared->lock, LWLockNewTrancheId("gp dtx"));
+}
+
+static void
 gp_connections_xact_callback(XactEvent event, void *arg)
 {
 	switch (event)
@@ -285,6 +317,17 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 						errdetail("A subtransaction that sent DDL to the segments was rolled back, or a connection to a segment was closed."),
 						errhint("Roll back the whole transaction."));
 			gp_connections_prepare();
+			if (prepared_any)
+			{
+				/*
+				 * The distributed snapshot: from the moment the segments
+				 * prepare to the moment they all hear COMMIT PREPARED, no
+				 * query may take its snapshots on the segments, or it
+				 * would see the transaction on some of them only
+				 */
+				LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+				dtx_held = true;
+			}
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			if (diverged || ndispatched > 0)
@@ -300,6 +343,11 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 				gp_connections_finish(psprintf("COMMIT PREPARED %s",
 											   quote_literal_cstr(gid)), true);
 			}
+			if (dtx_held)
+			{
+				LWLockRelease(&dtx_shared->lock);
+				dtx_held = false;
+			}
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -308,6 +356,11 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			if (prepared_any)
 				gp_connections_finish(psprintf("ROLLBACK PREPARED %s",
 											   quote_literal_cstr(gid)), true);
+			if (dtx_held)
+			{
+				LWLockRelease(&dtx_shared->lock);
+				dtx_held = false;
+			}
 			break;
 		default:
 			break;
@@ -364,6 +417,7 @@ gp_connections_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 void
 gp_dispatch_init(void)
 {
+	RegisterShmemCallbacks(&gp_dispatch_shmem_callbacks);
 	RegisterXactCallback(gp_connections_xact_callback, NULL);
 	RegisterSubXactCallback(gp_connections_subxact_callback, NULL);
 }
@@ -1000,6 +1054,9 @@ struct GpQuery
 	GpSegment  *segments;
 	int			nsegments;
 	int			current;		/* the segment whose rows come now */
+	PGresult  **first;			/* the first result of each segment, which
+								 * gp_query_start() took under the lock of the
+								 * distributed snapshot */
 };
 
 /*
@@ -1018,6 +1075,7 @@ gp_query_start(const char *sql, int only)
 	GpConnection **entries;
 
 	query->nsegments = gp_connections_ready(&query->segments, &entries, only);
+	query->first = palloc0_array(PGresult *, query->nsegments);
 	for (int i = 0; i < query->nsegments; i++)
 	{
 		PGconn	   *conn = entries[i]->conn;
@@ -1031,6 +1089,34 @@ gp_query_start(const char *sql, int only)
 						   query->segments[i].segment_id,
 						   query->segments[i].host, query->segments[i].port),
 					errdetail_internal("%s", pchomp(PQerrorMessage(conn))));
+	}
+
+	/*
+	 * The distributed snapshot: a query that reads the segments takes its
+	 * snapshots while no transaction commits on them, so every segment
+	 * either sees a distributed transaction in full or not at all.  The
+	 * first result of a segment tells that its snapshot is taken.
+	 */
+	if (query->nsegments > 0)
+	{
+		LWLockAcquire(&dtx_shared->lock, LW_SHARED);
+		PG_TRY();
+		{
+			for (int i = 0; i < query->nsegments; i++)
+			{
+				GpConnection *entry = hash_search(connections,
+												  &query->segments[i].segment_id,
+												  HASH_FIND, NULL);
+
+				query->first[i] = libpqsrv_get_result(entry->conn,
+													  wait_event_result);
+			}
+		}
+		PG_FINALLY();
+		{
+			LWLockRelease(&dtx_shared->lock);
+		}
+		PG_END_TRY();
 	}
 	return query;
 }
@@ -1055,7 +1141,14 @@ gp_query_next(GpQuery *query)
 					errcode(ERRCODE_CONNECTION_FAILURE),
 					errmsg("no connection to segment %d", segment->segment_id));
 
-		res = libpqsrv_get_result(entry->conn, wait_event_result);
+		if (query->first[query->current] != NULL)
+		{
+			/* The result that gp_query_start() took under the lock */
+			res = query->first[query->current];
+			query->first[query->current] = NULL;
+		}
+		else
+			res = libpqsrv_get_result(entry->conn, wait_event_result);
 		if (res == NULL)
 		{
 			/* All results of the segment are read */
