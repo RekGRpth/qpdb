@@ -174,7 +174,7 @@ is(on_segments('SELECT count(*) FROM e'), '0 0', 'no row of it stays');
 run('CREATE TABLE chk (a int CHECK (a < 100))');
 run(q{SELECT gp.distribute('chk', ARRAY['a'])});
 fails(q{COPY chk FROM PROGRAM 'seq 1 500'},
-	qr/violates check constraint "chk_a_check"\n.*segment \d at /s,
+	qr/violates check constraint "chk_a_check"\n.*segment \d/s,
 	'a row that a segment refuses');
 is(on_segments('SELECT count(*) FROM chk'), '0 0', 'no row of it stays');
 

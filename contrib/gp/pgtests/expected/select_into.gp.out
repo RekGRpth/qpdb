@@ -163,7 +163,7 @@ END$$;
 DROP TABLE created_table;
 DROP TABLE easi, easi2;
 ERROR:  table "easi" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 --
 -- Disallowed uses of SELECT ... INTO.  All should fail
 --

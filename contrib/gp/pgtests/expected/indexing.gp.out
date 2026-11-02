@@ -570,7 +570,7 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 -- attach the indexes; parents stay invalid
 alter index idxpart1_a_b_idx attach partition idxpart11_a_b_idx;
 ERROR:  relation "idxpart11_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 alter index idxpart_a_b_idx attach partition idxpart1_a_b_idx;
 alter index idxpart_a_b_idx attach partition idxpart2_a_b_idx;
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
@@ -587,11 +587,11 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 delete from idxpart11 where b = 0;
 reindex index concurrently idxpart11_a_b_idx;
 ERROR:  relation "idxpart11_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 -- reattach the leaf partition index; parents should now be valid
 alter index idxpart1_a_b_idx attach partition idxpart11_a_b_idx;
 ERROR:  relation "idxpart11_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
    where relname like 'idxpart%' order by relname;
       relname      | indisvalid 
@@ -628,10 +628,10 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 -- attach both; parent stays invalid
 alter index idxpart_a_b_idx attach partition idxpart1_a_b_idx;
 ERROR:  relation "idxpart1_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 alter index idxpart_a_b_idx attach partition idxpart2_a_b_idx;
 ERROR:  relation "idxpart2_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
    where relname like 'idxpart%' order by relname;
      relname      | indisvalid 
@@ -645,11 +645,11 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 delete from idxpart1 where b = 0;
 reindex index concurrently idxpart1_a_b_idx;
 ERROR:  relation "idxpart1_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 -- re-attach the fixed child; parent should stay invalid
 alter index idxpart_a_b_idx attach partition idxpart1_a_b_idx;
 ERROR:  relation "idxpart1_a_b_idx" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
    where relname like 'idxpart%' order by relname;
      relname      | indisvalid 
@@ -1696,7 +1696,7 @@ ERROR:  division by zero
 create index parted_isvalid_idx on parted_isvalid_tab ((a/b));
 ERROR:  the coordinator assigned 4 OIDs, but the segment needs more
 DETAIL:  A new row of catalog "pg_class" has no OID.
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 select indexrelid::regclass, indisvalid,
        indrelid::regclass, inhparent::regclass
   from pg_index idx left join

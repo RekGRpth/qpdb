@@ -94,7 +94,7 @@ my ($output, $failed) =
 ok($failed, 'a role unknown on the segment fails the command');
 like(
 	$session->{stderr},
-	qr/role "alice" does not exist\nCONTEXT:  setting the parameters of the session on segment 1 at /,
+	qr/role "alice" does not exist\nCONTEXT:  setting the parameters of the session on segment 1/,
 	'the error names the segment');
 $session->{stderr} = '';
 

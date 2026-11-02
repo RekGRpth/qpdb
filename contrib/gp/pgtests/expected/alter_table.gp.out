@@ -4532,7 +4532,7 @@ DROP TABLE part_rpd;
 -- works fine
 ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
 ERROR:  ALTER TABLE ... DETACH CONCURRENTLY cannot run inside a transaction block
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 \d+ range_parted2
                          Partitioned table "public.range_parted2"
  Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
@@ -4549,7 +4549,7 @@ CREATE TABLE hash_parted2 (a int) PARTITION BY HASH(a);
 CREATE TABLE part_hp PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
 ALTER TABLE hash_parted2 DETACH PARTITION part_hp CONCURRENTLY;
 ERROR:  ALTER TABLE ... DETACH CONCURRENTLY cannot run inside a transaction block
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 DROP TABLE hash_parted2;
 INSERT INTO part_hp VALUES (1);
 ERROR:  relation "part_hp" does not exist

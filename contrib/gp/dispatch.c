@@ -773,10 +773,13 @@ gp_dispatch_check(const GpSegment *segments, GpConnection **entries,
 					errdetail_internal("%s", detail));
 			return;
 		}
-		/* errcontext() is a comma expression: no use in a conditional one */
-		context = psprintf("%s%ssegment %d at %s:%d", what ? what : "",
-						   what ? " on " : "", segment->segment_id,
-						   segment->host, segment->port);
+		/*
+		 * errcontext() is a comma expression: no use in a conditional one.
+		 * The number tells the segment; its address would make the message
+		 * differ between clusters.
+		 */
+		context = psprintf("%s%ssegment %d", what ? what : "",
+						   what ? " on " : "", segment->segment_id);
 		ereport(elevel,
 				errcode(code),
 				errmsg_internal("%s", primary),

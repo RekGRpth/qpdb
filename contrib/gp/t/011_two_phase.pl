@@ -59,9 +59,9 @@ my ($ret, $stdout, $stderr) =
   $coordinator->psql('postgres', 'CREATE TABLE t1 (a int)');
 like(
 	$stderr,
-	qr/prepared transactions are disabled\n.*CONTEXT:  preparing the transaction on segment 2 at /s,
+	qr/prepared transactions are disabled\n.*CONTEXT:  preparing the transaction on segment 2/s,
 	'a segment that cannot prepare fails the commit');
-is(scalar(() = $stderr =~ /segment 2 at /g), 1, 'the error has one context');
+is(scalar(() = $stderr =~ /segment 2\b/g), 1, 'the error has one context');
 is(where('t1'), 'f f f', 'the table is nowhere');
 is(prepared(), '0 0', 'the prepared transaction of segment 1 is rolled back');
 

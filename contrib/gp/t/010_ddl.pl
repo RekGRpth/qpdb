@@ -139,7 +139,7 @@ pass('gp.exec_on_all() sees the DDL of its transaction on the segments');
 $seg2->safe_psql('postgres',
 	'SET gp.allow_local_ddl = on; CREATE TABLE s.conflict (a int)');
 fails('CREATE TABLE s.conflict (a int)',
-	qr/relation "conflict" already exists\nCONTEXT:  segment 2 at /,
+	qr/relation "conflict" already exists\nCONTEXT:  segment 2/,
 	'an error of a segment fails the command');
 is( $coordinator->safe_psql('postgres', "SELECT to_regclass('s.conflict') IS NOT NULL")
 	  . ' ' . where('s.conflict'),

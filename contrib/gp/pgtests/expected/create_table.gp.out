@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS as_select1 AS EXECUTE select1;
 NOTICE:  relation "as_select1" already exists, skipping
 DROP TABLE as_select1;
 ERROR:  table "as_select1" does not exist
-CONTEXT:  segment 1 at localhost:9001
+CONTEXT:  segment 1
 DEALLOCATE select1;
 -- create an extra wide table to test for issues related to that
 -- (temporarily hide query, to avoid the long CREATE TABLE stmt)

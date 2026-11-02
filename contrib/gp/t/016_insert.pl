@@ -209,7 +209,7 @@ is(total('SELECT count(*) FROM tx'), 22, 'and inserts nothing');
 run('CREATE TABLE chk (a int CHECK (a < 100))');
 run(q{SELECT gp.distribute('chk', ARRAY['a'])});
 fails('INSERT INTO chk VALUES (1), (2), (500)',
-	qr/violates check constraint "chk_a_check"\n.*segment \d at /s,
+	qr/violates check constraint "chk_a_check"\n.*segment \d/s,
 	'a row that a segment refuses');
 is(on_segments('SELECT count(*) FROM chk'), '0 0', 'no row of it stays');
 
