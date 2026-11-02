@@ -76,6 +76,7 @@ typedef struct GpConnection
 	bool		busy;			/* a command runs, its result is not read */
 	bool		in_xact;		/* in a transaction of the coordinator */
 	bool		prepared;		/* has prepared the transaction as gid */
+	bool		one_phase;		/* commits with the coordinator, alone */
 	char	   *settings;		/* settings sent, "name\0value\0" pairs */
 	int			settings_len;	/* -1 if unknown after a rollback */
 } GpConnection;
@@ -109,6 +110,17 @@ static struct
 	LWLock		lock;
 }		   *dtx_shared = NULL;
 static bool dtx_held = false;
+
+/* The transaction has a segment that commits with it, alone */
+static bool one_phase_any = false;
+
+/* How gp_connections_finish() picks the connections to talk to */
+enum
+{
+	GP_FINISH_IN_XACT,
+	GP_FINISH_PREPARED,
+	GP_FINISH_ONE_PHASE,
+};
 
 static void gp_dispatch_shmem_request(void *arg);
 static void gp_dispatch_shmem_init(void *arg);
@@ -163,12 +175,28 @@ gp_connections_abort(void)
 
 /*
  * End the transactions of the segments with a command: COMMIT or ROLLBACK
- * those in progress, COMMIT PREPARED or ROLLBACK PREPARED the prepared
- * ones.  The transaction of the coordinator has ended already, so a failure
- * is only a warning.
+ * those in progress, COMMIT or ROLLBACK the ones that commit alone with
+ * the coordinator, COMMIT PREPARED or ROLLBACK PREPARED the prepared
+ * ones.  The transaction of the coordinator has ended already, so a
+ * failure is only a warning.
  */
+static bool
+gp_finish_selects(const GpConnection *entry, int which)
+{
+	switch (which)
+	{
+		case GP_FINISH_IN_XACT:
+			return entry->in_xact;
+		case GP_FINISH_PREPARED:
+			return entry->prepared;
+		case GP_FINISH_ONE_PHASE:
+			return entry->one_phase;
+	}
+	return false;
+}
+
 static void
-gp_connections_finish(const char *command, bool prepared)
+gp_connections_finish(const char *command, int which)
 {
 	HASH_SEQ_STATUS status;
 	GpConnection *entry;
@@ -178,7 +206,7 @@ gp_connections_finish(const char *command, bool prepared)
 
 	hash_seq_init(&status, connections);
 	while ((entry = hash_seq_search(&status)) != NULL)
-		if (prepared ? entry->prepared : entry->in_xact)
+		if (gp_finish_selects(entry, which))
 			entry->busy = PQsendQuery(entry->conn, command);
 
 	hash_seq_init(&status, connections);
@@ -187,23 +215,24 @@ gp_connections_finish(const char *command, bool prepared)
 		PGresult   *res = NULL;
 		char	   *sqlstate = NULL;
 
-		if (!(prepared ? entry->prepared : entry->in_xact))
+		if (!gp_finish_selects(entry, which))
 			continue;
 		if (entry->busy)
 			res = libpqsrv_get_result_last(entry->conn, wait_event_result);
 		entry->busy = false;
 		entry->in_xact = false;
 		entry->prepared = false;
+		entry->one_phase = false;
 
 		/* Settings sent in a rolled back transaction are gone */
-		if (!prepared && strcmp(command, "ROLLBACK") == 0)
+		if (which == GP_FINISH_IN_XACT && strcmp(command, "ROLLBACK") == 0)
 			entry->settings_len = -1;
 
 		if (res != NULL)
 			sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
 
 		/* A segment that failed to prepare has nothing to roll back */
-		if (prepared && sqlstate != NULL &&
+		if (which == GP_FINISH_PREPARED && sqlstate != NULL &&
 			strcmp(sqlstate, "42704") == 0 &&
 			strncmp(command, "ROLLBACK", 8) == 0)
 		{
@@ -218,10 +247,15 @@ gp_connections_finish(const char *command, bool prepared)
 					errmsg("could not run %s on segment %d at %s:%d",
 						   command, entry->segment_id, entry->host,
 						   entry->port),
-					errdetail_internal("%s", pchomp(PQerrorMessage(entry->conn))),
-					prepared ?
+					errdetail_internal("%s", res == NULL ?
+									   pchomp(PQerrorMessage(entry->conn)) :
+									   pchomp(PQresultErrorMessage(res))),
+					which == GP_FINISH_PREPARED ?
 					errhint("The transaction stays prepared on the segment; run %s there.",
-							command) : 0);
+							command) :
+					which == GP_FINISH_ONE_PHASE ?
+					errhint("The segment rolled back, and the rows of the transaction may be lost; run the command again.") :
+					0);
 			if (PQstatus(entry->conn) != CONNECTION_OK)
 				gp_connection_close(entry);
 		}
@@ -263,6 +297,20 @@ gp_connections_prepare(void)
 	}
 	if (n == 0)
 		return;
+
+	/*
+	 * A transaction that wrote one segment alone needs no GID: the
+	 * segment commits with the coordinator, in one phase.  A segment
+	 * lost in that moment rolls back rather than stay prepared, and the
+	 * rows may be lost with a warning.
+	 */
+	if (n == 1)
+	{
+		entries[0]->in_xact = false;
+		entries[0]->one_phase = true;
+		one_phase_any = true;
+		return;
+	}
 
 	prepared_any = true;
 	snprintf(gid, sizeof(gid), "gp_" UINT64_FORMAT,
@@ -317,7 +365,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 						errdetail("A subtransaction that sent DDL to the segments was rolled back, or a connection to a segment was closed."),
 						errhint("Roll back the whole transaction."));
 			gp_connections_prepare();
-			if (prepared_any)
+			if (prepared_any || one_phase_any)
 			{
 				/*
 				 * The distributed snapshot: from the moment the segments
@@ -341,7 +389,13 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			{
 				INJECTION_POINT("gp-before-commit-prepared", NULL);
 				gp_connections_finish(psprintf("COMMIT PREPARED %s",
-											   quote_literal_cstr(gid)), true);
+											   quote_literal_cstr(gid)),
+									  GP_FINISH_PREPARED);
+			}
+			if (one_phase_any)
+			{
+				INJECTION_POINT("gp-before-one-phase-commit", NULL);
+				gp_connections_finish("COMMIT", GP_FINISH_ONE_PHASE);
 			}
 			if (dtx_held)
 			{
@@ -352,10 +406,13 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			gp_connections_abort();
-			gp_connections_finish("ROLLBACK", false);
+			gp_connections_finish("ROLLBACK", GP_FINISH_IN_XACT);
+			/* A commit that failed after its prepare may have one of these */
+			gp_connections_finish("ROLLBACK", GP_FINISH_ONE_PHASE);
 			if (prepared_any)
 				gp_connections_finish(psprintf("ROLLBACK PREPARED %s",
-											   quote_literal_cstr(gid)), true);
+											   quote_literal_cstr(gid)),
+									  GP_FINISH_PREPARED);
 			if (dtx_held)
 			{
 				LWLockRelease(&dtx_shared->lock);
@@ -375,6 +432,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		subxact_marks = NIL;
 		diverged = false;
 		prepared_any = false;
+		one_phase_any = false;
 		copy_segments = NULL;
 		copy_nsegments = 0;
 	}
@@ -515,6 +573,7 @@ gp_connection_open(const GpSegment *segment)
 	entry->busy = false;
 	entry->in_xact = false;
 	entry->prepared = false;
+	entry->one_phase = false;
 	entry->settings = NULL;
 	entry->settings_len = 0;
 	return entry;

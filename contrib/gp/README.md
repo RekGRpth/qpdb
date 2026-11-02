@@ -167,6 +167,11 @@ transaction in between, so every query sees a distributed transaction in
 full or not at all.  This makes the commits run one at a time, and a
 query wait out the one that is running; a faster scheme can come later.
 
+A transaction that wrote one segment alone ends with a plain `COMMIT`
+there, with no prepared transaction: a segment lost in that moment rolls
+back rather than stay prepared, and the coordinator warns that its rows
+may be lost.
+
 A segment lost between the commit of the coordinator and `COMMIT PREPARED`
 keeps its transaction prepared, holding its locks, and the coordinator
 warns.  Until recovery comes, resolve it by hand: `pg_xact_status('<xid>')`
