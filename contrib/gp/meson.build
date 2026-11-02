@@ -71,6 +71,7 @@ tests += {
       't/017_direct_dispatch.pl',
       't/018_gather.pl',
       't/019_default_distribution.pl',
+      't/020_dtx_snapshot.pl',
     ],
   },
 }
