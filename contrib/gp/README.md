@@ -344,9 +344,17 @@ succeeded; roles of a failed run linger, and call for `gp-cluster.sh destroy`,
 `init` and `start` again.  Not every difference is a mistake: tablespaces,
 materialized views and the statements listed above as not sent are known.
 
-CI runs the tests of `tools/gp-pg-regress.tests` this way weekly and on
-demand (`gp-pg-regress.yml`).  The job does not fail the workflow: it shows
-how many tests pass and keeps the diffs as an artifact.
+A test that differs on purpose keeps a copy of its output as
+`pgtests/expected/foo.gp.out`, which the script puts in place of the answer
+of PostgreSQL; the numbered answers of such a test are dropped, so a cluster
+answer cannot hide behind one of them.  The refusals of non-immutable
+expressions, `CREATE TABLE AS EXECUTE`, the artifacts of a failed
+`CREATE INDEX CONCURRENTLY` and a command on a temporary table together
+with others have answers of their own this way.
+
+CI runs the tests of `tools/gp-pg-regress.tests` this way on every push,
+weekly and on demand (`gp-pg-regress.yml`); a failing test fails the job,
+which keeps the diffs as an artifact.
 
 ## Reference
 
@@ -427,14 +435,13 @@ by the patch and `contrib/gp`.
    commands that run outside a transaction and extensions.
 3. **Placing data and correct SELECT** — in progress: `COPY`, `INSERT`,
    direct dispatch of `INSERT` and `SELECT` through a gather are done, and
-   tests of PostgreSQL run on the cluster, 132 of the 156 of the schedule
-   passing: what fails is known — materialized views, rules, extended
-   statistics, foreign data and `REINDEX` stay on the coordinator while
-   commands around them go to the segments, temporary objects in a command
-   of the cluster, and the refusals of non-immutable expressions; next are
-   `gp_segment_id()`, stable functions of time on the coordinator, a
-   comparison with a vanilla server and answers of our own for the tests
-   that differ on purpose.
+   the 159 tests of the schedule of PostgreSQL all pass on the cluster,
+   twelve of them against answers of our own in `pgtests/expected/`: the
+   refusals of non-immutable expressions, `CREATE TABLE AS EXECUTE`, the
+   artifacts of a failed `CREATE INDEX CONCURRENTLY`, a command on a
+   temporary table together with others; next are `gp_segment_id()`,
+   stable functions of time on the coordinator and a comparison with a
+   vanilla server.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
    distributed snapshots, `UPDATE` and `DELETE`.
 5. **MPP planner without interconnect** — locus, slices; colocated joins

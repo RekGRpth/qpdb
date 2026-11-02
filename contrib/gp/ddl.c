@@ -795,6 +795,9 @@ gp_ddl_dispatched(Node *parsetree)
 				/* The system catalogs are those of the coordinator */
 				if (stmt->kind == REINDEX_OBJECT_SYSTEM)
 					return GP_DISPATCH_NONE;
+				if (stmt->kind == REINDEX_OBJECT_SCHEMA &&
+					strncmp(stmt->name, "pg_temp", 7) == 0)
+					return GP_DISPATCH_NONE;
 				foreach(lc, stmt->params)
 				{
 					DefElem    *def = lfirst(lc);

@@ -1,11 +1,12 @@
 # Tests of PostgreSQL on a cluster of contrib/gp, with new tables distributed
-# by their first column.  Many of them differ from the answers of PostgreSQL
-# for now, as the cluster does not support all DDL yet, so the job never fails
-# the workflow: it shows how many tests pass and keeps the diffs.
+# by their first column.  A test that differs on the cluster by design keeps
+# an answer of its own in pgtests/expected, so a failing test fails the job;
+# the weekly run without a push catches a drift that comes with time.
 
 name: gp-pg-regress
 
 on:
+  push:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
@@ -18,7 +19,6 @@ jobs:
     name: PG tests on a cluster
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    continue-on-error: true
     container:
       image: ghcr.io/anarazel/pg-vm-images/main/linux_debian_trixie_ci:latest
       options: --privileged --pid=host --ipc=host --ulimit memlock=-1:-1
