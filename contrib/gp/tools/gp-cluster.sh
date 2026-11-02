@@ -16,13 +16,14 @@
 # Environment:
 #   GP_CLUSTER_DIR  directory of the cluster, $HOME/gp-cluster by default
 #   GP_PORT         port of the coordinator, 9000 by default; segment N,
-#                   numbered from 1, listens on GP_PORT + N (init only)
+#                   segment-N, listens on GP_PORT + N (init only)
 #   GP_SEGMENTS     number of segments, 3 by default (init only)
 #   PGBIN           directory of initdb, pg_ctl and psql of a server built
 #                   with contrib/gp; taken from pg_config in PATH by default
 #
-# The other commands take the nodes from the file "nodes", which init
-# writes to the cluster directory.
+# A segment is named segment-N, its directory in the cluster directory
+# and its cluster_name, which carries the port of the node, alike.  The other commands take the nodes from the
+# file "nodes", which init writes to the cluster directory.
 #
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
@@ -74,7 +75,7 @@ cmd_init()
 	mkdir -p "$dir"
 	i=1
 	while [ "$i" -le "$segments" ]; do
-		echo "seg$i $((port + i)) segment" >>"$nodes.new"
+		echo "segment-$i $((port + i)) segment" >>"$nodes.new"
 		i=$((i + 1))
 	done
 	echo "coordinator $port coordinator" >>"$nodes.new"
@@ -84,18 +85,23 @@ cmd_init()
 		# A segment has a number, registers on the coordinator and prepares
 		# transactions of DDL
 		case $role in
-			segment) set -- -c "gp.segment_id=${name#seg}" \
+			segment) set -- -c "gp.segment_id=${name#segment-}" \
 				-c "gp.coordinator=host=localhost port=$port" \
 				-c gp.register_retry_interval=1 \
 				-c max_prepared_transactions=64 ;;
 			*) set -- ;;
 		esac
+		# Tests of PostgreSQL count on autovacuum cleaning up between them:
+		# the plans that some of them print come out only after one.  The
+		# suite can run faster than autovacuum wakes up at its default, so
+		# the nodes wake it up more often.
 		"$PGBIN/initdb" --pgdata "$dir/$name" --auth trust --no-instructions \
 			-c shared_preload_libraries=gp \
 			-c "gp.role=$role" \
 			"$@" \
 			-c "port=$nport" \
-			-c "cluster_name=gp-$name" \
+			-c "cluster_name=$name $nport" \
+			-c autovacuum_naptime=5s \
 			>"$dir/$name.initdb.log" 2>&1 ||
 			die "initdb $name failed, see $dir/$name.initdb.log"
 	done <"$nodes.new"
