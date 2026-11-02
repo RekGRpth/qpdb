@@ -389,6 +389,7 @@ All are set at server start unless noted.
 | `gp.bucket(nbuckets, VARIADIC key)` | Bucket of a key |
 | `gp.bucket_segment(colocation_id, bucket)` | Segment of a bucket of a colocation group |
 | `gp.policy_changed(relation)` | Make every session read the policy of a table again; `gp.distribute()` calls it |
+| `gp.segment_id()` | The segment this server is: 0 on the coordinator, and its number on a segment.  A row of a distributed table keeps its segment, but no query tells it yet: that comes with the pushdown of the MPP planner |
 
 `gp.register_segment()`, `gp.exec_on_all()` and `gp.distribute()` are for
 superusers only.

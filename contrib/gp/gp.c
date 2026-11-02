@@ -16,6 +16,7 @@
 #include <limits.h>
 
 #include "catalog/catalog.h"
+#include "fmgr.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "miscadmin.h"
@@ -314,4 +315,19 @@ gp_register_main(Datum main_arg)
 			errmsg("registered as segment %d on the coordinator at %s:%d",
 				   gp_segment_id, gp_host, PostPortNumber));
 	proc_exit(0);
+}
+
+/*
+ * gp.segment_id(): the segment this server is.  A row of a distributed
+ * table keeps its segment, but the planner runs everything above the scan
+ * on the coordinator, where no row tells its own: per-row answers come
+ * with the pushdown of stage 5, and until then a query that wants the
+ * segment of a row filters on it, or takes the answer of the server.
+ */
+PG_FUNCTION_INFO_V1(gp_segment_id_fn);
+
+Datum
+gp_segment_id_fn(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(gp_segment_id);
 }
