@@ -72,6 +72,7 @@ tests += {
       't/018_gather.pl',
       't/019_default_distribution.pl',
       't/020_dtx_snapshot.pl',
+      't/021_one_phase.pl',
     ],
   },
 }
