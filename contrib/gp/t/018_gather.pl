@@ -211,10 +211,6 @@ fails('SELECT count(*) FROM d', qr/permission denied for table d/,
 	'a user without SELECT cannot', extra_params => [ '-U', 'u2' ]);
 
 # What is not supported yet is refused, not done on the coordinator alone
-fails('UPDATE d SET b = \'u\' WHERE a = 1',
-	qr/UPDATE of a distributed table is not supported yet/, 'UPDATE');
-fails('DELETE FROM d WHERE a = 1',
-	qr/DELETE of a distributed table is not supported yet/, 'DELETE');
 fails(q{WITH ins AS (INSERT INTO d (a) VALUES (7)) SELECT 1},
 	qr/a data-modifying statement in WITH of a distributed table is not supported yet/,
 	'INSERT in WITH');

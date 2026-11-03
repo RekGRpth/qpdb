@@ -39,6 +39,8 @@
 #include "nodes/value.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
+#include "access/sysattr.h"
+#include "storage/lmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
@@ -347,19 +349,204 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 }
 
 /*
+ * The rows of UPDATE and DELETE are on the segments, and the statement runs
+ * there, over its own rows, in the transaction of the coordinator.  The
+ * plan of the coordinator goes away; a custom scan sends the statement to
+ * the segments on the first call, and takes their counts of rows for the
+ * answer of the statement.  The coordinator holds an exclusive lock on the
+ * table for the whole statement, which orders the writers between the
+ * sessions and spares the segments a deadlock of their own.
+ */
+typedef struct GpDmlState
+{
+	CustomScanState css;
+	char	   *sql;
+	bool		done;
+} GpDmlState;
+
+static Node *gp_dml_create_state(CustomScan *cscan);
+static const CustomExecMethods gp_dml_exec_methods;
+
+static const CustomScanMethods gp_dml_plan_methods = {
+	.CustomName = "GpDml",
+	.CreateCustomScanState = gp_dml_create_state,
+};
+
+static Node *
+gp_dml_create_state(CustomScan *cscan)
+{
+	GpDmlState *state = (GpDmlState *) newNode(sizeof(GpDmlState),
+											   T_CustomScanState);
+
+	state->css.flags = cscan->flags;
+	state->css.methods = &gp_dml_exec_methods;
+	return (Node *) state;
+}
+
+static void
+gp_dml_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	GpDmlState *state = (GpDmlState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
+	state->sql = strVal(linitial(cscan->custom_private));
+}
+
+static TupleTableSlot *
+gp_dml_exec(CustomScanState *node)
+{
+	GpDmlState *state = (GpDmlState *) node;
+
+	if (!state->done)
+	{
+		uint64		rows = 0;
+
+		state->done = true;
+		gp_dispatch_xact_rows(state->sql, &rows);
+		node->ss.ps.state->es_processed = rows;
+	}
+	return NULL;
+}
+
+static void
+gp_dml_end(CustomScanState *node)
+{
+}
+
+static const CustomExecMethods gp_dml_exec_methods = {
+	.CustomName = "GpDml",
+	.BeginCustomScan = gp_dml_begin,
+	.ExecCustomScan = gp_dml_exec,
+	.EndCustomScan = gp_dml_end,
+};
+
+/*
+ * Turn the plan of an UPDATE or a DELETE of a distributed table into the
+ * custom scan that runs the statement on the segments.  The statement may
+ * use its own table only: the segments see their own rows of it, and no
+ * other rows at all.
+ */
+static void
+gp_dml_plan(Query *parse, PlannedStmt *stmt, ParamListInfo boundParams,
+			const char *queryString)
+{
+	ModifyTable *mt = (ModifyTable *) stmt->planTree;
+	RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
+	const char *verb = parse->commandType == CMD_UPDATE ? "UPDATE" : "DELETE";
+	GpPolicy	policy;
+
+	if (!gp_policy_get(rte->relid, &policy))
+		return;
+
+	if (mt->returningLists != NIL)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("RETURNING is not supported on a distributed table"));
+	if (parse->hasRowSecurity)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("row-level security is not supported on a distributed table"));
+	if (boundParams != NULL && boundParams->numParams > 0)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("parameters are not supported in %s of a distributed table yet",
+					   verb));
+	if (parse->hasSubLinks)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("subqueries are not supported in %s of a distributed table yet",
+					   verb),
+				errdetail("A segment sees its own rows of a distributed table, and no rows of the others."));
+	{
+		ListCell   *lc;
+
+		foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
+
+		if (r->rtekind == RTE_RELATION && r->relid == rte->relid)
+			continue;
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("%s of a distributed table can only use its own table",
+					   verb),
+				errdetail("A segment sees its own rows of it, and no rows of the others."));
+		}
+	}
+	if (parse->commandType == CMD_UPDATE)
+	{
+		ListCell   *lc;
+
+		/*
+		 * The columns the statement sets are the updatedCols of its
+		 * permission info: the target list of the query is not to be
+		 * trusted, for the planner rebuilds it.  A key that anything
+		 * else sets is a change of the distribution.
+		 */
+		foreach(lc, parse->rteperminfos)
+		{
+			RTEPermissionInfo *perminfo = lfirst(lc);
+			Bitmapset  *keys = NULL;
+			int			i;
+
+			if (perminfo->relid != rte->relid)
+				continue;
+			for (i = 0; i < policy.nkeys; i++)
+				keys = bms_add_member(keys,
+									  policy.keys[i] -
+									  FirstLowInvalidHeapAttributeNumber);
+			if (bms_overlap(perminfo->updatedCols, keys))
+			{
+				bms_free(keys);
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("changing the distribution key of a distributed table is not supported yet"),
+						errdetail("Rows with the new key would belong to another segment."));
+				return;
+			}
+			bms_free(keys);
+		}
+	}
+
+	/* The writers of the table run one at a time */
+	LockRelationOid(rte->relid, ExclusiveLock);
+
+	{
+		/*
+		 * The segments run the statement as it was written: the target
+		 * list of the query is not to be trusted here, for the planner
+		 * rebuilds it and renumbers the columns it leaves out.
+		 */
+		CustomScan *cscan = makeNode(CustomScan);
+		int			location = stmt->stmt_location;
+		int			len = stmt->stmt_len > 0 ? stmt->stmt_len :
+			strlen(queryString);
+		char	   *sql = pnstrdup(queryString + location, len);
+
+		cscan->scan.plan.startup_cost = mt->plan.startup_cost;
+		cscan->scan.plan.total_cost = mt->plan.total_cost;
+		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
+		cscan->scan.plan.plan_width = mt->plan.plan_width;
+		cscan->scan.scanrelid = 0;
+		cscan->custom_private = list_make2(makeString(sql),
+										   makeBoolean(stmt->canSetTag));
+		cscan->methods = &gp_dml_plan_methods;
+		stmt->planTree = &cscan->scan.plan;
+	}
+}
+
+/*
  * Refuse what would change a distributed table, and is not sent to the
- * segments: UPDATE, DELETE and MERGE, which would find no rows on the
- * coordinator, and a data-modifying statement in WITH, whose rows would stay
- * there.  Only the INSERT of the statement itself is routed.
+ * segments: MERGE, which would find no rows on the coordinator, and a
+ * data-modifying statement in WITH, whose rows would stay there.  Only the
+ * INSERT of the statement itself is routed, and UPDATE and DELETE go to the
+ * segments whole.
  */
 static void
 gp_check_modifications(Query *parse, bool toplevel)
 {
 	if (parse->resultRelation > 0 &&
-		(parse->commandType == CMD_UPDATE ||
-		 parse->commandType == CMD_DELETE ||
-		 parse->commandType == CMD_MERGE ||
-		 (parse->commandType == CMD_INSERT && !toplevel)))
+		(parse->commandType == CMD_MERGE || !toplevel))
 	{
 		RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
 		GpPolicy	policy;
@@ -368,8 +555,7 @@ gp_check_modifications(Query *parse, bool toplevel)
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("%s of a distributed table is not supported yet",
-						   toplevel ? (parse->commandType == CMD_UPDATE ? "UPDATE" :
-									   parse->commandType == CMD_DELETE ? "DELETE" : "MERGE") :
+						   toplevel ? "MERGE" :
 						   "a data-modifying statement in WITH"));
 	}
 
@@ -398,6 +584,10 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	if (parse->commandType == CMD_INSERT && IsUnderPostmaster &&
 		stmt->planTree != NULL && IsA(stmt->planTree, ModifyTable))
 		gp_insert_plan(parse, stmt);
+	if ((parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE) &&
+		IsUnderPostmaster && stmt->planTree != NULL &&
+		IsA(stmt->planTree, ModifyTable))
+		gp_dml_plan(parse, stmt, boundParams, query_string);
 
 	return stmt;
 }
@@ -409,6 +599,7 @@ void
 gp_insert_init(void)
 {
 	RegisterCustomScanMethods(&gp_insert_plan_methods);
+	RegisterCustomScanMethods(&gp_dml_plan_methods);
 	prev_planner = planner_hook;
 	planner_hook = gp_planner;
 }

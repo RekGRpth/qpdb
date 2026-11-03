@@ -978,6 +978,16 @@ gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 void
 gp_dispatch_xact(const char *sql)
 {
+	gp_dispatch_xact_rows(sql, NULL);
+}
+
+/*
+ * Send a command in the transaction of the coordinator, and set the number
+ * of the rows the segments changed, as the command tags of them say
+ */
+void
+gp_dispatch_xact_rows(const char *sql, uint64 *rows)
+{
 	GpSegment  *segments;
 	GpConnection **entries;
 	int			nsegments = gp_connections_ready(&segments, &entries, 0);
@@ -994,7 +1004,12 @@ gp_dispatch_xact(const char *sql)
 
 	results = gp_dispatch(segments, entries, nsegments, commands, NULL);
 	for (int i = 0; i < nsegments; i++)
+	{
+		if (rows != NULL && results[i] != NULL &&
+			PQresultStatus(results[i]) == PGRES_COMMAND_OK)
+			*rows += strtoull(PQcmdTuples(results[i]), NULL, 10);
 		PQclear(results[i]);
+	}
 }
 
 /*

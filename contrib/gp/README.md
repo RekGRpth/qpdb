@@ -297,6 +297,25 @@ before it relies on the segment.  A key that is a parameter of a prepared
 statement, a function or a column of a source table takes the way to all
 segments.
 
+### UPDATE and DELETE of distributed tables (`insert.c`)
+
+The rows of UPDATE and DELETE are on the segments, and the statement runs
+there, over its own rows, in the transaction of the coordinator, under the
+two-phase commit; one segment that wrote alone commits in one phase.  The
+plan of the coordinator goes away, and a custom scan, `GpDml`, sends the
+statement to the segments on the first call, and answers with the sum of
+their counts of rows.  The coordinator takes an exclusive lock on the table
+for the whole statement, which runs the writers one at a time and spares
+the segments a deadlock of their own.  A replicated table takes its UPDATE
+on every segment, over every copy.
+
+What is refused: a change of the distribution key, which would move rows
+between segments; `RETURNING`; row-level security; parameters, subqueries,
+and anything beyond the target table in the statement, for a segment sees
+its own rows of the target table and no rows of the others; `MERGE`, and a
+data-modifying statement in WITH.  A statement that matches no row changes
+nothing, and answers 0.
+
 ### SELECT from distributed tables (`gather.c`)
 
 The rows of a distributed table are on the segments, so a query cannot read
@@ -463,7 +482,10 @@ by the patch and `contrib/gp`.
    stable functions of time on the coordinator and a comparison with a
    vanilla server.
 4. **Distributed transactions and DML** — two-phase commit of all writes,
-   distributed snapshots, `UPDATE` and `DELETE`.
+   distributed snapshots, `UPDATE` and `DELETE` are in; still ahead are
+   the recovery of a transaction a segment keeps prepared, and unique
+   indexes without the key of the distribution, which the cluster cannot
+   check (a distributed table refuses them already).
 5. **MPP planner without interconnect** — locus, slices; colocated joins
    and aggregates on the segments.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
