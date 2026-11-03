@@ -207,6 +207,25 @@ BEGIN
 			USING HINT = 'Distribute a table before filling it.';
 	END IF;
 
+	-- A segment sees its own rows only: a unique index without the whole
+	-- key of the distribution cannot tell two equal rows apart when they
+	-- sit on different segments
+	IF key IS NOT NULL AND EXISTS (
+		SELECT FROM pg_catalog.pg_index i
+		WHERE i.indrelid = relation AND i.indisunique
+		  AND NOT (
+			SELECT array_agg(a.attnum)
+			FROM unnest(key) AS k(name)
+			JOIN pg_catalog.pg_attribute a
+			  ON a.attrelid = relation AND a.attname = k.name
+		  ) <@ i.indkey::pg_catalog.int2[]
+	) THEN
+		RAISE EXCEPTION
+			'the unique indexes of table "%" must include the whole key of the distribution',
+			relation
+			USING HINT = 'Rows with equal values may sit on different segments; distribute by a column of every unique index.';
+	END IF;
+
 	IF key IS NULL THEN
 		IF colocate_with IS NOT NULL THEN
 			RAISE EXCEPTION 'a replicated table has no colocation group';
@@ -216,6 +235,7 @@ BEGIN
 		PERFORM gp.policy_changed(relation);
 		RETURN;
 	END IF;
+
 
 	IF cardinality(key) = 0 THEN
 		RAISE EXCEPTION 'a key has at least one column';

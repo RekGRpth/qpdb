@@ -107,6 +107,12 @@ of `CREATE SCHEMA`) and statements of extension scripts are not sent on
 their own.  DDL in a function is sent when the function runs on the
 coordinator.
 
+A unique index of a distributed table must include the whole key of its
+distribution: a segment sees its own rows only, so an index without the
+key cannot tell two equal rows apart when they sit on different segments.
+A table distributed by hand learns this from `gp.distribute()`, and a
+statement that makes such an index on a distributed table fails.
+
 What goes to the segments: `CREATE`, `ALTER` and `DROP` of tables, indexes,
 sequences and views; `CREATE SCHEMA` and `DROP SCHEMA`; composite, enum and
 range types, domains, `ALTER TYPE ... ADD VALUE`; base and shell types,

@@ -835,6 +835,53 @@ gp_ddl_dispatched(Node *parsetree)
 }
 
 /* The text of the statement, cut out of the query string */
+/*
+ * Every unique index of a distributed table must include the whole key of
+ * its distribution: a segment sees its own rows only, so an index without
+ * the key cannot tell two equal rows apart when they sit on different
+ * segments.  Called after a statement that may have made such an index.
+ */
+static void
+gp_check_unique(Oid relid)
+{
+	GpPolicy	policy;
+	Relation	rel;
+	List	   *indexes;
+	ListCell   *lc;
+
+	if (!gp_policy_get(relid, &policy) || policy.replicated)
+		return;
+
+	rel = relation_open(relid, AccessShareLock);
+	indexes = RelationGetIndexList(rel);
+	relation_close(rel, NoLock);
+
+	foreach(lc, indexes)
+	{
+		Relation	idx = index_open(lfirst_oid(lc), AccessShareLock);
+		bool		covers = true;
+
+		if (idx->rd_index->indisunique)
+			for (int k = 0; covers && k < policy.nkeys; k++)
+			{
+				bool		found = false;
+
+				for (int i = 0; i < idx->rd_index->indnkeyatts; i++)
+					if (idx->rd_index->indkey.values[i] == policy.keys[k])
+						found = true;
+				covers = found;
+			}
+		index_close(idx, AccessShareLock);
+
+		if (!covers)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("the unique indexes of table \"%s\" must include the whole key of the distribution",
+						   get_rel_name(relid)),
+					errhint("Rows with equal values may sit on different segments."));
+	}
+}
+
 static char *
 gp_statement_text(PlannedStmt *pstmt, const char *queryString)
 {
@@ -1159,11 +1206,30 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 		gp_dispatch_nonxact_stmt(parsetree,
 								 gp_statement_text(pstmt, queryString), oids);
 
-	/* A new table that the setting sends to the segments; a partition goes with its table */
+	/*
+	 * A new table that the setting sends to the segments; a partition goes
+	 * with its table.  A unique index of a distributed table must know the
+	 * whole key of the distribution, whatever made it: the statement, the
+	 * default distribution, or an earlier one.
+	 */
 	if (mode == GP_DISPATCH_XACT && gp_default_distribution != GP_DEFAULT_COORDINATOR &&
 		IsA(parsetree, CreateStmt) && ((CreateStmt *) parsetree)->partbound == NULL)
 		gp_distribute_by_default(RangeVarGetRelid(((CreateStmt *) parsetree)->relation,
 												  NoLock, false));
+	if (mode != GP_DISPATCH_NONE &&
+		(IsA(parsetree, CreateStmt) || IsA(parsetree, IndexStmt) ||
+		 IsA(parsetree, AlterTableStmt)))
+	{
+		RangeVar   *relation;
+
+		if (IsA(parsetree, CreateStmt))
+			relation = ((CreateStmt *) parsetree)->relation;
+		else if (IsA(parsetree, IndexStmt))
+			relation = ((IndexStmt *) parsetree)->relation;
+		else
+			relation = ((AlterTableStmt *) parsetree)->relation;
+		gp_check_unique(RangeVarGetRelid(relation, NoLock, true));
+	}
 }
 
 /*
