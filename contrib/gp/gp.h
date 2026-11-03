@@ -96,6 +96,7 @@ extern void gp_gather_init(void);
 extern void gp_dispatch_init(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
+extern void gp_dispatch_xact_rows(const char *sql, uint64 *rows);
 extern int	gp_copy_open(const char *sql, int only, GpSegment **segments);
 extern void gp_copy_send(int segment_id, const char *data, int len);
 extern void gp_copy_close(void);
