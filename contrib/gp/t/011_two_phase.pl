@@ -85,6 +85,12 @@ SKIP:
 	skip 'injection points are not supported by this build', 6
 	  unless $ENV{enable_injection_points} eq 'yes';
 
+	# The recovery worker of the coordinator would finish the commit below
+	# before the test does it by hand; push its next pass past the test
+	$coordinator->safe_psql('postgres',
+		"ALTER SYSTEM SET gp.recovery_interval = 3600;
+SELECT pg_reload_conf();");
+
 	$coordinator->safe_psql('postgres',
 		"CREATE EXTENSION injection_points;
 SELECT injection_points_attach('gp-before-commit-prepared', 'wait')");

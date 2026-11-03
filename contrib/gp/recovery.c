@@ -59,7 +59,7 @@
 static uint32 gp_recovery_wait_event = 0;
 
 /* Seconds between the passes of the worker */
-int			gp_recovery_interval = 5;
+static int	gp_recovery_interval = 5;
 
 pg_noreturn PGDLLEXPORT void gp_recovery_worker_main(Datum main_arg);
 

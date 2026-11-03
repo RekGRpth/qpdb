@@ -146,6 +146,9 @@ SELECT injection_points_wakeup('gp-before-commit-prepared')");
 	is(run('SELECT count(*) FROM t'), 6, 'and the coordinator sees the same');
 }
 
-$_->stop foreach (@segments, $coordinator);
+# An immediate stop: the test is over, and on Windows the coordinator,
+# crash-restarted above, takes its time letting its last children go,
+# which a fast stop waits out and fails on
+$_->stop('immediate') foreach (@segments, $coordinator);
 
 done_testing();

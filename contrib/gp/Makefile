@@ -11,6 +11,7 @@ OBJS = \
 	gp.o \
 	insert.o \
 	oids.o \
+	recovery.o \
 	route.o \
 	segments.o
 
