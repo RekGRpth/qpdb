@@ -92,8 +92,13 @@ extern void gp_insert_init(void);
 /* gather.c */
 extern void gp_gather_init(void);
 
+/* recovery.c */
+extern void gp_recovery_init(void);
+
 /* dispatch.c */
 extern void gp_dispatch_init(void);
+extern void gp_dtx_lock(void);
+extern void gp_dtx_unlock(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
 extern void gp_dispatch_xact_rows(const char *sql, uint64 *rows);

@@ -10,6 +10,7 @@ gp_sources = files(
   'gp.c',
   'insert.c',
   'oids.c',
+  'recovery.c',
   'route.c',
   'segments.c',
 )
@@ -75,6 +76,7 @@ tests += {
       't/021_one_phase.pl',
       't/022_unique_key.pl',
       't/023_update_delete.pl',
+      't/024_recovery.pl',
     ],
   },
 }
