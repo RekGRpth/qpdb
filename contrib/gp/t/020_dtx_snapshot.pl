@@ -85,12 +85,15 @@ SELECT injection_points_attach('gp-before-commit-prepared', 'wait')");
 		3, 'every segment keeps the transaction prepared');
 
 	# A reader waits for the commit to finish rather than see a half of
-	# it, and then sees it in full
+	# it, and then sees it in full.  The recovery worker of the coordinator
+	# waits on the same lock while the writer holds it, so count the reader
+	# by its backend type
 	my $reader = $coordinator->background_psql('postgres', on_error_stop => 1);
 	$reader->query_until(qr/start/,
 		"\\echo start\nSELECT count(*) FROM t;\n");
 	$coordinator->poll_query_until('postgres',
-		"SELECT count(*) = 1 FROM pg_stat_activity WHERE wait_event = 'gp dtx'")
+		"SELECT count(*) = 1 FROM pg_stat_activity
+		 WHERE wait_event = 'gp dtx' AND backend_type = 'client backend'")
 	  or die 'the reader does not wait for the committing transaction';
 
 	$coordinator->safe_psql('postgres',

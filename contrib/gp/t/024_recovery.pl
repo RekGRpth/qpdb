@@ -42,6 +42,23 @@ $coordinator->poll_query_until('postgres',
 
 sub run { return $coordinator->safe_psql('postgres', shift); }
 
+# Wait until the postmaster of a node is really gone.  On Windows a
+# coordinator may take seconds to exit after pg_ctl stops waiting for it
+# (and pg_ctl then reports a failure for a server that does shut down), so
+# a stop with fail_ok is followed by waiting out the pid file
+sub wait_gone
+{
+	my ($node) = @_;
+	my $pidfile = $node->data_dir . '/postmaster.pid';
+
+	for (1 .. 300)
+	{
+		return if !-e $pidfile;
+		select(undef, undef, undef, 0.1);
+	}
+	die "$pidfile is still there";
+}
+
 # Whether a segment keeps a transaction of ours prepared
 sub prepared
 {
@@ -122,7 +139,8 @@ SELECT injection_points_wakeup('gp-before-commit-prepared')");
 	is(scalar(() = grep { prepared($_) eq '1' } @segments), 3,
 		'every segment keeps the transaction prepared');
 
-	$coordinator->stop('immediate');
+	$coordinator->stop('immediate', fail_ok => 1);
+	wait_gone($coordinator);
 	$coordinator->start;
 	$coordinator->poll_query_until('postgres',
 		'SELECT count(*) = 3 FROM gp.cluster_segments()')
@@ -146,9 +164,10 @@ SELECT injection_points_wakeup('gp-before-commit-prepared')");
 	is(run('SELECT count(*) FROM t'), 6, 'and the coordinator sees the same');
 }
 
-# An immediate stop: the test is over, and on Windows the coordinator,
-# crash-restarted above, takes its time letting its last children go,
-# which a fast stop waits out and fails on
-$_->stop('immediate') foreach (@segments, $coordinator);
+# An immediate stop: the test is over, and the coordinator, crash-restarted
+# above, takes its time letting its children go, which pg_ctl may not wait
+# out
+$_->stop foreach @segments;
+$coordinator->stop('immediate', fail_ok => 1);
 
 done_testing();
