@@ -353,6 +353,22 @@ The policy of a table is read once, by a session, from `gp.distribution_policy`,
 and kept; `gp.distribute()` and the drop of a table invalidate it through
 the relcache entry of the table, and a change of an extension drops it.
 
+### Aggregates on the segments (`slice.c`)
+
+When a query groups by the whole key of the distribution, every row of a
+group is on one segment, so the segment can compute the group to the end:
+`SELECT key, count(*) FROM t GROUP BY key` needs no rows on the
+coordinator, only the finished groups of every segment.  Such an
+aggregate is replaced after the planner by a custom scan, `GpSlice`,
+which runs the aggregate of the query on the segments and reads their
+rows; the sort and the limit of the query stay on the coordinator.  A
+replicated table is aggregated by one segment as a whole, even without a
+grouping.  Joins, subqueries, windows, grouping sets, a grouping that
+does not cover the whole key, a global aggregate of a hashed table, and
+a sorted aggregate that answers the `ORDER BY` of the query by itself
+are left to the coordinator, as is a query whose target list has junk
+columns.  `EXPLAIN (VERBOSE)` shows the query of the segments.
+
 ## Trying it
 
 Build the tree with Meson or make; `contrib/gp` is built with the rest.
@@ -469,6 +485,7 @@ start their own clusters:
 | `022_unique_key.pl` | Unique indexes of a distributed table must include the whole key of the distribution; equal keys stay on one segment, and its index tells them apart |
 | `023_update_delete.pl` | `UPDATE` and `DELETE` run on the segments: distributed and replicated tables, rollbacks, a second writer waiting out the first, what is refused |
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
+| `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -497,8 +514,10 @@ by the patch and `contrib/gp`.
    distributed snapshots; `UPDATE` and `DELETE` on the segments; unique
    indexes made to include the key of the distribution; and the recovery
    worker that resolves the transactions lost segments keep prepared.
-5. **MPP planner without interconnect** — locus, slices; colocated joins
-   and aggregates on the segments.
+5. **MPP planner without interconnect** — in progress: aggregates whose
+   grouping covers the key of the distribution run on the segments, and a
+   replicated table is aggregated by one segment; next are colocated
+   joins.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.

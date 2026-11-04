@@ -577,9 +577,12 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		   ParamListInfo boundParams, ExplainState *es)
 {
 	PlannedStmt *stmt;
+	Query	   *agg_original = NULL;
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
+
+	agg_original = gp_slice_agg_query(parse);
 
 	if (prev_planner)
 		stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
@@ -593,6 +596,9 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		IsUnderPostmaster && stmt->planTree != NULL &&
 		IsA(stmt->planTree, ModifyTable))
 		gp_dml_plan(parse, stmt, boundParams, query_string);
+
+	if (agg_original != NULL)
+		gp_slice_agg_plan(agg_original, stmt);
 
 	return stmt;
 }
