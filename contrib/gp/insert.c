@@ -32,12 +32,14 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
 #include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "access/sysattr.h"
 #include "storage/lmgr.h"
@@ -48,6 +50,9 @@
 #include "gp.h"
 
 static planner_hook_type prev_planner = NULL;
+static post_parse_analyze_hook_type prev_post_parse_analyze = NULL;
+
+static void gp_dml_lock(Oid relid);
 
 typedef struct GpInsertState
 {
@@ -509,7 +514,7 @@ gp_dml_plan(Query *parse, PlannedStmt *stmt, ParamListInfo boundParams,
 	}
 
 	/* The writers of the table run one at a time */
-	LockRelationOid(rte->relid, ExclusiveLock);
+	gp_dml_lock(rte->relid);
 
 	{
 		/*
@@ -593,7 +598,46 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 }
 
 /*
- * Install the hook on the coordinator; called from _PG_init()
+ * The writers of a distributed table run one at a time.  Their lock is
+ * on the policy of the table, not on the table itself: the parser holds
+ * the row exclusive lock of the target already when any hook gets to
+ * run, and upgrading it to an exclusive lock would deadlock two writers
+ * upgrading at the same time.  A lock on the policy upgrades nothing.
+ */
+static void
+gp_dml_lock(Oid relid)
+{
+	Oid			policy_relid;
+
+	policy_relid = get_relname_relid("distribution_policy",
+									 get_namespace_oid("gp", false));
+	LockDatabaseObject(policy_relid, relid, 0, ExclusiveLock);
+}
+
+/*
+ * The lock of a distributed UPDATE or DELETE, taken as early as the
+ * hooks allow, so that a second writer waits before it plans
+ */
+static void
+gp_post_parse_analyze(ParseState *pstate, Query *query,
+					  const JumbleState *jstate)
+{
+	if (prev_post_parse_analyze)
+		prev_post_parse_analyze(pstate, query, jstate);
+
+	if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE) &&
+		query->resultRelation > 0 && IsUnderPostmaster)
+	{
+		RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
+		GpPolicy	policy;
+
+		if (rte->rtekind == RTE_RELATION && gp_policy_get(rte->relid, &policy))
+			gp_dml_lock(rte->relid);
+	}
+}
+
+/*
+ * Install the hooks on the coordinator; called from _PG_init()
  */
 void
 gp_insert_init(void)
@@ -602,4 +646,6 @@ gp_insert_init(void)
 	RegisterCustomScanMethods(&gp_dml_plan_methods);
 	prev_planner = planner_hook;
 	planner_hook = gp_planner;
+	prev_post_parse_analyze = post_parse_analyze_hook;
+	post_parse_analyze_hook = gp_post_parse_analyze;
 }
