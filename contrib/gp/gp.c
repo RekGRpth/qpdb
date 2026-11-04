@@ -241,6 +241,7 @@ _PG_init(void)
 		gp_ddl_init();
 		gp_insert_init();
 		gp_gather_init();
+		gp_slice_init();
 	}
 
 	gp_oids_init();

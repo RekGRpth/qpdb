@@ -13,7 +13,8 @@ OBJS = \
 	oids.o \
 	recovery.o \
 	route.o \
-	segments.o
+	segments.o \
+	slice.o
 
 EXTENSION = gp
 DATA = gp--1.0.sql

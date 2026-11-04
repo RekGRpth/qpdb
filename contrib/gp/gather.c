@@ -288,6 +288,14 @@ static const CustomPathMethods gp_gather_path_methods = {
 	.PlanCustomPath = gp_gather_plan,
 };
 
+/* Whether a plan node is the gather of a distributed table */
+bool
+gp_is_gather(Plan *plan)
+{
+	return IsA(plan, CustomScan) &&
+		((CustomScan *) plan)->methods == &gp_gather_plan_methods;
+}
+
 /*
  * The query that the segments run, and their columns, as the node reads
  * them

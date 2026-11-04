@@ -91,6 +91,12 @@ extern void gp_insert_init(void);
 
 /* gather.c */
 extern void gp_gather_init(void);
+extern bool gp_is_gather(Plan *plan);
+
+/* slice.c */
+extern void gp_slice_init(void);
+extern Query *gp_slice_agg_query(Query *parse);
+extern void gp_slice_agg_plan(Query *original, PlannedStmt *stmt);
 
 /* recovery.c */
 extern void gp_recovery_init(void);

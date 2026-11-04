@@ -13,6 +13,7 @@ gp_sources = files(
   'recovery.c',
   'route.c',
   'segments.c',
+  'slice.c',
 )
 
 if host_system == 'windows'
@@ -77,6 +78,7 @@ tests += {
       't/022_unique_key.pl',
       't/023_update_delete.pl',
       't/024_recovery.pl',
+      't/025_agg_pushdown.pl',
     ],
   },
 }
