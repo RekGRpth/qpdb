@@ -351,6 +351,22 @@ gp_dispatch_shmem_init(void *arg)
 	LWLockInitialize(&dtx_shared->lock, LWLockNewTrancheId("gp dtx"));
 }
 
+/*
+ * The lock of the distributed snapshot, for the recovery worker: a pass
+ * of it takes the lock too, and resolves nothing while a commit runs
+ */
+void
+gp_dtx_lock(void)
+{
+	LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
+}
+
+void
+gp_dtx_unlock(void)
+{
+	LWLockRelease(&dtx_shared->lock);
+}
+
 static void
 gp_connections_xact_callback(XactEvent event, void *arg)
 {
@@ -375,6 +391,8 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 				 */
 				LWLockAcquire(&dtx_shared->lock, LW_EXCLUSIVE);
 				dtx_held = true;
+				if (prepared_any)
+					INJECTION_POINT("gp-after-prepare-transaction", NULL);
 			}
 			break;
 		case XACT_EVENT_PRE_PREPARE:

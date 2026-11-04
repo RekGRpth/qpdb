@@ -170,6 +170,15 @@ CREATE FUNCTION gp.segment_id() RETURNS int4
 AS 'MODULE_PATHNAME', 'gp_segment_id_fn'
 LANGUAGE C VOLATILE;
 
+-- Run one pass of the recovery of the transactions the segments keep
+-- prepared
+CREATE FUNCTION gp.recovery_pass_now()
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_recovery_pass_now'
+LANGUAGE C;
+
+REVOKE ALL ON FUNCTION gp.recovery_pass_now() FROM PUBLIC;
+
 -- Distribute an empty table by hash of the key columns, or replicate it to
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key

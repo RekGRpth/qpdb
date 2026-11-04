@@ -180,10 +180,15 @@ may be lost.
 
 A segment lost between the commit of the coordinator and `COMMIT PREPARED`
 keeps its transaction prepared, holding its locks, and the coordinator
-warns.  Until recovery comes, resolve it by hand: `pg_xact_status('<xid>')`
-on the coordinator tells whether to run `COMMIT PREPARED 'gp_<xid>'` or
-`ROLLBACK PREPARED 'gp_<xid>'` on the segment; `pg_prepared_xacts` there
-lists such transactions.
+warns.  A background worker of the coordinator, `gp recovery`, resolves
+what is left: every `gp.recovery_interval` seconds it asks every segment
+for the transactions it keeps prepared under a name of ours, looks into
+the clog of the coordinator for the fate of each, and runs `COMMIT
+PREPARED` or `ROLLBACK PREPARED` on the segment as the clog says — a
+coordinator lost before it told is rolled back, as the safest of the two.
+A pass runs under the lock of the distributed snapshot above, so it never
+touches a transaction whose commit is running.  `gp.recovery_pass_now()`
+runs a pass at once.
 
 #### Commands outside a transaction
 
@@ -409,6 +414,7 @@ All are set at server start unless noted.
 | `gp.host` | `localhost` | Host of a segment for the other servers |
 | `gp.register_retry_interval` | 5s | Time between attempts of a segment to register |
 | `gp.max_segments` | 64 | Size of the copy of `gp.segments` on the coordinator |
+| `gp.recovery_interval` | 5s | Time between the passes of the recovery worker, on the coordinator |
 | `gp.dispatch_oids` | | OIDs of a command from the coordinator; set per command by the coordinator, not in the configuration of a server |
 | `gp.dispatch_oids_session` | off | Keeps `gp.dispatch_oids` for the next transaction, for a command out of a transaction block |
 | `gp.allow_local_ddl` | off | Lets a segment create objects of its own; superuser, for maintenance |
@@ -458,6 +464,11 @@ start their own clusters:
 | `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
 | `018_gather.pl` | `SELECT` from distributed tables against the same rows in ordinary tables: aggregates, joins, windows, rescans, replicated and partitioned tables, types, own writes, privileges, what is refused |
 | `019_default_distribution.pl` | `gp.default_distribution`: the key of a new table, partitions, temporary tables, `CREATE TABLE AS`, `SELECT INTO`, a database's setting |
+| `020_dtx_snapshot.pl` | The lock of the distributed snapshot: a reader waits out a commit stopped between its prepare and `COMMIT PREPARED`; writers and readers together keep every transaction whole |
+| `021_one_phase.pl` | A transaction that wrote one segment commits there in one phase; a segment lost in the window rolls back and its rows are lost with a warning |
+| `022_unique_key.pl` | Unique indexes of a distributed table must include the whole key of the distribution; equal keys stay on one segment, and its index tells them apart |
+| `023_update_delete.pl` | `UPDATE` and `DELETE` run on the segments: distributed and replicated tables, rollbacks, a second writer waiting out the first, what is refused |
+| `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -481,11 +492,11 @@ by the patch and `contrib/gp`.
    temporary table together with others; next are `gp_segment_id()`,
    stable functions of time on the coordinator and a comparison with a
    vanilla server.
-4. **Distributed transactions and DML** — two-phase commit of all writes,
-   distributed snapshots, `UPDATE` and `DELETE` are in; still ahead are
-   the recovery of a transaction a segment keeps prepared, and unique
-   indexes without the key of the distribution, which the cluster cannot
-   check (a distributed table refuses them already).
+4. **Distributed transactions and DML** — done: two-phase commit of all
+   writes, and one phase for a transaction that wrote one segment;
+   distributed snapshots; `UPDATE` and `DELETE` on the segments; unique
+   indexes made to include the key of the distribution; and the recovery
+   worker that resolves the transactions lost segments keep prepared.
 5. **MPP planner without interconnect** — locus, slices; colocated joins
    and aggregates on the segments.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
