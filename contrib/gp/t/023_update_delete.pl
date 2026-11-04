@@ -86,6 +86,13 @@ is(run('SELECT count(*) FROM t'), 25, 'DELETE rolls back the same way');
 my $busy = $coordinator->background_psql('postgres', on_error_stop => 1);
 $busy->query_until(qr/start/,
 	"\\echo start\nBEGIN; UPDATE t SET b = 'held' WHERE a = 1;\n");
+# The first writer holds the lock of the table once its UPDATE has run;
+# starting the second writer before that would let it win the lock and
+# commit first, and then nothing would wait
+$coordinator->poll_query_until('postgres',
+	"SELECT count(*) = 1 FROM pg_stat_activity
+	 WHERE query LIKE '%held%' AND state = 'idle in transaction'")
+  or die 'the first writer did not update';
 my $second = $coordinator->background_psql('postgres', on_error_stop => 1);
 $second->query_until(qr/start/,
 	"\\echo start\nUPDATE t SET b = 'taken' WHERE a = 2;\n");
