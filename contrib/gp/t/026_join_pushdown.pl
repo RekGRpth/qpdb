@@ -78,8 +78,19 @@ like(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.a = j2.a AND j1.b = j2.c'
 	qr/GpSlice/, 'a condition on top of the key is a filter, not a redistribution');
 unlike(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.b = j2.c'), qr/GpSlice/,
 	'a join not by the key is not pushed');
-unlike(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a'),
-	qr/GpSlice/, 'an aggregate over a join is not pushed yet');
+like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a'),
+	qr/GpSlice/, 'an aggregate over a colocated join by the key is pushed');
+unlike(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a'),
+	qr/GpSlice/,
+	'a sorted aggregate over a join that answers the order by itself is not pushed');
+unlike(plan_for('SELECT j1.b, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.b'),
+	qr/GpSlice/, 'an aggregate over a join not by the key is not pushed');
+unlike(plan_for('SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a'), qr/GpSlice/,
+	'a global aggregate over a join is not pushed');
+like(plan_for('SELECT j1.a, r1.d, count(*) FROM j1 JOIN r1 ON j1.a = r1.a GROUP BY j1.a, r1.d'),
+	qr/GpSlice/, 'an aggregate over a hashed and a replicated table is pushed');
+like(plan_for('SELECT r1.a, count(*) FROM r1 JOIN r2 ON r1.a = r2.a GROUP BY r1.a'),
+	qr/GpSlice/, 'an aggregate over two replicated tables is pushed');
 
 my @queries = (
 	'SELECT j1.a, j1.b, j2.c FROM j1 JOIN j2 ON j1.a = j2.a ORDER BY j1.a',
@@ -90,6 +101,12 @@ my @queries = (
 	'SELECT j1.a, r1.d FROM j1 JOIN r1 ON j1.a = r1.a ORDER BY j1.a LIMIT 5',
 	'SELECT r1.a, r2.e FROM r1 JOIN r2 ON r1.a = r2.a ORDER BY r1.a LIMIT 5',
 	'SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a LIMIT 3',
+	'SELECT j1.a, r1.d, count(*) FROM j1 JOIN r1 ON j1.a = r1.a GROUP BY j1.a, r1.d ORDER BY j1.a, r1.d LIMIT 5',
+	'SELECT r1.a, count(*) FROM r1 JOIN r2 ON r1.a = r2.a GROUP BY r1.a ORDER BY r1.a LIMIT 5',
+	'SELECT j1.b, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.b ORDER BY j1.b LIMIT 3',
+	'SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a',
+	'SELECT j1.a, sum(j2.a) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
+	'SELECT j1.a, count(*) FROM j1 LEFT JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
 );
 foreach my $query (@queries)
 {
