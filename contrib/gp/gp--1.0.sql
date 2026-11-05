@@ -179,6 +179,15 @@ LANGUAGE C;
 
 REVOKE ALL ON FUNCTION gp.recovery_pass_now() FROM PUBLIC;
 
+-- The rows of a query from every segment of the cluster, among them the
+-- segment that asks.  The query returns the columns the caller says it
+-- does.  It runs on a segment, written by the planner of the coordinator
+-- into the queries of a redistributed join
+CREATE FUNCTION gp.peer_query(sql text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gp_peer_query'
+LANGUAGE C VOLATILE;
+
 -- Distribute an empty table by hash of the key columns, or replicate it to
 -- all segments if key is NULL.  A table distributed by hash joins the
 -- colocation group of colocate_with, or else the first group with its key

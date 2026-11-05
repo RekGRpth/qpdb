@@ -49,6 +49,7 @@ typedef struct GpSegment
 } GpSegment;
 
 /* GUC variables */
+extern const char *gp_coordinator_conninfo(void);
 extern int	gp_role;
 extern int	gp_segment_id;
 extern char *gp_database;

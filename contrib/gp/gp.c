@@ -261,6 +261,13 @@ _PG_init(void)
 	}
 }
 
+/* The connection string of the coordinator, for the motion of a segment */
+const char *
+gp_coordinator_conninfo(void)
+{
+	return gp_coordinator;
+}
+
 /*
  * Background worker of a segment: register the segment on the coordinator,
  * then exit.  Exit code 0 tells the postmaster not to start the worker

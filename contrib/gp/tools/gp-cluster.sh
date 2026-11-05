@@ -124,6 +124,17 @@ cmd_start()
 		-c 'CREATE EXTENSION IF NOT EXISTS gp' ||
 		die "could not create extension gp on the coordinator"
 
+	# The motion of a segment calls the functions of the extension there
+	list | while read -r name port role; do
+		[ "$role" = segment ] || continue
+		psql -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
+			-p "$port" -d postgres \
+			-c 'SET gp.allow_local_ddl = on' \
+			-c 'CREATE EXTENSION IF NOT EXISTS gp' \
+			>>"$dir/$name.log" 2>&1 ||
+			echo "warning: could not create extension gp on $name"
+	done
+
 	# Segments retry every few seconds, so the first ones may have failed
 	segments=$(grep -c ' segment$' "$nodes")
 	i=0

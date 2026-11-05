@@ -31,7 +31,9 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -678,6 +680,180 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 }
 
 /*
+ * Whether the join is of two hashed tables of different colocation groups,
+ * joined by the whole key of both: the rows of one table can move, placed
+ * by the hash of the join key under the map of the other, and every row
+ * meets its partners on one segment.  The table that stays and the table
+ * that moves are returned
+ */
+static bool
+gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
+							  GpJoinTable **stay, GpJoinTable **move)
+{
+	GpJoinTable *t1;
+	GpJoinTable *t2;
+
+	if (list_length(tables) != 2)
+		return false;
+	t1 = linitial(tables);
+	t2 = lsecond(tables);
+	if (t1->policy.replicated || t2->policy.replicated ||
+		t1->policy.colocation_id == 0 ||
+		t1->policy.colocation_id == t2->policy.colocation_id ||
+		t1->policy.nkeys != t2->policy.nkeys)
+		return false;
+
+	/* The key columns must hash to one place, so they are of one type */
+	{
+		RangeTblEntry *rte1 = rt_fetch(t1->rti, parse->rtable);
+		RangeTblEntry *rte2 = rt_fetch(t2->rti, parse->rtable);
+		Relation	rel1 = table_open(rte1->relid, AccessShareLock);
+		Relation	rel2 = table_open(rte2->relid, AccessShareLock);
+		bool		ok = true;
+
+		for (int i = 0; i < t1->policy.nkeys; i++)
+		{
+			if (TupleDescAttr(RelationGetDescr(rel1), t1->policy.keys[i] - 1)->atttypid !=
+				TupleDescAttr(RelationGetDescr(rel2), t2->policy.keys[i] - 1)->atttypid)
+			{
+				ok = false;
+				break;
+			}
+		}
+		table_close(rel1, AccessShareLock);
+		table_close(rel2, AccessShareLock);
+		if (!ok)
+			return false;
+	}
+
+	for (int i = 0; i < t1->policy.nkeys; i++)
+	{
+		if (!gp_slice_join_pair_list(conds, t1->rti, t2->rti,
+									 t1->policy.keys[i],
+									 t2->policy.keys[i]))
+			return false;
+	}
+
+	*stay = t1;
+	*move = t2;
+	return true;
+}
+
+/*
+ * Whether some join of the tree is not an inner one: a row of the moving
+ * table that the hash places nowhere — a row with a null key — meets no
+ * partner on any segment, which an outer join would have to keep
+ */
+static bool
+gp_slice_join_not_inner(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *join = (JoinExpr *) node;
+
+		if (join->jointype != JOIN_INNER)
+			return true;
+	}
+	return expression_tree_walker(node, gp_slice_join_not_inner, context);
+}
+
+/*
+ * Rewrite the table that moves into a pull of its rows from every segment:
+ * the segment runs the query, and the function asks every segment — itself
+ * among them — for the rows that the hash of the join key places on it.
+ * The map of the table that stays goes into the query as an array, and the
+ * segment the rows are for comes in a setting of the connection, so the
+ * query itself is one for all the segments
+ */
+static void
+gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move)
+{
+	RangeTblEntry *rte = rt_fetch(move->rti, remote->rtable);
+	Relation	rel;
+	TupleDesc	tupdesc;
+	StringInfoData sql;
+	StringInfoData cols;
+	StringInfoData map;
+	StringInfoData keys;
+	List	   *coltypes = NIL;
+	List	   *coltypmods = NIL;
+	List	   *colnames = NIL;
+	List	   *colcolls = NIL;
+	RangeTblFunction *rtf;
+	FuncExpr   *func;
+	Const	   *arg;
+	Oid			peer_query_oid;
+
+	rel = table_open(rte->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	initStringInfo(&sql);
+	initStringInfo(&cols);
+	initStringInfo(&keys);
+	initStringInfo(&map);
+	appendStringInfoString(&map, "ARRAY[");
+	for (int i = 0; i < stay->policy.nbuckets; i++)
+		appendStringInfo(&map, "%s%d", i > 0 ? "," : "",
+						 stay->policy.map[i]);
+	appendStringInfoString(&map, "]");
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+		{
+			table_close(rel, AccessShareLock);
+			return;
+		}
+		appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
+						 quote_identifier(NameStr(att->attname)));
+		coltypes = lappend_oid(coltypes, att->atttypid);
+		coltypmods = lappend_int(coltypmods, att->atttypmod);
+		colnames = lappend(colnames, makeString(pstrdup(NameStr(att->attname))));
+		colcolls = lappend_oid(colcolls, att->attcollation);
+	}
+	for (int i = 0; i < move->policy.nkeys; i++)
+		appendStringInfo(&keys, "%s%s", keys.len > 0 ? ", " : "",
+						 quote_identifier(NameStr(TupleDescAttr(tupdesc,
+																move->policy.keys[i] - 1)->attname)));
+
+	appendStringInfo(&sql, "SELECT %s FROM %s WHERE (%s)[gp.bucket(%d%s%s) + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4",
+					 cols.data,
+					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												RelationGetRelationName(rel)),
+					 map.data, stay->policy.nbuckets,
+					 keys.len > 0 ? ", " : "", keys.data);
+	table_close(rel, AccessShareLock);
+
+	peer_query_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+														  CStringGetDatum("gp.peer_query(text)")));
+	arg = makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+					PointerGetDatum(cstring_to_text(sql.data)), false, false);
+	func = makeNode(FuncExpr);
+	func->funcid = peer_query_oid;
+	func->funcresulttype = RECORDOID;
+	func->funcretset = true;
+	func->funcvariadic = false;
+	func->funcformat = COERCE_EXPLICIT_CALL;
+	func->funccollid = InvalidOid;
+	func->inputcollid = DEFAULT_COLLATION_OID;
+	func->args = list_make1(arg);
+
+	rtf = makeNode(RangeTblFunction);
+	rtf->funccolcount = list_length(coltypes);
+	rtf->funccoltypes = coltypes;
+	rtf->funccoltypmods = coltypmods;
+	rtf->funccolnames = colnames;
+	rtf->funccolcollations = colcolls;
+	rtf->funcexpr = (Node *) func;
+
+	rte->rtekind = RTE_FUNCTION;
+	rte->functions = list_make1(rtf);
+}
+
+/*
  * Resolve a column of a plan to the column of a base table it comes from,
  * through the OUTER_VAR and INNER_VAR references of the plans above
  */
@@ -784,12 +960,22 @@ gp_slice_join_query(Query *parse)
 		return NULL;
 	if (!gp_slice_join_collect(linitial(parse->jointree->fromlist),
 							   &tables, &conds))
-		return NULL;
+	{
+			return NULL;
+	}
 	if (list_length(tables) < 2)
 		return NULL;
 	conds = lappend(conds, parse->jointree->quals);
 	if (!gp_slice_join_colocated(parse, tables, conds))
-		return NULL;
+	{
+		GpJoinTable *stay;
+		GpJoinTable *move;
+
+		if (gp_slice_join_not_inner(linitial(parse->jointree->fromlist), NULL) ||
+			!gp_slice_join_redistributable(parse, tables, conds,
+										   &stay, &move))
+			return NULL;
+	}
 
 	foreach(lc, tables)
 	{
@@ -839,7 +1025,21 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		return false;
 	conds = lappend(conds, original->jointree->quals);
 	if (!gp_slice_join_colocated(original, tables, conds))
-		return false;
+	{
+		/*
+		 * Two hashed tables of different colocation groups, joined by the
+		 * whole key: the second table moves, pulled from every segment by
+		 * the hash of the join key under the map of the first
+		 */
+		GpJoinTable *stay;
+		GpJoinTable *move;
+
+		if (gp_slice_join_not_inner(linitial(original->jointree->fromlist), NULL) ||
+			!gp_slice_join_redistributable(original, tables, conds,
+										   &stay, &move))
+			return false;
+		gp_slice_redistribute_rte(original, stay, move);
+	}
 	foreach(lc, tables)
 	{
 		GpJoinTable *table = lfirst(lc);

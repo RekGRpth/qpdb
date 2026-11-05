@@ -374,7 +374,19 @@ column of its own when there is one.
 A join runs on the segments too, when any row that joins another is on
 the same segment with it: tables of one colocation group joined by the
 whole key of the distribution, or a replicated table joined to anything,
-or two replicated tables.  The whole plan of such a join is replaced by
+or two replicated tables.  A join of two hashed tables of different
+colocation groups, joined by the whole key of both, moves the rows of
+one table first: every segment asks every segment — itself among them —
+for the rows that the hash of the join key places on it under the map of
+the other table, and joins what comes with its own rows.  The asking is
+`gp.peer_query()`, which runs on a segment, as the user of the query:
+it takes the addresses of the segments from the coordinator at every
+call, so a cluster that changed stays correct, and it tells each segment
+which segment its rows are for by a setting of the connection.  Outer
+joins are not redistributed: a row of the moving table with a null key
+would meet no partner on any segment, and an outer join would have to
+keep it.  The extension is created on the segments too, for the motion
+calls its functions there.  The whole plan of such a join is replaced by
 `GpSlice`, which runs the join of the query on the segments; the sort and
 the limit stay on the coordinator, and a merge join that answers the
 `ORDER BY` by itself is left alone.  Inner, left, right and full joins
@@ -524,6 +536,7 @@ start their own clusters:
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
+| `029_redistributed_join.pl` | A join of two colocation groups by the whole key moves one table to the segments of the other; the answers match the coordinator, and outer joins stay |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by other columns and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
@@ -560,7 +573,10 @@ by the patch and `contrib/gp`.
    list allowed, the same computation inside a subquery in FROM, and
    aggregates by other columns answered partly on the segments; next is
    the locus model for the rest.
-6. **Interconnect** — Redistribute and Broadcast motions between segments.
+6. **Interconnect** — in progress: a join of two colocation groups by
+   the whole key moves one table, pulled by every segment from every
+   segment; next are joins of more shapes and a faster transport than a
+   query per segment.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
 8. **More kinds of distribution** — replicated with the coordinator, on the

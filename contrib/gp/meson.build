@@ -9,6 +9,7 @@ gp_sources = files(
   'gather.c',
   'gp.c',
   'insert.c',
+  'motion.c',
   'oids.c',
   'recovery.c',
   'route.c',
@@ -82,6 +83,7 @@ tests += {
       't/026_join_pushdown.pl',
       't/027_subquery_pushdown.pl',
       't/028_partial_agg.pl',
+      't/029_redistributed_join.pl',
     ],
   },
 }
