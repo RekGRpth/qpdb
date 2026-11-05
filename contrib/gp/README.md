@@ -393,6 +393,16 @@ whatever node it is; a plan that answers the `ORDER BY` by its own order
 is left alone, and so is a subquery with a limit of its own, a condition
 of the outer query on its results, and a subquery joined to a table.
 
+An aggregate whose grouping does not cover the key of the distribution is
+answered in two steps: the segments aggregate their own rows — grouped by
+the grouping of the query, or all rows together when there is none — and
+the coordinator finishes the aggregate over the columns of every segment.
+The final aggregate is the same aggregate again, which only `min`, `max`
+and `sum` of a type they combine in truly answer; `count` counts the
+partial columns instead of adding them, and the average divides, so they
+stay on the coordinator with every query they are in.  `HAVING` stays on
+the coordinator too, for a group may pass it only as a whole.
+
 `EXPLAIN (VERBOSE)` shows the query of the segments.
 
 ## Trying it
@@ -514,6 +524,7 @@ start their own clusters:
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
+| `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by other columns and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -546,8 +557,9 @@ by the patch and `contrib/gp`.
    grouping covers the key of the distribution, and joins whose partners
    are on the same segment run on the segments, with aggregates over
    colocated joins of any number of tables, junk columns of the target
-   list allowed, and the same computation inside a subquery in FROM;
-   next is the locus model for the rest.
+   list allowed, the same computation inside a subquery in FROM, and
+   aggregates by other columns answered partly on the segments; next is
+   the locus model for the rest.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
