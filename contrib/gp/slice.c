@@ -253,7 +253,6 @@ gp_slice_agg_query(Query *parse)
 	RangeTblEntry *rte;
 	Index		rti;
 	GpPolicy	policy;
-	ListCell   *lc;
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
 		!parse->hasAggs)
@@ -274,15 +273,6 @@ gp_slice_agg_query(Query *parse)
 	rte = rt_fetch(rti, parse->rtable);
 	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
 		return NULL;
-
-	/* Junk columns of the target list would not come back from the segments */
-	foreach(lc, parse->targetList)
-	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-
-		if (tle->resjunk)
-			return NULL;
-	}
 
 	/* A replicated table is answered by one segment as a whole */
 	if (policy.replicated)
@@ -410,20 +400,61 @@ gp_slice_make(Plan *src, Query *original, bool replicated)
 {
 	Query	   *remote = copyObject(original);
 	CustomScan *cscan = makeNode(CustomScan);
+	List	   *srctlist = src->targetlist;
+	List	   *origtlist = original->targetList;
 	List	   *tlist = NIL;
 	ListCell   *lc;
+	int			pos = 0;
 
+	/*
+	 * A junk column is a grouping or a sort key that is not selected.  With
+	 * no ORDER BY it is not needed by anything above, so it is dropped from
+	 * both lists.  With an ORDER BY it is needed by the sort, so it goes to
+	 * the segments as a column of its own.
+	 */
+	if (original->sortClause == NIL)
+	{
+		List	   *srcnonjunk = NIL;
+		List	   *orignojunk = NIL;
+
+		foreach(lc, srctlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!tle->resjunk)
+				srcnonjunk = lappend(srcnonjunk, tle);
+		}
+		foreach(lc, origtlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!tle->resjunk)
+				orignojunk = lappend(orignojunk, tle);
+		}
+		srctlist = srcnonjunk;
+		origtlist = orignojunk;
+	}
+	if (original->sortClause != NIL)
+	{
+		foreach(lc, remote->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			tle->resjunk = false;
+		}
+	}
 	remote->sortClause = NIL;
 	remote->limitCount = NULL;
 	remote->limitOffset = NULL;
 
-	foreach(lc, src->targetlist)
+	foreach(lc, srctlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 		TargetEntry *out;
 		Var		   *var;
 
-		var = makeVar(INDEX_VAR, tle->resno,
+		pos++;
+		var = makeVar(INDEX_VAR, pos,
 					  exprType((Node *) tle->expr),
 					  exprTypmod((Node *) tle->expr),
 					  exprCollation((Node *) tle->expr), 0);
@@ -440,7 +471,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated)
 	cscan->scan.plan.total_cost = src->total_cost;
 	cscan->scan.plan.plan_rows = src->plan_rows;
 	cscan->scan.plan.plan_width = src->plan_width;
-	cscan->custom_scan_tlist = copyObject(original->targetList);
+	cscan->custom_scan_tlist = copyObject(origtlist);
 	cscan->custom_private = list_make2(makeString(pg_get_querydef(remote, false)),
 									   makeBoolean(replicated));
 	cscan->methods = &gp_slice_plan_methods;
@@ -759,15 +790,6 @@ gp_slice_join_query(Query *parse)
 	}
 	if (parse->hasAggs && any_hash && parse->groupClause == NIL)
 		return NULL;
-
-	/* Junk columns of the target list would not come back from the segments */
-	foreach(lc, parse->targetList)
-	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-
-		if (tle->resjunk)
-			return NULL;
-	}
 
 	return copyObject(parse);
 }

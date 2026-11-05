@@ -103,6 +103,8 @@ unlike(plan_for('SELECT j1.a, j2.c, j3.e FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 
 	qr/GpSlice/, 'a join with a table not joined by the key is not pushed');
 like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a GROUP BY j1.a'),
 	qr/GpSlice/, 'an aggregate over a three-way colocated join is pushed');
+like(plan_for('SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a'),
+	qr/GpSlice/, 'a junk grouping column over a join is pushed');
 
 my @queries = (
 	'SELECT j1.a, j1.b, j2.c FROM j1 JOIN j2 ON j1.a = j2.a ORDER BY j1.a',
@@ -123,6 +125,8 @@ my @queries = (
 	'SELECT j1.a, j2.c, r1.d FROM j1 JOIN j2 ON j1.a = j2.a JOIN r1 ON j2.a = r1.a ORDER BY j1.a LIMIT 5',
 	'SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
 	'SELECT j1.a, j2.c, j3.e, r1.d FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a JOIN r1 ON j1.a = r1.a ORDER BY j1.a LIMIT 4',
+	'SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a',
+	'SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY count(*) DESC, j1.a',
 );
 foreach my $query (@queries)
 {

@@ -366,8 +366,10 @@ replicated table is aggregated by one segment as a whole, even without a
 grouping.  Joins, subqueries, windows, grouping sets, a grouping that
 does not cover the whole key, a global aggregate of a hashed table, and
 a sorted aggregate that answers the `ORDER BY` of the query by itself
-are left to the coordinator, as is a query whose target list has junk
-columns.
+are left to the coordinator.  A junk column of the target list — a
+grouping or a sort key that is not selected — is not a stopper: it is
+dropped when there is no `ORDER BY`, and sent to the segments as a
+column of its own when there is one.
 
 A join runs on the segments too, when any row that joins another is on
 the same segment with it: tables of one colocation group joined by the
@@ -533,8 +535,8 @@ by the patch and `contrib/gp`.
 5. **MPP planner without interconnect** — in progress: aggregates whose
    grouping covers the key of the distribution, and joins whose partners
    are on the same segment run on the segments, with aggregates over
-   colocated joins of any number of tables; next are the locus model and
-   lifting the limitation on junk columns of the target list.
+   colocated joins of any number of tables and junk columns of the target
+   list allowed; next is the locus model.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.

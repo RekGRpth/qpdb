@@ -67,6 +67,12 @@ unlike(plan_for('SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a'),
 	'a sorted aggregate that answers the order by itself is not pushed');
 like(plan_for('SELECT a, count(DISTINCT b) FROM t GROUP BY a'), qr/GpSlice/,
 	'a distinct aggregate without an order by is pushed');
+like(plan_for('SELECT count(*) FROM t GROUP BY a'), qr/GpSlice/,
+	'a grouping key that is not selected is not a stopper either');
+like(plan_for('SELECT count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a'),
+	qr/GpSlice/, 'a junk grouping column goes to the segments for the sort');
+like(plan_for('SELECT count(*) FROM t GROUP BY a, b ORDER BY a, b'), qr/GpSlice/,
+	'junk grouping columns of a wider key are pushed');
 
 my @queries = (
 	'SELECT a, count(*) FROM t GROUP BY a ORDER BY a',
@@ -79,6 +85,10 @@ my @queries = (
 	'SELECT count(*) FROM t',
 	'SELECT a, count(*) FROM t WHERE a > 5 GROUP BY a ORDER BY a DESC LIMIT 3',
 	'SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a LIMIT 4',
+	'SELECT count(*) FROM t GROUP BY a ORDER BY a',
+	'SELECT count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a',
+	'SELECT count(*) FROM t GROUP BY a ORDER BY a+1',
+	'SELECT count(*) FROM t GROUP BY a, b ORDER BY a, b',
 );
 foreach my $query (@queries)
 {
