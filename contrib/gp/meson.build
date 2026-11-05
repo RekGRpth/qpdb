@@ -79,6 +79,7 @@ tests += {
       't/023_update_delete.pl',
       't/024_recovery.pl',
       't/025_agg_pushdown.pl',
+      't/026_join_pushdown.pl',
     ],
   },
 }

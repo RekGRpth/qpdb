@@ -578,11 +578,14 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 {
 	PlannedStmt *stmt;
 	Query	   *agg_original = NULL;
+	Query	   *join_original = NULL;
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
 
 	agg_original = gp_slice_agg_query(parse);
+	if (agg_original == NULL)
+		join_original = gp_slice_join_query(parse);
 
 	if (prev_planner)
 		stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
@@ -599,6 +602,8 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	if (agg_original != NULL)
 		gp_slice_agg_plan(agg_original, stmt);
+	else if (join_original != NULL)
+		gp_slice_join_plan(join_original, stmt);
 
 	return stmt;
 }

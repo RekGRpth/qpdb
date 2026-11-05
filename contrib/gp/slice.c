@@ -62,6 +62,8 @@ static const CustomScanMethods gp_slice_plan_methods = {
 	.CreateCustomScanState = gp_slice_create_state,
 };
 
+static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated);
+
 /*
  * Read all rows of the aggregate from the segments into the tuplestore.
  * The columns of the result are those of the target list of the node.
@@ -306,9 +308,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	bool		sort_above = false;
 	Agg		   *agg;
 	Plan	   *below;
-	Query	   *remote;
 	CustomScan *cscan;
-	List	   *tlist = NIL;
 	ListCell   *lc;
 	bool		replicated;
 
@@ -393,14 +393,31 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 		list_length(original->targetList))
 		return;
 
-	/* The query of the segments, without the sort and the limit of here */
-	remote = copyObject(original);
+	cscan = gp_slice_make(&agg->plan, original, replicated);
+
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+}
+
+/*
+ * A scan that runs a query on the segments: its target list is that of the
+ * plan it replaces, and its SQL is the query without its sort and limit
+ */
+static CustomScan *
+gp_slice_make(Plan *src, Query *original, bool replicated)
+{
+	Query	   *remote = copyObject(original);
+	CustomScan *cscan = makeNode(CustomScan);
+	List	   *tlist = NIL;
+	ListCell   *lc;
+
 	remote->sortClause = NIL;
 	remote->limitCount = NULL;
 	remote->limitOffset = NULL;
 
-	cscan = makeNode(CustomScan);
-	foreach(lc, agg->plan.targetlist)
+	foreach(lc, src->targetlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 		TargetEntry *out;
@@ -419,14 +436,176 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = NIL;
 	cscan->scan.scanrelid = 0;
-	cscan->scan.plan.startup_cost = agg->plan.startup_cost;
-	cscan->scan.plan.total_cost = agg->plan.total_cost;
-	cscan->scan.plan.plan_rows = agg->plan.plan_rows;
-	cscan->scan.plan.plan_width = agg->plan.plan_width;
+	cscan->scan.plan.startup_cost = src->startup_cost;
+	cscan->scan.plan.total_cost = src->total_cost;
+	cscan->scan.plan.plan_rows = src->plan_rows;
+	cscan->scan.plan.plan_width = src->plan_width;
 	cscan->custom_scan_tlist = copyObject(original->targetList);
 	cscan->custom_private = list_make2(makeString(pg_get_querydef(remote, false)),
 									   makeBoolean(replicated));
 	cscan->methods = &gp_slice_plan_methods;
+	return cscan;
+}
+
+/*
+ * Whether the condition equates the two given columns of the two tables,
+ * at the top of an AND or below it
+ */
+static bool
+gp_slice_join_pair(Node *qual, Index rti1, Index rti2,
+				   AttrNumber k1, AttrNumber k2)
+{
+	OpExpr	   *op;
+	Var		   *var1;
+	Var		   *var2;
+
+	if (qual == NULL)
+		return false;
+	if (IsA(qual, BoolExpr) && ((BoolExpr *) qual)->boolop == AND_EXPR)
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((BoolExpr *) qual)->args)
+		{
+			if (gp_slice_join_pair(lfirst(lc), rti1, rti2, k1, k2))
+				return true;
+		}
+		return false;
+	}
+	if (!IsA(qual, OpExpr))
+		return false;
+	op = (OpExpr *) qual;
+	if (list_length(op->args) != 2 ||
+		get_opname(op->opno) == NULL ||
+		strcmp(get_opname(op->opno), "=") != 0)
+		return false;
+	if (!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+		return false;
+	var1 = (Var *) linitial(op->args);
+	var2 = (Var *) lsecond(op->args);
+
+	return (var1->varno == rti1 && var1->varattno == k1 &&
+			var2->varno == rti2 && var2->varattno == k2) ||
+		(var1->varno == rti2 && var1->varattno == k2 &&
+		 var2->varno == rti1 && var2->varattno == k1);
+}
+
+/*
+ * Whether the query is a join the segments can compute: two distributed
+ * tables, and any row that joins another is on the same segment with it.
+ * That is two tables of one colocation group joined by the whole key, or
+ * a replicated table joined to anything, or two replicated tables.  A copy
+ * of the query is returned, or NULL when the join is not such a join.
+ */
+Query *
+gp_slice_join_query(Query *parse)
+{
+	JoinExpr   *join;
+	RangeTblRef *lref;
+	RangeTblRef *rref;
+	RangeTblEntry *rte1;
+	RangeTblEntry *rte2;
+	GpPolicy	p1;
+	GpPolicy	p2;
+	ListCell   *lc;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->hasAggs)
+		return NULL;
+	if (parse->hasWindowFuncs || parse->hasSubLinks ||
+		parse->setOperations != NULL || parse->cteList != NIL ||
+		parse->groupingSets != NIL || parse->rowMarks != NIL ||
+		parse->distinctClause != NIL)
+		return NULL;
+
+	/* One join of two base tables */
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), JoinExpr))
+		return NULL;
+	join = linitial_node(JoinExpr, parse->jointree->fromlist);
+	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
+		join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL)
+		return NULL;
+	if (!IsA(join->larg, RangeTblRef) || !IsA(join->rarg, RangeTblRef))
+		return NULL;
+	lref = (RangeTblRef *) join->larg;
+	rref = (RangeTblRef *) join->rarg;
+	rte1 = rt_fetch(lref->rtindex, parse->rtable);
+	rte2 = rt_fetch(rref->rtindex, parse->rtable);
+	if (rte1->rtekind != RTE_RELATION || rte2->rtekind != RTE_RELATION ||
+		!gp_policy_get(rte1->relid, &p1) || !gp_policy_get(rte2->relid, &p2))
+		return NULL;
+
+	if (!p1.replicated && !p2.replicated)
+	{
+		/* Two hashed tables: one colocation group, joined by the whole key */
+		if (p1.colocation_id == 0 || p1.colocation_id != p2.colocation_id ||
+			p1.nkeys != p2.nkeys)
+			return NULL;
+		for (int i = 0; i < p1.nkeys; i++)
+		{
+			if (!gp_slice_join_pair(join->quals, lref->rtindex, rref->rtindex,
+									p1.keys[i], p2.keys[i]))
+				return NULL;
+		}
+	}
+	/* A replicated table is on every segment, so its join is colocated */
+
+	/* Junk columns of the target list would not come back from the segments */
+	foreach(lc, parse->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			return NULL;
+	}
+
+	return copyObject(parse);
+}
+
+/*
+ * Replace the whole plan of a colocated join with a scan that runs it on
+ * the segments, keeping the sort and the limit of the query here
+ */
+void
+gp_slice_join_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	bool		replicated = false;
+	CustomScan *cscan;
+	ListCell   *lc;
+	int			nreplicated = 0;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL)
+		return;
+
+	/* A merge join answers the ORDER BY by itself, with no sort on top */
+	if (original->sortClause != NIL && !sort_above)
+		return;
+
+	/* Two replicated tables are answered by one segment */
+	foreach(lc, original->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		GpPolicy	policy;
+
+		if (rte->rtekind == RTE_RELATION && gp_policy_get(rte->relid, &policy) &&
+			policy.replicated)
+			nreplicated++;
+	}
+	replicated = nreplicated == 2;
+
+	cscan = gp_slice_make(plan, original, replicated);
 
 	if (parent == NULL)
 		stmt->planTree = &cscan->scan.plan;
