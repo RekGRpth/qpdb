@@ -80,6 +80,7 @@ tests += {
       't/024_recovery.pl',
       't/025_agg_pushdown.pl',
       't/026_join_pushdown.pl',
+      't/027_subquery_pushdown.pl',
     ],
   },
 }

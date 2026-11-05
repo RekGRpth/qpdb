@@ -384,6 +384,15 @@ aggregate whose grouping does not cover the key, are left to the
 coordinator.  An aggregate over a colocated join runs on the segments as
 well, when its grouping covers the key of a hashed table.
 
+A subquery in FROM has a locus of its own: an aggregate of a distributed
+table grouped by the key, or a colocated join, runs on the segments even
+inside a subquery of a query that is not colocated itself.  The planner
+often inlines the plan of a simple subquery with no `SubqueryScan` node,
+so the plan below the sort and the limit of the outer query is replaced,
+whatever node it is; a plan that answers the `ORDER BY` by its own order
+is left alone, and so is a subquery with a limit of its own, a condition
+of the outer query on its results, and a subquery joined to a table.
+
 `EXPLAIN (VERBOSE)` shows the query of the segments.
 
 ## Trying it
@@ -504,6 +513,7 @@ start their own clusters:
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
+| `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -535,8 +545,9 @@ by the patch and `contrib/gp`.
 5. **MPP planner without interconnect** — in progress: aggregates whose
    grouping covers the key of the distribution, and joins whose partners
    are on the same segment run on the segments, with aggregates over
-   colocated joins of any number of tables and junk columns of the target
-   list allowed; next is the locus model.
+   colocated joins of any number of tables, junk columns of the target
+   list allowed, and the same computation inside a subquery in FROM;
+   next is the locus model for the rest.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
