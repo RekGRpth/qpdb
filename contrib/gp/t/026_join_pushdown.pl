@@ -48,17 +48,21 @@ run('CREATE TABLE j1 (a int, b text)');
 run("SELECT gp.distribute('j1', ARRAY['a'])");
 run('CREATE TABLE j2 (a int, c text)');
 run("SELECT gp.distribute('j2', ARRAY['a'])");
+run('CREATE TABLE j3 (a int, e text)');
+run("SELECT gp.distribute('j3', ARRAY['a'])");
 run('CREATE TABLE r1 (a int, d text)');
 run("SELECT gp.distribute('r1', NULL)");
 run('CREATE TABLE r2 (a int, e text)');
 run("SELECT gp.distribute('r2', NULL)");
 run("INSERT INTO j1 SELECT g, 'b' || g FROM generate_series(1, 100) g");
 run("INSERT INTO j2 SELECT g, 'c' || g FROM generate_series(41, 120) g");
+run("INSERT INTO j3 SELECT g, 'e' || g FROM generate_series(50, 110) g");
 run("INSERT INTO r1 SELECT g, 'd' || g FROM generate_series(1, 100) g");
 run("INSERT INTO r2 SELECT g, 'e' || g FROM generate_series(1, 100) g");
 # The same rows in tables of the coordinator, to compare the answers with
 run('CREATE TABLE l1 AS SELECT * FROM j1');
 run('CREATE TABLE l2 AS SELECT * FROM j2');
+run('CREATE TABLE l3 AS SELECT * FROM j3');
 run('CREATE TABLE lr1 AS SELECT * FROM r1');
 run('CREATE TABLE lr2 AS SELECT * FROM r2');
 
@@ -91,6 +95,14 @@ like(plan_for('SELECT j1.a, r1.d, count(*) FROM j1 JOIN r1 ON j1.a = r1.a GROUP 
 	qr/GpSlice/, 'an aggregate over a hashed and a replicated table is pushed');
 like(plan_for('SELECT r1.a, count(*) FROM r1 JOIN r2 ON r1.a = r2.a GROUP BY r1.a'),
 	qr/GpSlice/, 'an aggregate over two replicated tables is pushed');
+like(plan_for('SELECT j1.a, j2.c, j3.e FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a'),
+	qr/GpSlice/, 'a join of three tables of one colocation group is pushed');
+like(plan_for('SELECT j1.a, j2.c, r1.d FROM j1 JOIN j2 ON j1.a = j2.a JOIN r1 ON j2.a = r1.a'),
+	qr/GpSlice/, 'a join of two hashed tables with a replicated one is pushed');
+unlike(plan_for('SELECT j1.a, j2.c, j3.e FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j1.b = j3.e'),
+	qr/GpSlice/, 'a join with a table not joined by the key is not pushed');
+like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a GROUP BY j1.a'),
+	qr/GpSlice/, 'an aggregate over a three-way colocated join is pushed');
 
 my @queries = (
 	'SELECT j1.a, j1.b, j2.c FROM j1 JOIN j2 ON j1.a = j2.a ORDER BY j1.a',
@@ -107,12 +119,17 @@ my @queries = (
 	'SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a',
 	'SELECT j1.a, sum(j2.a) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
 	'SELECT j1.a, count(*) FROM j1 LEFT JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
+	'SELECT j1.a, j1.b, j2.c, j3.e FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a ORDER BY j1.a LIMIT 5',
+	'SELECT j1.a, j2.c, r1.d FROM j1 JOIN j2 ON j1.a = j2.a JOIN r1 ON j2.a = r1.a ORDER BY j1.a LIMIT 5',
+	'SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a GROUP BY j1.a ORDER BY j1.a DESC LIMIT 4',
+	'SELECT j1.a, j2.c, j3.e, r1.d FROM j1 JOIN j2 ON j1.a = j2.a JOIN j3 ON j2.a = j3.a JOIN r1 ON j1.a = r1.a ORDER BY j1.a LIMIT 4',
 );
 foreach my $query (@queries)
 {
 	my $local = $query;
 	$local =~ s/\bj1\b/l1/g;
 	$local =~ s/\bj2\b/l2/g;
+	$local =~ s/\bj3\b/l3/g;
 	$local =~ s/\br1\b/lr1/g;
 	$local =~ s/\br2\b/lr2/g;
 	is(run($query), run($local), "the same answer as on the coordinator: $query");

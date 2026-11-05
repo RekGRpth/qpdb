@@ -490,42 +490,150 @@ gp_slice_join_pair(Node *qual, Index rti1, Index rti2,
 		 var2->varno == rti1 && var2->varattno == k1);
 }
 
+/* Whether any of the join conditions equates the two columns */
+static bool
+gp_slice_join_pair_list(List *conds, Index rti1, Index rti2,
+						AttrNumber k1, AttrNumber k2)
+{
+	ListCell   *lc;
+
+	foreach(lc, conds)
+	{
+		if (gp_slice_join_pair(lfirst(lc), rti1, rti2, k1, k2))
+			return true;
+	}
+	return false;
+}
+
+/* A table of a join, with its place in the distribution of the rows */
+typedef struct GpJoinTable
+{
+	Index		rti;
+	GpPolicy	policy;
+} GpJoinTable;
+
 /*
- * The two tables of a two-table join and their distribution policies;
- * false when the FROM is not one join of two base tables
+ * Collect the base tables of a join tree and all its join conditions;
+ * false when a leaf is not a base table or a join type is not supported
  */
 static bool
-gp_slice_join_tables(Query *parse, JoinExpr **join_out, Index *rti1,
-					 Index *rti2, GpPolicy *p1, GpPolicy *p2)
+gp_slice_join_collect(Node *node, List **tables, List **conds)
 {
 	JoinExpr   *join;
-	RangeTblRef *lref;
-	RangeTblRef *rref;
-	RangeTblEntry *rte1;
-	RangeTblEntry *rte2;
 
-	if (!IsA(parse->jointree, FromExpr) ||
-		list_length(parse->jointree->fromlist) != 1 ||
-		!IsA(linitial(parse->jointree->fromlist), JoinExpr))
+	if (IsA(node, RangeTblRef))
+	{
+		GpJoinTable *table = palloc0(sizeof(GpJoinTable));
+
+		table->rti = ((RangeTblRef *) node)->rtindex;
+		*tables = lappend(*tables, table);
+		return true;
+	}
+	if (!IsA(node, JoinExpr))
 		return false;
-	join = linitial_node(JoinExpr, parse->jointree->fromlist);
+	join = (JoinExpr *) node;
 	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 		join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL)
 		return false;
-	if (!IsA(join->larg, RangeTblRef) || !IsA(join->rarg, RangeTblRef))
-		return false;
-	lref = (RangeTblRef *) join->larg;
-	rref = (RangeTblRef *) join->rarg;
-	rte1 = rt_fetch(lref->rtindex, parse->rtable);
-	rte2 = rt_fetch(rref->rtindex, parse->rtable);
-	if (rte1->rtekind != RTE_RELATION || rte2->rtekind != RTE_RELATION ||
-		!gp_policy_get(rte1->relid, p1) || !gp_policy_get(rte2->relid, p2))
-		return false;
+	*conds = lappend(*conds, join->quals);
+	return gp_slice_join_collect(join->larg, tables, conds) &&
+		gp_slice_join_collect(join->rarg, tables, conds);
+}
 
-	*join_out = join;
-	*rti1 = lref->rtindex;
-	*rti2 = rref->rtindex;
-	return true;
+/*
+ * Load the policies of the tables of a join and check that every row of
+ * the join is on one segment: all hashed tables are of one colocation
+ * group, and every one of them is joined to the others by the whole key,
+ * while a replicated table is on every segment already
+ */
+static bool
+gp_slice_join_colocated(Query *parse, List *tables, List *conds)
+{
+	ListCell   *lc;
+	int			colocation_id = 0;
+	int			nkeys = 0;
+	bool		any_hash = false;
+	List	   *connected = NIL;
+	List	   *pending = NIL;
+
+	/* Policies, and one colocation group for all hashed tables */
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+		RangeTblEntry *rte = rt_fetch(table->rti, parse->rtable);
+
+		if (rte->rtekind != RTE_RELATION ||
+			!gp_policy_get(rte->relid, &table->policy))
+			return false;
+		if (table->policy.replicated)
+			continue;
+		any_hash = true;
+		if (colocation_id == 0)
+		{
+			colocation_id = table->policy.colocation_id;
+			nkeys = table->policy.nkeys;
+		}
+		if (table->policy.colocation_id != colocation_id ||
+			table->policy.nkeys != nkeys || colocation_id == 0)
+			return false;
+	}
+	if (!any_hash)
+		return true;
+
+	/* Grow the connected set of hashed tables by key pairs of the joins */
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!table->policy.replicated)
+			pending = lappend(pending, table);
+	}
+	if (pending != NIL)
+	{
+		GpJoinTable *first = linitial(pending);
+
+		connected = list_make1(first);
+		pending = list_delete(pending, first);
+	}
+	for (;;)
+	{
+		bool		grew = false;
+		ListCell   *lp;
+
+		foreach(lp, pending)
+		{
+			GpJoinTable *table = lfirst(lp);
+			ListCell   *lu;
+
+			foreach(lu, connected)
+			{
+				GpJoinTable *other = lfirst(lu);
+				bool		all_keys = true;
+
+				for (int i = 0; i < nkeys; i++)
+				{
+					if (!gp_slice_join_pair_list(conds, table->rti, other->rti,
+												 table->policy.keys[i],
+												 other->policy.keys[i]))
+					{
+						all_keys = false;
+						break;
+					}
+				}
+				if (all_keys)
+				{
+					connected = lappend(connected, table);
+					pending = list_delete(pending, table);
+					grew = true;
+					break;
+				}
+			}
+			if (grew)
+				break;
+		}
+		if (!grew)
+			return pending == NIL;
+	}
 }
 
 /*
@@ -559,60 +667,69 @@ gp_slice_base_column(Plan *plan, TargetEntry *tle, Index *rti,
 
 /*
  * Whether the grouping of the aggregate covers the distribution key of
- * the join, so that every group is on one segment.  The key of a hashed
- * table must be a grouping column; a replicated table has no key to ask
- * for.  The grouping columns are read from the plan
+ * some hashed table of the join, so that every group is on one segment.
+ * All hashed tables are colocated by their keys, so grouping by the whole
+ * key of any one of them is enough.  The grouping columns are read from
+ * the plan
  */
 static bool
-gp_slice_join_agg_keys(Agg *agg, Index rti1, Index rti2,
-					   GpPolicy *p1, GpPolicy *p2)
+gp_slice_join_agg_keys(Agg *agg, List *tables)
 {
-	int			nkeys = Max(p1->nkeys, p2->nkeys);
+	ListCell   *lc;
 
-	for (int i = 0; i < nkeys; i++)
+	foreach(lc, tables)
 	{
-		AttrNumber	k1 = i < p1->nkeys ? p1->keys[i] : 0;
-		AttrNumber	k2 = i < p2->nkeys ? p2->keys[i] : 0;
-		bool		grouped = false;
+		GpJoinTable *table = lfirst(lc);
+		bool		all_keys = true;
 
-		for (int j = 0; j < agg->numCols; j++)
+		if (table->policy.replicated)
+			continue;
+		for (int i = 0; i < table->policy.nkeys; i++)
 		{
-			TargetEntry *tle = list_nth(agg->plan.lefttree->targetlist,
-										agg->grpColIdx[j] - 1);
-			Index		grti;
-			AttrNumber	gattno;
+			bool		grouped = false;
 
-			if (!gp_slice_base_column(agg->plan.lefttree, tle, &grti, &gattno))
-				return false;
-			if ((k1 != 0 && grti == rti1 && gattno == k1) ||
-				(k2 != 0 && grti == rti2 && gattno == k2))
+			for (int j = 0; j < agg->numCols; j++)
 			{
-				grouped = true;
+				TargetEntry *tle = list_nth(agg->plan.lefttree->targetlist,
+											agg->grpColIdx[j] - 1);
+				Index		grti;
+				AttrNumber	gattno;
+
+				if (!gp_slice_base_column(agg->plan.lefttree, tle, &grti, &gattno))
+					return false;
+				if (grti == table->rti && gattno == table->policy.keys[i])
+				{
+					grouped = true;
+					break;
+				}
+			}
+			if (!grouped)
+			{
+				all_keys = false;
 				break;
 			}
 		}
-		if (!grouped)
-			return false;
+		if (all_keys)
+			return true;
 	}
-	return true;
+	return false;
 }
 
 /*
- * Whether the query is a join the segments can compute: two distributed
- * tables, and any row that joins another is on the same segment with it.
- * That is two tables of one colocation group joined by the whole key, or
- * a replicated table joined to anything, or two replicated tables.  A copy
- * of the query is returned, or NULL when the join is not such a join.
+ * Whether the query is a join the segments can compute: distributed tables
+ * joined so that every row of the join is on one segment — hashed tables
+ * of one colocation group connected by the whole key, with replicated
+ * tables anywhere.  An aggregate over the join is allowed when its
+ * grouping covers the key of a hashed table, which is checked on the plan.
+ * A copy of the query is returned, or NULL when it is not such a join.
  */
 Query *
 gp_slice_join_query(Query *parse)
 {
-	JoinExpr   *join;
-	Index		rti1;
-	Index		rti2;
-	GpPolicy	p1;
-	GpPolicy	p2;
+	List	   *tables = NIL;
+	List	   *conds = NIL;
 	ListCell   *lc;
+	bool		any_hash = false;
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT)
 		return NULL;
@@ -621,28 +738,26 @@ gp_slice_join_query(Query *parse)
 		parse->groupingSets != NIL || parse->rowMarks != NIL ||
 		parse->distinctClause != NIL)
 		return NULL;
-
-	if (!gp_slice_join_tables(parse, &join, &rti1, &rti2, &p1, &p2))
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1)
+		return NULL;
+	if (!gp_slice_join_collect(linitial(parse->jointree->fromlist),
+							   &tables, &conds))
+		return NULL;
+	if (list_length(tables) < 2)
+		return NULL;
+	conds = lappend(conds, parse->jointree->quals);
+	if (!gp_slice_join_colocated(parse, tables, conds))
 		return NULL;
 
-	if (!p1.replicated && !p2.replicated)
+	foreach(lc, tables)
 	{
-		/* Two hashed tables: one colocation group, joined by the whole key */
-		if (p1.colocation_id == 0 || p1.colocation_id != p2.colocation_id ||
-			p1.nkeys != p2.nkeys)
-			return NULL;
-		for (int i = 0; i < p1.nkeys; i++)
-		{
-			if (!gp_slice_join_pair(join->quals, rti1, rti2,
-									p1.keys[i], p2.keys[i]))
-				return NULL;
-		}
-	}
-	/* A replicated table is on every segment, so its join is colocated */
+		GpJoinTable *table = lfirst(lc);
 
-	/* An aggregate over a distributed join needs a grouping to be colocated */
-	if (parse->hasAggs && !(p1.replicated && p2.replicated) &&
-		parse->groupClause == NIL)
+		if (!table->policy.replicated)
+			any_hash = true;
+	}
+	if (parse->hasAggs && any_hash && parse->groupClause == NIL)
 		return NULL;
 
 	/* Junk columns of the target list would not come back from the segments */
@@ -667,12 +782,10 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	Plan	   *parent = NULL;
 	Plan	   *plan = stmt->planTree;
 	bool		sort_above = false;
-	bool		replicated = false;
-	JoinExpr   *join;
-	Index		rti1;
-	Index		rti2;
-	GpPolicy	p1;
-	GpPolicy	p2;
+	bool		replicated = true;
+	List	   *tables = NIL;
+	List	   *conds = NIL;
+	ListCell   *lc;
 	CustomScan *cscan;
 
 	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
@@ -689,15 +802,25 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return;
 
-	if (!gp_slice_join_tables(original, &join, &rti1, &rti2, &p1, &p2))
+	if (!gp_slice_join_collect(linitial(original->jointree->fromlist),
+							   &tables, &conds))
 		return;
-	replicated = p1.replicated && p2.replicated;
+	conds = lappend(conds, original->jointree->quals);
+	if (!gp_slice_join_colocated(original, tables, conds))
+		return;
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!table->policy.replicated)
+			replicated = false;
+	}
 
 	/* The columns the segments return are the target list of the plan */
 	if (list_length(plan->targetlist) != list_length(original->targetList))
 		return;
 
-	/* An aggregate over the join must group by the key of the distribution */
+	/* An aggregate over the join must group by the key of a hashed table */
 	if (original->hasAggs && !replicated)
 	{
 		Plan	   *agg = plan;
@@ -708,8 +831,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 				return;
 			agg = agg->lefttree;
 		}
-		if (agg == NULL ||
-			!gp_slice_join_agg_keys((Agg *) agg, rti1, rti2, &p1, &p2))
+		if (agg == NULL || !gp_slice_join_agg_keys((Agg *) agg, tables))
 			return;
 	}
 

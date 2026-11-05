@@ -370,16 +370,17 @@ are left to the coordinator, as is a query whose target list has junk
 columns.
 
 A join runs on the segments too, when any row that joins another is on
-the same segment with it: two tables of one colocation group joined by
-the whole key of the distribution, or a replicated table joined to
-anything, or two replicated tables.  The whole plan of such a join is
-replaced by `GpSlice`, which runs the join of the query on the segments;
-the sort and the limit stay on the coordinator, and a merge join that
-answers the `ORDER BY` by itself is left alone.  Inner, left, right and
-full joins are all colocated by the same argument: a row without a
-partner on its segment has no partner anywhere.  A join by another
-column, a join of more than two tables, and an aggregate over a join are
-left to the coordinator.
+the same segment with it: tables of one colocation group joined by the
+whole key of the distribution, or a replicated table joined to anything,
+or two replicated tables.  The whole plan of such a join is replaced by
+`GpSlice`, which runs the join of the query on the segments; the sort and
+the limit stay on the coordinator, and a merge join that answers the
+`ORDER BY` by itself is left alone.  Inner, left, right and full joins
+are all colocated by the same argument: a row without a partner on its
+segment has no partner anywhere.  A join by another column, and an
+aggregate whose grouping does not cover the key, are left to the
+coordinator.  An aggregate over a colocated join runs on the segments as
+well, when its grouping covers the key of a hashed table.
 
 `EXPLAIN (VERBOSE)` shows the query of the segments.
 
@@ -500,7 +501,7 @@ start their own clusters:
 | `023_update_delete.pl` | `UPDATE` and `DELETE` run on the segments: distributed and replicated tables, rollbacks, a second writer waiting out the first, what is refused |
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
-| `026_join_pushdown.pl` | Joins on the segments: one colocation group joined by the key, replicated tables, outer joins, what is not pushed, the same answers as on the coordinator |
+| `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show
@@ -531,8 +532,9 @@ by the patch and `contrib/gp`.
    worker that resolves the transactions lost segments keep prepared.
 5. **MPP planner without interconnect** — in progress: aggregates whose
    grouping covers the key of the distribution, and joins whose partners
-   are on the same segment run on the segments; next are colocated
-   aggregates over joins and the locus model.
+   are on the same segment run on the segments, with aggregates over
+   colocated joins of any number of tables; next are the locus model and
+   lifting the limitation on junk columns of the target list.
 6. **Interconnect** — Redistribute and Broadcast motions between segments.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
