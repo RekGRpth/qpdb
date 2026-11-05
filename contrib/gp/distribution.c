@@ -151,7 +151,7 @@ static bool
 gp_policy_load(Oid relid, GpPolicy *policy)
 {
 	const char *sql =
-		"SELECT p.kind, p.key_columns, g.nbuckets, g.map "
+		"SELECT p.kind, p.key_columns, g.nbuckets, g.map, p.colocation_id "
 		"FROM gp.distribution_policy p "
 		"LEFT JOIN gp.colocation_groups g "
 		"ON g.colocation_id OPERATOR(pg_catalog.=) p.colocation_id "
@@ -194,6 +194,9 @@ gp_policy_load(Oid relid, GpPolicy *policy)
 		policy->keys = NULL;
 		policy->nbuckets = 0;
 		policy->map = NULL;
+		policy->colocation_id = DatumGetInt32(SPI_getbinval(tuple, desc, 5, &isnull));
+		if (isnull)
+			policy->colocation_id = 0;
 
 		if (!policy->replicated)
 		{

@@ -67,6 +67,7 @@ typedef struct GpPolicy
 	AttrNumber *keys;			/* key columns */
 	int			nbuckets;
 	int		   *map;			/* segment of each bucket */
+	int			colocation_id;	/* colocation group, for colocated joins */
 } GpPolicy;
 
 /* distribution.c */
@@ -97,6 +98,8 @@ extern bool gp_is_gather(Plan *plan);
 extern void gp_slice_init(void);
 extern Query *gp_slice_agg_query(Query *parse);
 extern void gp_slice_agg_plan(Query *original, PlannedStmt *stmt);
+extern Query *gp_slice_join_query(Query *parse);
+extern void gp_slice_join_plan(Query *original, PlannedStmt *stmt);
 
 /* recovery.c */
 extern void gp_recovery_init(void);
