@@ -62,7 +62,8 @@ static const CustomScanMethods gp_slice_plan_methods = {
 	.CreateCustomScanState = gp_slice_create_state,
 };
 
-static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated);
+static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
+								 List *sortClause);
 
 /*
  * Read all rows of the aggregate from the segments into the tuplestore.
@@ -383,7 +384,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 		list_length(original->targetList))
 		return;
 
-	cscan = gp_slice_make(&agg->plan, original, replicated);
+	cscan = gp_slice_make(&agg->plan, original, replicated, original->sortClause);
 
 	if (parent == NULL)
 		stmt->planTree = &cscan->scan.plan;
@@ -396,7 +397,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
  * plan it replaces, and its SQL is the query without its sort and limit
  */
 static CustomScan *
-gp_slice_make(Plan *src, Query *original, bool replicated)
+gp_slice_make(Plan *src, Query *original, bool replicated, List *sortClause)
 {
 	Query	   *remote = copyObject(original);
 	CustomScan *cscan = makeNode(CustomScan);
@@ -412,7 +413,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated)
 	 * both lists.  With an ORDER BY it is needed by the sort, so it goes to
 	 * the segments as a column of its own.
 	 */
-	if (original->sortClause == NIL)
+	if (sortClause == NIL)
 	{
 		List	   *srcnonjunk = NIL;
 		List	   *orignojunk = NIL;
@@ -434,7 +435,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated)
 		srctlist = srcnonjunk;
 		origtlist = orignojunk;
 	}
-	if (original->sortClause != NIL)
+	if (sortClause != NIL)
 	{
 		foreach(lc, remote->targetList)
 		{
@@ -857,12 +858,150 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 			return;
 	}
 
-	cscan = gp_slice_make(plan, original, replicated);
+	cscan = gp_slice_make(plan, original, replicated, original->sortClause);
 
 	if (parent == NULL)
 		stmt->planTree = &cscan->scan.plan;
 	else
 		parent->lefttree = &cscan->scan.plan;
+}
+
+/*
+ * Whether a subquery is answered by one segment: a replicated table for a
+ * single-table aggregate, or all replicated tables for a join
+ */
+static bool
+gp_slice_subquery_replicated(Query *subquery, bool is_join)
+{
+	ListCell   *lc;
+
+	if (!is_join)
+	{
+		foreach(lc, subquery->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+			GpPolicy	policy;
+
+			if (rte->rtekind == RTE_RELATION &&
+				gp_policy_get(rte->relid, &policy) && policy.replicated)
+				return true;
+		}
+		return false;
+	}
+	else
+	{
+		List	   *tables = NIL;
+		List	   *conds = NIL;
+
+		if (!gp_slice_join_collect(linitial(subquery->jointree->fromlist),
+								   &tables, &conds))
+			return false;
+		foreach(lc, tables)
+		{
+			GpJoinTable *table = lfirst(lc);
+			RangeTblEntry *rte = rt_fetch(table->rti, subquery->rtable);
+			GpPolicy	policy;
+
+			if (!gp_policy_get(rte->relid, &policy) || !policy.replicated)
+				return false;
+		}
+		return true;
+	}
+}
+
+/*
+ * Whether the query is a plain select over one subquery, with nothing of
+ * its own but a projection, a sort and a limit: whatever the planner put
+ * below the sort and the limit is the plan of the subquery alone — an
+ * aggregate, a join, or a SubqueryScan the planner chose to keep
+ */
+static bool
+gp_slice_subquery_outer(Query *parse, RangeTblEntry **rte_out)
+{
+	RangeTblRef *ref;
+	RangeTblEntry *rte;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasSubLinks ||
+		parse->setOperations != NULL || parse->cteList != NIL ||
+		parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->distinctClause != NIL || parse->rowMarks != NIL)
+		return false;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
+		parse->jointree->quals != NULL)
+		return false;
+	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
+	rte = rt_fetch(ref->rtindex, parse->rtable);
+	if (rte->rtekind != RTE_SUBQUERY)
+		return false;
+
+	*rte_out = rte;
+	return true;
+}
+
+/*
+ * A subquery in FROM has a locus of its own: if it is a colocated join or
+ * a single-table aggregate by the key, it runs on the segments even when
+ * the query above it is not colocated at all.  The subquery keeps no
+ * limit of its own: a limit taken on every segment is not the limit of
+ * the whole.  The planner often inlines the plan of a simple subquery
+ * with no SubqueryScan of its own, so the plan below the sort and the
+ * limit of the outer query is replaced, whatever node it is.  A plan that
+ * answers the ORDER BY by its own order, with no sort on top, is left
+ * alone: the replacement would not answer it
+ */
+static void
+gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
+{
+	Plan	   *plan = *planp;
+	RangeTblEntry *rte;
+	Query	   *subquery;
+	Query	   *candidate;
+	bool		is_agg;
+	bool		replicated;
+	CustomScan *cscan;
+
+	if (plan == NULL)
+		return;
+
+	/* The sort, the limit and the projection of the outer query */
+	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
+	{
+		gp_slice_subquery_walk(parse, &plan->lefttree,
+							   sort_above || IsA(plan, Sort));
+		return;
+	}
+
+	if (parse->sortClause != NIL && !sort_above)
+		return;
+	if (!gp_slice_subquery_outer(parse, &rte))
+		return;
+	subquery = rte->subquery;
+	if (subquery->limitCount != NULL || subquery->limitOffset != NULL)
+		return;
+
+	candidate = gp_slice_agg_query(subquery);
+	is_agg = candidate != NULL;
+	if (candidate == NULL)
+		candidate = gp_slice_join_query(subquery);
+	if (candidate == NULL)
+		return;
+
+	/* The columns the segments return are the outputs of the subquery */
+	if (list_length(plan->targetlist) != list_length(subquery->targetList))
+		return;
+
+	replicated = gp_slice_subquery_replicated(subquery, !is_agg);
+	cscan = gp_slice_make(plan, subquery, replicated, parse->sortClause);
+	*planp = &cscan->scan.plan;
+}
+
+void
+gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt)
+{
+	gp_slice_subquery_walk(parse, &stmt->planTree, false);
 }
 
 /*

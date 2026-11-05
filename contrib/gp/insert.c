@@ -604,6 +604,28 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		gp_slice_agg_plan(agg_original, stmt);
 	else if (join_original != NULL)
 		gp_slice_join_plan(join_original, stmt);
+	else
+	{
+		/*
+		 * A subquery in FROM may have been flattened into the query by the
+		 * planner, which rewrites the query in place: what was a select
+		 * over a subquery is an aggregate or a colocated join now, and the
+		 * detection above, run before the planner, saw none of it
+		 */
+		Query	   *flattened = gp_slice_agg_query(parse);
+
+		if (flattened == NULL)
+			flattened = gp_slice_join_query(parse);
+		if (flattened != NULL)
+		{
+			if (flattened->hasAggs)
+				gp_slice_agg_plan(flattened, stmt);
+			else
+				gp_slice_join_plan(flattened, stmt);
+		}
+		else
+			gp_slice_subquery_plans(parse, stmt);
+	}
 
 	return stmt;
 }
