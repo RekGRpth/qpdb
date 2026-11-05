@@ -97,10 +97,11 @@ extern bool gp_is_gather(Plan *plan);
 /* slice.c */
 extern void gp_slice_init(void);
 extern Query *gp_slice_agg_query(Query *parse);
-extern void gp_slice_agg_plan(Query *original, PlannedStmt *stmt);
+extern bool gp_slice_agg_plan(Query *original, PlannedStmt *stmt);
 extern Query *gp_slice_join_query(Query *parse);
-extern void gp_slice_join_plan(Query *original, PlannedStmt *stmt);
+extern bool gp_slice_join_plan(Query *original, PlannedStmt *stmt);
 extern void gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt);
+extern void gp_slice_partial_plan(Query *parse, PlannedStmt *stmt);
 
 /* recovery.c */
 extern void gp_recovery_init(void);

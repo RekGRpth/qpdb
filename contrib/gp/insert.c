@@ -579,6 +579,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	PlannedStmt *stmt;
 	Query	   *agg_original = NULL;
 	Query	   *join_original = NULL;
+	bool		replaced = false;
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
@@ -601,10 +602,11 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		gp_dml_plan(parse, stmt, boundParams, query_string);
 
 	if (agg_original != NULL)
-		gp_slice_agg_plan(agg_original, stmt);
+		replaced = gp_slice_agg_plan(agg_original, stmt);
 	else if (join_original != NULL)
-		gp_slice_join_plan(join_original, stmt);
-	else
+		replaced = gp_slice_join_plan(join_original, stmt);
+
+	if (!replaced)
 	{
 		/*
 		 * A subquery in FROM may have been flattened into the query by the
@@ -614,17 +616,26 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		 */
 		Query	   *flattened = gp_slice_agg_query(parse);
 
-		if (flattened == NULL)
-			flattened = gp_slice_join_query(parse);
 		if (flattened != NULL)
+			replaced = gp_slice_agg_plan(flattened, stmt);
+		if (!replaced)
 		{
-			if (flattened->hasAggs)
-				gp_slice_agg_plan(flattened, stmt);
-			else
-				gp_slice_join_plan(flattened, stmt);
+			flattened = gp_slice_join_query(parse);
+			if (flattened != NULL)
+				replaced = gp_slice_join_plan(flattened, stmt);
 		}
-		else
+		if (!replaced)
+		{
+			/*
+			 * An aggregate whose grouping does not cover the key of the
+			 * distribution is answered in two steps: partly on the
+			 * segments, finished here
+			 */
+			gp_slice_partial_plan(parse, stmt);
+
+			/* The subqueries of FROM have loci of their own */
 			gp_slice_subquery_plans(parse, stmt);
+		}
 	}
 
 	return stmt;
