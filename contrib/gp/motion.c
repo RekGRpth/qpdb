@@ -13,6 +13,10 @@
  * function: it takes the query of the rows and answers with the rows of every
  * segment together.
  *
+ * An aggregate whose grouping columns do not cover the distribution key moves
+ * its rows the same way, but hashes those grouping columns: every group lands
+ * on one segment, which computes the whole aggregate.
+ *
  * The addresses of the segments are not kept here: they are asked of the
  * coordinator at every call, so a cluster that changed stays correct.  The
  * segment the rows are for is told to the others by a setting of the

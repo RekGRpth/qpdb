@@ -48,12 +48,13 @@ commits: a statement trigger on the table asks for that, and an object
 access hook when the table is dropped.  `gp.cluster_segments()` shows the
 copy.
 
-A segment registers itself: at start, its background worker connects to
-`gp.coordinator`, calls `gp.register_segment(segment_id, gp.host, port)` in
-`gp.database` and exits.  While the coordinator is down or has no
-extension, the worker retries every `gp.register_retry_interval`, so
-segments may start before the coordinator.  A number registered at another
-address, or an address under another number, is refused.
+A segment registers itself: at start, its background worker creates the SQL
+part of `gp` in `gp.database`, connects to `gp.coordinator`, calls
+`gp.register_segment(segment_id, gp.host, port)` there and exits.  While the
+coordinator is down or has no extension, the worker retries every
+`gp.register_retry_interval`, so segments may start before the coordinator.
+A number registered at another address, or an address under another number,
+is refused.
 
 ### Connections and commands (`dispatch.c`)
 
@@ -94,9 +95,13 @@ in use.
   them in turn, failing if one is for another catalog, if it needs more, or
   if some are left over at commit: then it has run the command differently.
 - A segment creates no objects of its own unless `gp.allow_local_ddl` is
-  on, as they would take OIDs that the coordinator may assign later.
+  on.  Such objects get OIDs from the allocator with a large offset; the
+  coordinator refuses to assign OIDs in that range, so the ranges cannot
+  collide.
 
-Relfilenumbers stay local and may differ.
+Relfilenumbers stay local and may differ.  The registration worker of a
+segment uses this local range to create the SQL part of `gp` before
+registering, so motion can call its functions without any setup by the user.
 
 ### DDL on the segments (`ddl.c`)
 
@@ -136,20 +141,20 @@ segments, and DDL on them (`GRANT`, `COMMENT`, `ALTER EXTENSION ... SET
 SCHEMA`) goes there as well.
 
 What stays on the coordinator: temporary objects (functions and types of
-`pg_temp` too), extension `gp` with its schema and objects, and an object
-that depends on a temporary one, which stays with it — a function of a
-temporary sequence or type, a domain of a temporary type; one statement may
-not mix them with other objects.  A table `LIKE` a temporary one takes its
-columns on the coordinator, and the segments make it as the coordinator
-sees it.  Materialized views and foreign tables never go to the segments,
-and the commands on them — an index, `ALTER`, `GRANT`, `COMMENT`,
-`REFRESH` — stay on the coordinator with them.  Not sent yet: triggers,
-policies, event triggers, tablespaces and `ALTER DATABASE`.  What is
-refused, as it would stay on the coordinator while the commands around
-it go to the segments: rules on tables of the cluster.  The segments need no SQL part of `gp`: its tables and functions
-are for the configuration of the cluster, and its settings come with the
-library.  What is refused: `ALTER TABLE` that computes a column with a
-non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
+`pg_temp` too) and an object that depends on a temporary one, which stays
+with it — a function of a temporary sequence or type, a domain of a
+temporary type; one statement may not mix them with other objects.  A table
+`LIKE` a temporary one takes its columns on the coordinator, and the
+segments make it as the coordinator sees it.  Materialized views and
+foreign tables never go to the segments, and the commands on them — an
+index, `ALTER`, `GRANT`, `COMMENT`, `REFRESH` — stay on the coordinator
+with them.  Not sent yet: triggers, policies, event triggers, tablespaces
+and `ALTER DATABASE`.  What is refused, as it would stay on the coordinator
+while the commands around it go to the segments: rules on tables of the
+cluster.  Extension `gp` is special: its DDL is not dispatched from the
+coordinator; the registration worker of every segment creates its own copy
+in `gp.database` before registering, so motion can call its functions.
+What is refused: `ALTER TABLE` that computes a column with a non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
 identity, `ALTER COLUMN TYPE ... USING random()`), as each segment would
 compute its own values.
 
@@ -363,10 +368,13 @@ aggregate is replaced after the planner by a custom scan, `GpSlice`,
 which runs the aggregate of the query on the segments and reads their
 rows; the sort and the limit of the query stay on the coordinator.  A
 replicated table is aggregated by one segment as a whole, even without a
-grouping.  Joins, subqueries, windows, grouping sets, a grouping that
-does not cover the whole key, a global aggregate of a hashed table, and
-a sorted aggregate that answers the `ORDER BY` of the query by itself
-are left to the coordinator.  A junk column of the target list — a
+grouping.  When the grouping consists of plain columns with extended hash
+functions but does not cover the distribution key, the rows move by those
+grouping columns under the table's bucket map.  Every group lands on one segment again, so the whole
+aggregate runs there, including `count`, `avg`, distinct and mixed
+aggregates.  Windows, grouping sets, a grouping by expressions, a global
+aggregate of a hashed table, and a sorted aggregate that answers the
+`ORDER BY` of the query by itself are left to the coordinator.  A junk column of the target list — a
 grouping or a sort key that is not selected — is not a stopper: it is
 dropped when there is no `ORDER BY`, and sent to the segments as a
 column of its own when there is one.
@@ -393,36 +401,38 @@ row.  The peer connections are autonomous, so they cannot see the writes
 of the transaction that asks.  After a transaction has sent commands to
 the segments, a new plan uses the gather, whose connections are already
 in that transaction; a motion plan made before the write refuses to run
-after it.  The extension is created on the segments too, for the motion
-calls its functions there.  The whole plan of such a join is replaced by
+after it.  Every segment creates the SQL part of the extension in its
+registration worker, so motion can call its functions there.  The whole
+plan of such a join is replaced by
 `GpSlice`, which runs the join of the query on the segments; the sort and
 the limit stay on the coordinator, and a merge join that answers the
 `ORDER BY` by itself is left alone.  Inner, left, right and full joins
 are all colocated by the same argument: a row without a partner on its
 segment has no partner anywhere.  A join by another column, an outer
 join of more than two tables, a replicated table in a non-colocated join
-of several groups, and an aggregate whose grouping does not cover the
-key are left to the coordinator.  An aggregate over a colocated join runs on the segments as
+of several groups, and an aggregate over a join whose grouping does not
+cover the key are left to the coordinator.  An aggregate over a colocated join runs on the segments as
 well, when its grouping covers the key of a hashed table that is not
 null-supplying; a null-supplying key would leave a separate null group
 on every segment.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
-table grouped by the key, or a join with redistribution or broadcast,
-runs on the segments even inside a subquery of a query that is not
-colocated itself.  The planner
+table grouped by the key or redistributed by plain grouping columns, or
+a join with redistribution or broadcast, runs on the segments even inside
+a subquery of a query that is not colocated itself.  The planner
 often inlines the plan of a simple subquery with no `SubqueryScan` node,
 so the plan below the sort and the limit of the outer query is replaced,
 whatever node it is; a plan that answers the `ORDER BY` by its own order
 is left alone, and so is a subquery with a limit of its own, a condition
 of the outer query on its results, and a subquery joined to a table.
 
-An aggregate whose grouping does not cover the key of the distribution is
-answered in two steps: the segments aggregate their own rows — grouped by
-the grouping of the query, or all rows together when there is none — and
-the coordinator finishes the aggregate over the columns of every segment.
-The final aggregate is the same aggregate again, which only `min`, `max`
-and `sum` of a type they combine in truly answer; `count` counts the
+An aggregate grouped by expressions, and a global aggregate that does
+not move all rows to one segment, can be answered in two steps instead:
+the segments aggregate their own rows — grouped by the grouping of the
+query, or all rows together when there is none — and the coordinator
+finishes the aggregate over the columns of every segment.  The final
+aggregate is the same aggregate again, which only `min`, `max` and `sum`
+of a type they combine in truly answer; on this path `count` counts the
 partial columns instead of adding them, and the average divides, so they
 stay on the coordinator with every query they are in.  `HAVING` stays on
 the coordinator too, for a group may pass it only as a whole.
@@ -545,11 +555,11 @@ start their own clusters:
 | `022_unique_key.pl` | Unique indexes of a distributed table must include the whole key of the distribution; equal keys stay on one segment, and its index tells them apart |
 | `023_update_delete.pl` | `UPDATE` and `DELETE` run on the segments: distributed and replicated tables, rollbacks, a second writer waiting out the first, what is refused |
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
-| `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
+| `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write and dropped-column fallbacks |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
 | `029_redistributed_join.pl` | Inner joins of two and more colocation groups redistribute every table of another group by the whole key; outer joins of two tables broadcast the null-supplying side, and full joins broadcast both sides to one segment; null keys, unmatched rows, aggregates, subqueries, writes in the transaction and dropped columns are checked against the coordinator |
-| `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by other columns and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole |
+| `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
 server without `gp`, and with `gp` preloaded on a single server, to show

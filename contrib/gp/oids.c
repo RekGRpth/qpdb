@@ -10,8 +10,9 @@
  * that each is for the same catalog.  So a command that the segment runs
  * as the coordinator did gives its objects the same OIDs.
  *
- * A segment creates no objects of its own unless gp.allow_local_ddl is on:
- * they would take OIDs that the coordinator may assign later.
+ * A segment creates no objects of its own unless gp.allow_local_ddl is on.
+ * Their OIDs come from the allocator with a large offset, so they do not
+ * collide with the OIDs that the coordinator assigns.
  *
  * A command that cannot run in a transaction block gets its OIDs by SET in
  * a session, not SET LOCAL, with gp.dispatch_oids_session on.  The
@@ -29,6 +30,7 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "executor/spi.h"
@@ -42,6 +44,9 @@
 #include "utils/rel.h"
 
 #include "gp.h"
+
+/* The coordinator never assigns this range; segments use it for local objects */
+#define GP_LOCAL_OID_OFFSET (UINT64_C(1) << 30)
 
 /* A new catalog row and its OID */
 typedef struct GpOid
@@ -102,6 +107,13 @@ gp_new_oid_coordinator(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	}
 	PG_END_TRY();
 
+	if (oid >= GP_LOCAL_OID_OFFSET)
+		ereport(ERROR,
+				errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				errmsg("the OID range for coordinator objects is exhausted"),
+				errdetail("OIDs at and above %u are reserved for local objects of segments.",
+						  (unsigned int) GP_LOCAL_OID_OFFSET));
+
 	if (nrecorded == maxrecorded)
 	{
 		if (recorded == NULL)
@@ -134,13 +146,25 @@ gp_new_oid_segment(Relation relation, Oid indexId, AttrNumber oidcolumn)
 
 	if (dispatched == NULL)
 	{
+		uint64		oid;
+
 		if (!gp_allow_local_ddl)
 			ereport(ERROR,
 					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cannot create objects on a segment"),
 					errdetail("Objects of a segment get their OIDs from the coordinator."),
 					errhint("Run the command on the coordinator, or set \"gp.allow_local_ddl\" for maintenance."));
-		return InvalidOid;
+
+		/*
+		 * The allocator gives a fresh, persistent sequence, and the offset puts
+		 * local objects above the OIDs that the coordinator assigns
+		 */
+		oid = (uint64) GetNewObjectId() + GP_LOCAL_OID_OFFSET;
+		if (oid > PG_UINT32_MAX)
+			ereport(ERROR,
+					errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("the OID range for local objects of a segment is exhausted"));
+		return (Oid) oid;
 	}
 
 	if (nused >= dispatched->count)

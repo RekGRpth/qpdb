@@ -30,8 +30,11 @@
 
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#include "commands/defrem.h"
+#include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
@@ -72,6 +75,8 @@ static const CustomScanMethods gp_slice_plan_methods = {
 
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
+static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
+							   bool *replicated, bool *motion);
 
 /*
  * Read all rows of the aggregate from the segments into the tuplestore.
@@ -316,8 +321,8 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	Agg		   *agg;
 	Plan	   *below;
 	CustomScan *cscan;
-	ListCell   *lc;
-	bool		replicated;
+	bool		replicated = false;
+	bool		motion = false;
 
 	/* Find the aggregate, below whatever sorts and limits sit on top */
 	while (plan != NULL && !IsA(plan, Agg))
@@ -348,59 +353,15 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	if (below == NULL || !gp_is_gather(below))
 		return false;
 
-	replicated = false;
-	{
-		GpPolicy	policy = {0};
-		RangeTblEntry *rte = NULL;
-
-		foreach(lc, original->rtable)
-		{
-			RangeTblEntry *r = lfirst_node(RangeTblEntry, lc);
-
-			if (r->rtekind == RTE_RELATION)
-				rte = r;
-		}
-		if (rte != NULL && gp_policy_get(rte->relid, &policy))
-			replicated = policy.replicated;
-
-		/*
-		 * Every column of the distribution key must be a grouping column of
-		 * the aggregate, so that every group is on one segment.  The grouping
-		 * columns are read from the plan, as columns of the table below it.
-		 */
-		if (!replicated)
-		{
-			for (int k = 0; k < policy.nkeys; k++)
-			{
-				bool		grouped = false;
-
-				for (int i = 0; i < agg->numCols; i++)
-				{
-					TargetEntry *tle = list_nth(agg->plan.lefttree->targetlist,
-												agg->grpColIdx[i] - 1);
-					Var		   *var;
-
-					if (!IsA(tle->expr, Var))
-						return false;
-					var = (Var *) tle->expr;
-					if (var->varattno == policy.keys[k])
-					{
-						grouped = true;
-						break;
-					}
-				}
-				if (!grouped)
-					return false;
-			}
-		}
-	}
+	if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion))
+		return false;
 
 	/* The columns the segments return are the target list of the aggregate */
 	if (list_length(agg->plan.targetlist) !=
 		list_length(original->targetList))
 		return false;
 
-	cscan = gp_slice_make(&agg->plan, original, replicated, false,
+	cscan = gp_slice_make(&agg->plan, original, replicated, motion,
 						  original->sortClause);
 
 	if (parent == NULL)
@@ -858,8 +819,8 @@ gp_slice_join_type_of(Query *parse)
  * connection, so the query itself is one for all the segments
  */
 static bool
-gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
-						 bool broadcast)
+gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *move,
+						 bool broadcast, int nkeys, const AttrNumber *keyatts)
 {
 	RangeTblEntry *rte = rt_fetch(move->rti, remote->rtable);
 	Relation	rel;
@@ -905,22 +866,24 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
 		colnames = lappend(colnames, makeString(pstrdup(NameStr(att->attname))));
 		colcolls = lappend_oid(colcolls, att->attcollation);
 	}
-	for (int i = 0; i < move->policy.nkeys; i++)
+	for (int i = 0; i < nkeys; i++)
 		appendStringInfo(&keys, "%s%s", keys.len > 0 ? ", " : "",
 						 quote_identifier(NameStr(TupleDescAttr(tupdesc,
-																move->policy.keys[i] - 1)->attname)));
+																keyatts[i] - 1)->attname)));
 
 	if (broadcast)
 	{
-		appendStringInfo(&sql, "SELECT %s FROM %s",
+		appendStringInfo(&sql, "SELECT %s FROM %s%s",
 						 cols.data,
+						 rte->inh ? "" : "ONLY ",
 						 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 													RelationGetRelationName(rel)));
 	}
 	else
 	{
-		appendStringInfo(&sql, "SELECT %s FROM %s WHERE (%s)[gp.bucket(%d%s%s) + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4",
+		appendStringInfo(&sql, "SELECT %s FROM %s%s WHERE (%s)[gp.bucket(%d%s%s) + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4",
 						 cols.data,
+						 rte->inh ? "" : "ONLY ",
 						 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 													RelationGetRelationName(rel)),
 						 map.data, stay->policy.nbuckets,
@@ -952,6 +915,117 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
 
 	rte->rtekind = RTE_FUNCTION;
 	rte->functions = list_make1(rtf);
+	return true;
+}
+
+/* Redistribute a join side by its distribution key */
+static bool
+gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
+						 bool broadcast)
+{
+	return gp_slice_redistribute_rte_keys(remote, stay, move, broadcast,
+										 move->policy.nkeys, move->policy.keys);
+}
+
+/* Whether gp.bucket() can hash a grouping column of this type */
+static bool
+gp_slice_hashable(Oid typid)
+{
+	Oid			opclass = GetDefaultOpClass(typid, HASH_AM_OID);
+	Oid			opcintype;
+	Oid			proc;
+
+	if (!OidIsValid(opclass))
+		return false;
+	opcintype = get_opclass_input_type(opclass);
+	proc = get_opfamily_proc(get_opclass_family(opclass), opcintype, opcintype,
+							 HASHEXTENDED_PROC);
+	return OidIsValid(proc);
+}
+
+/*
+ * Whether an aggregate of one table can run on the segments.  A replicated
+ * table is answered by one of them.  A hash table answers locally when the
+ * grouping covers its distribution key.  Otherwise its rows move by the
+ * grouping columns, provided they are plain columns of the table: every group
+ * then lands on one segment, which computes the whole aggregate
+ */
+static bool
+gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
+				   bool *replicated, bool *motion)
+{
+	RangeTblRef *ref;
+	RangeTblEntry *rte;
+	GpJoinTable *table;
+	AttrNumber *keyatts;
+	bool		colocated = true;
+
+	*replicated = false;
+	*motion = false;
+	if (!IsA(original->jointree, FromExpr) ||
+		list_length(original->jointree->fromlist) != 1 ||
+		!IsA(linitial(original->jointree->fromlist), RangeTblRef))
+		return false;
+	ref = linitial_node(RangeTblRef, original->jointree->fromlist);
+	rte = rt_fetch(ref->rtindex, original->rtable);
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+
+	table = palloc0(sizeof(GpJoinTable));
+	table->rti = ref->rtindex;
+	if (!gp_policy_get(rte->relid, &table->policy))
+		return false;
+	if (table->policy.replicated)
+	{
+		*replicated = true;
+		return true;
+	}
+
+	/* Does the grouping cover the whole distribution key? */
+	for (int k = 0; k < table->policy.nkeys && colocated; k++)
+	{
+		bool		grouped = false;
+
+		for (int i = 0; i < agg->numCols; i++)
+		{
+			TargetEntry *tle = list_nth(below->targetlist,
+										agg->grpColIdx[i] - 1);
+			Var		   *var;
+
+			if (!IsA(tle->expr, Var))
+				return false;
+			var = (Var *) tle->expr;
+			if (var->varattno == table->policy.keys[k])
+			{
+				grouped = true;
+				break;
+			}
+		}
+		colocated = grouped;
+	}
+	if (colocated)
+		return true;
+	if (agg->numCols == 0 || gp_dispatch_in_xact())
+		return false;
+
+	/* Move every row by all the grouping columns instead */
+	keyatts = palloc_array(AttrNumber, agg->numCols);
+	for (int i = 0; i < agg->numCols; i++)
+	{
+		TargetEntry *tle = list_nth(below->targetlist, agg->grpColIdx[i] - 1);
+		Var		   *var;
+
+		if (!IsA(tle->expr, Var))
+			return false;
+		var = (Var *) tle->expr;
+		if (var->varattno <= 0 || !gp_slice_hashable(var->vartype))
+			return false;
+		keyatts[i] = var->varattno;
+	}
+	if (!gp_slice_redistribute_rte_keys(original, table, table, false,
+										agg->numCols, keyatts))
+		return false;
+	*motion = true;
 	return true;
 }
 
@@ -1417,12 +1491,34 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	if (list_length(plan->targetlist) != list_length(subquery->targetList))
 		return;
 
-	replicated = gp_slice_subquery_replicated(subquery, !is_agg);
-	if (!is_agg)
+	if (is_agg)
+	{
+		Plan	   *agg = plan;
+		Plan	   *below;
+
+		while (agg != NULL && !IsA(agg, Agg))
+		{
+			if (agg->righttree != NULL)
+				return;
+			agg = agg->lefttree;
+		}
+		if (agg == NULL)
+			return;
+		below = agg->lefttree;
+		while (below != NULL && IsA(below, Sort))
+			below = below->lefttree;
+		if (below == NULL || !gp_is_gather(below) ||
+			!gp_slice_agg_locus(candidate, (Agg *) agg, below,
+								&replicated, &motion))
+			return;
+	}
+	else
 	{
 		List	   *tables = NIL;
 		List	   *conds = NIL;
 		bool		single_segment = false;
+
+		replicated = gp_slice_subquery_replicated(subquery, true);
 
 		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
 								   &tables, &conds))

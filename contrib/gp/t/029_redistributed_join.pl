@@ -34,9 +34,6 @@ gp.register_retry_interval = 1
 max_prepared_transactions = 10
 ");
 	$node->start;
-	# The motion of the segment calls the functions of the extension there
-	$node->safe_psql('postgres',
-		"SET gp.allow_local_ddl = on; CREATE EXTENSION gp");
 	push @segments, $node;
 }
 $coordinator->poll_query_until('postgres',
