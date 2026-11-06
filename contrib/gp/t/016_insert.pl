@@ -203,9 +203,8 @@ is($ret, 0, 'privileges of the selected columns are sufficient');
 is(total('SELECT count(*) FROM priv_dst'), 2, 'both rows were inserted');
 
 # The hash uses the default routing collation, not the source column's one
-if (run("SELECT count(*) > 0 FROM pg_collation WHERE collprovider = 'i'") eq 't')
+if (eval { run("CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level1', deterministic = false)"); 1 })
 {
-	run("CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level1', deterministic = false)");
 	run('CREATE TABLE src_coll (v int, k text COLLATE ci)');
 	run("SELECT gp.distribute('src_coll', ARRAY['v'])");
 	run('CREATE TABLE dst_coll (k text, v int)');
@@ -230,7 +229,7 @@ FROM gp.distribution_policy p WHERE p.relid = 'dst_coll'::regclass GROUP BY 1},
 }
 else
 {
-	pass('ICU is not available in this build');
+	pass('ICU collation is not available in this build or database encoding');
 }
 
 # After a write the source is read by the old path, in the same transaction
