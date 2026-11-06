@@ -1,10 +1,11 @@
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
-# An aggregate whose grouping does not cover the key of the distribution is
-# answered in two steps: the segments aggregate their own rows, and the
-# coordinator finishes the aggregate over the columns of every segment.
-# min, max and sum of a closing type combine by the same aggregate again
+# An aggregate grouped by expressions, and a global aggregate that does not
+# move all rows to one segment, is answered in two steps: the segments
+# aggregate their own rows, and the coordinator finishes the aggregate over
+# the columns of every segment.  min, max and sum of a closing type combine
+# by the same aggregate again
 
 use strict;
 use warnings FATAL => 'all';

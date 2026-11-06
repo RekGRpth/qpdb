@@ -2,9 +2,9 @@
 # Licensed under the PostgreSQL License, see LICENSE
 
 # Aggregates whose grouping covers the key of the distribution run on the
-# segments: every group is on one segment, so the segment computes it to
-# the end, and the coordinator collects the finished groups.  A replicated
-# table is aggregated by one segment as a whole
+# segments.  A grouping by other plain columns redistributes the rows by
+# them first, so every group still reaches one segment.  A replicated table
+# is aggregated by one segment as a whole
 
 use strict;
 use warnings FATAL => 'all';
@@ -58,8 +58,14 @@ like(plan_for('SELECT a, count(*), sum(c) FROM t WHERE b > \'x100\' GROUP BY a O
 	qr/GpSlice/, 'filter, sort and limit do not stop the pushdown');
 like(plan_for('SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a LIMIT 4'),
 	qr/GpSlice/, 'an order by the aggregate is kept on the coordinator');
-unlike(plan_for('SELECT b, count(*) FROM t GROUP BY b'), qr/GpSlice/,
-	'grouping by another column is not pushed');
+like(plan_for('SELECT b, count(*) FROM t GROUP BY b'), qr/GpSlice/,
+	'grouping by another column redistributes the rows by it');
+like(plan_for('SELECT b, avg(c), count(*) FROM t GROUP BY b'), qr/GpSlice/,
+	'a redistributed group is aggregated to the end');
+like(plan_for('SELECT b, count(DISTINCT a) FROM t GROUP BY b'), qr/GpSlice/,
+	'a distinct aggregate works after redistribution too');
+like(plan_for('SELECT b, n FROM (SELECT b, count(*) AS n FROM t GROUP BY b) s'),
+	qr/GpSlice/, 'a non-key aggregate redistributes inside a subquery too');
 unlike(plan_for('SELECT count(*) FROM t'), qr/GpSlice/,
 	'a global aggregate of a hashed table is not pushed');
 unlike(plan_for('SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a'),
@@ -82,6 +88,9 @@ my @queries = (
 	'SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a DESC LIMIT 3',
 	'SELECT a, sum(c) FROM t GROUP BY a HAVING sum(c) > 70000 ORDER BY a',
 	'SELECT b, count(*) FROM t GROUP BY b ORDER BY b LIMIT 3',
+	'SELECT b, avg(c), count(*) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, count(DISTINCT a) FROM t GROUP BY b ORDER BY b',
+	'SELECT b, n FROM (SELECT b, count(*) AS n FROM t GROUP BY b) s ORDER BY b',
 	'SELECT count(*) FROM t',
 	'SELECT a, count(*) FROM t WHERE a > 5 GROUP BY a ORDER BY a DESC LIMIT 3',
 	'SELECT a, count(*) FROM t GROUP BY a ORDER BY count(*) DESC, a LIMIT 4',
@@ -104,6 +113,53 @@ like(plan_for('SELECT count(*) FROM r'), qr/GpSlice/,
 is(run('SELECT a, count(*) FROM r GROUP BY a ORDER BY a'),
 	"0|10\n1|10\n2|10\n3|10\n4|10", 'the groups of the replicated table');
 is(run('SELECT count(*) FROM r'), 50, 'the global count of the replicated table');
+
+# A grouping type without an extended hash function cannot move rows
+run('CREATE TABLE mt (a int, m money)');
+run("SELECT gp.distribute('mt', ARRAY['a'])");
+run("INSERT INTO mt VALUES (1, 10), (2, 10), (3, 20)");
+run('CREATE TABLE ml AS SELECT * FROM mt');
+unlike(plan_for('SELECT m, count(*) FROM mt GROUP BY m'), qr/GpSlice/,
+	'a group by an unhashable type stays on the coordinator');
+is(run('SELECT m, count(*) FROM mt GROUP BY m ORDER BY m'),
+	run('SELECT m, count(*) FROM ml GROUP BY m ORDER BY m'),
+	'the unhashable type still has a sorted aggregate');
+
+# ONLY keeps children out of the motion, while the default includes them
+run('CREATE TABLE parent_t (a int, b text)');
+run("SELECT gp.distribute('parent_t', ARRAY['a'])");
+run('CREATE TABLE child_t () INHERITS (parent_t)');
+run("SELECT gp.distribute('child_t', ARRAY['a'])");
+run("INSERT INTO parent_t VALUES (1, 'parent')");
+run("INSERT INTO child_t VALUES (2, 'child')");
+like(plan_for('SELECT b, count(*) FROM ONLY parent_t GROUP BY b'), qr/GpSlice/,
+	'ONLY still allows aggregate redistribution');
+is(run('SELECT b, count(*) FROM ONLY parent_t GROUP BY b ORDER BY b'),
+	'parent|1', 'ONLY does not read the child through the motion');
+is(run('SELECT b, count(*) FROM parent_t GROUP BY b ORDER BY b'),
+	"child|1\nparent|1", 'the default inheritance scan includes the child');
+
+# An autonomous motion cannot see the writes of this transaction
+my $session = $coordinator->background_psql('postgres', on_error_stop => 1);
+$session->query_safe('BEGIN');
+$session->query_safe("INSERT INTO t VALUES (11, 'new', 1)");
+$session->query_safe("INSERT INTO l VALUES (11, 'new', 1)");
+unlike($session->query_safe('EXPLAIN (COSTS OFF) SELECT b, count(*) FROM t GROUP BY b'),
+	qr/GpSlice/, 'an aggregate motion after a write stays on the coordinator');
+is($session->query_safe("SELECT b, count(*) FROM t WHERE b = 'new' GROUP BY b"),
+	$session->query_safe("SELECT b, count(*) FROM l WHERE b = 'new' GROUP BY b"),
+	'an aggregate after a write sees the new row');
+$session->query_safe('ROLLBACK');
+$session->quit;
+
+# A dropped column cannot be returned by the record of a motion
+run('ALTER TABLE t ADD COLUMN junk int');
+run('ALTER TABLE t DROP COLUMN junk');
+unlike(plan_for('SELECT b, count(*) FROM t GROUP BY b'), qr/GpSlice/,
+	'a dropped column cancels aggregate redistribution');
+is(run('SELECT b, count(*) FROM t GROUP BY b ORDER BY b LIMIT 3'),
+	run('SELECT b, count(*) FROM l GROUP BY b ORDER BY b LIMIT 3'),
+	'a dropped column leaves the right answer on the coordinator');
 
 $_->stop foreach (@segments, $coordinator);
 

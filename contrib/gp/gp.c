@@ -16,6 +16,8 @@
 #include <limits.h>
 
 #include "catalog/catalog.h"
+#include "access/xact.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
@@ -25,6 +27,8 @@
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 #include "gp.h"
@@ -264,7 +268,8 @@ _PG_init(void)
 	{
 		BackgroundWorker worker = {0};
 
-		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 		worker.bgw_restart_time = gp_register_retry_interval;
 		strlcpy(worker.bgw_library_name, "gp", BGW_MAXLEN);
@@ -283,11 +288,39 @@ gp_coordinator_conninfo(void)
 }
 
 /*
- * Background worker of a segment: register the segment on the coordinator,
- * then exit.  Exit code 0 tells the postmaster not to start the worker
- * again; on a failure, exit code 1 makes it retry after
- * gp.register_retry_interval, so a segment may start before the
- * coordinator.
+ * Create the SQL part of the extension on a segment.  Its objects use the
+ * local OID range, so they cannot collide with objects of the coordinator
+ */
+static void
+gp_segment_extension(void)
+{
+	BackgroundWorkerInitializeConnection(gp_database, NULL, 0);
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_execute("SELECT 1 FROM pg_extension WHERE extname = 'gp'",
+					true, 1) != SPI_OK_SELECT)
+		ereport(ERROR,
+				errmsg("could not look for extension gp on segment %d",
+					   gp_segment_id));
+	if (SPI_processed == 0 &&
+		(SPI_execute("SET gp.allow_local_ddl = on", false, 0) != SPI_OK_UTILITY ||
+		 SPI_execute("CREATE EXTENSION gp", false, 0) != SPI_OK_UTILITY))
+		ereport(ERROR,
+				errmsg("could not create extension gp on segment %d",
+					   gp_segment_id));
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
+}
+
+/*
+ * Background worker of a segment: create the SQL part of the extension for
+ * motion, then register the segment on the coordinator and exit.  Exit code 0
+ * tells the postmaster not to start the worker again; on a failure, exit code
+ * 1 makes it retry after gp.register_retry_interval, so a segment may start
+ * before the coordinator.
  */
 void
 gp_register_main(Datum main_arg)
@@ -316,6 +349,20 @@ gp_register_main(Datum main_arg)
 		libpqsrv_disconnect(conn);
 		proc_exit(1);
 	}
+
+	PG_TRY();
+	{
+		gp_segment_extension();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		AbortCurrentTransaction();
+		FlushErrorState();
+		libpqsrv_disconnect(conn);
+		proc_exit(1);
+	}
+	PG_END_TRY();
 
 	snprintf(segment_id, sizeof(segment_id), "%d", gp_segment_id);
 	snprintf(port, sizeof(port), "%d", PostPortNumber);
