@@ -109,6 +109,7 @@ extern void gp_recovery_init(void);
 
 /* dispatch.c */
 extern void gp_dispatch_init(void);
+extern bool gp_dispatch_in_xact(void);
 extern void gp_dtx_lock(void);
 extern void gp_dtx_unlock(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);

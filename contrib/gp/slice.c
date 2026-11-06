@@ -59,6 +59,7 @@ typedef struct GpSliceState
 	CustomScanState css;
 	char	   *sql;
 	bool		replicated;
+	bool		motion;
 	Tuplestorestate *store;		/* all rows, once read */
 } GpSliceState;
 
@@ -70,7 +71,7 @@ static const CustomScanMethods gp_slice_plan_methods = {
 };
 
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
-								 List *sortClause);
+								 bool motion, List *sortClause);
 
 /*
  * Read all rows of the aggregate from the segments into the tuplestore.
@@ -89,6 +90,12 @@ gp_slice_load(GpSliceState *state)
 	GpQuery    *query;
 	PGresult   *res;
 	int			only = 0;
+
+	if (state->motion && gp_dispatch_in_xact())
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("a motion query cannot see writes made earlier in the same transaction"),
+				errhint("Run the query before writing, or prepare it after the write."));
 
 	for (int i = 0; i < natts; i++)
 	{
@@ -167,6 +174,7 @@ gp_slice_begin(CustomScanState *node, EState *estate, int eflags)
 
 	state->sql = strVal(linitial(cscan->custom_private));
 	state->replicated = boolVal(lsecond(cscan->custom_private));
+	state->motion = boolVal(lthird(cscan->custom_private));
 }
 
 static TupleTableSlot *
@@ -392,7 +400,8 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 		list_length(original->targetList))
 		return false;
 
-	cscan = gp_slice_make(&agg->plan, original, replicated, original->sortClause);
+	cscan = gp_slice_make(&agg->plan, original, replicated, false,
+						  original->sortClause);
 
 	if (parent == NULL)
 		stmt->planTree = &cscan->scan.plan;
@@ -408,7 +417,8 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
  * plan it replaces, and its SQL is the query without its sort and limit
  */
 static CustomScan *
-gp_slice_make(Plan *src, Query *original, bool replicated, List *sortClause)
+gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
+			  List *sortClause)
 {
 	Query	   *remote = copyObject(original);
 	CustomScan *cscan = makeNode(CustomScan);
@@ -484,8 +494,9 @@ gp_slice_make(Plan *src, Query *original, bool replicated, List *sortClause)
 	cscan->scan.plan.plan_rows = src->plan_rows;
 	cscan->scan.plan.plan_width = src->plan_width;
 	cscan->custom_scan_tlist = copyObject(origtlist);
-	cscan->custom_private = list_make2(makeString(pg_get_querydef(remote, false)),
-									   makeBoolean(replicated));
+	cscan->custom_private = list_make3(makeString(pg_get_querydef(remote, false)),
+									   makeBoolean(replicated),
+									   makeBoolean(motion));
 	cscan->methods = &gp_slice_plan_methods;
 	return cscan;
 }
@@ -740,35 +751,36 @@ gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
 }
 
 /*
- * Whether some join of the tree is not an inner one: a row of the moving
- * table that the hash places nowhere — a row with a null key — meets no
- * partner on any segment, which an outer join would have to keep
+ * The kind of the first join of the query: an inner join, or which side of
+ * it is kept even when it has no partner
  */
-static bool
-gp_slice_join_not_inner(Node *node, void *context)
+static JoinType
+gp_slice_join_type_of(Query *parse)
 {
-	if (node == NULL)
-		return false;
-	if (IsA(node, JoinExpr))
-	{
-		JoinExpr   *join = (JoinExpr *) node;
+	Node	   *first;
 
-		if (join->jointype != JOIN_INNER)
-			return true;
-	}
-	return expression_tree_walker(node, gp_slice_join_not_inner, context);
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1)
+		return JOIN_INNER;
+	first = linitial(parse->jointree->fromlist);
+	if (!IsA(first, JoinExpr))
+		return JOIN_INNER;
+	return ((JoinExpr *) first)->jointype;
 }
 
 /*
  * Rewrite the table that moves into a pull of its rows from every segment:
  * the segment runs the query, and the function asks every segment — itself
- * among them — for the rows that the hash of the join key places on it.
- * The map of the table that stays goes into the query as an array, and the
- * segment the rows are for comes in a setting of the connection, so the
- * query itself is one for all the segments
+ * among them — for the rows.  An inner join needs only the rows that the
+ * hash of the join key places on the asking segment.  An outer join broadcasts
+ * the moving side instead, so that rows with null keys and rows without a
+ * partner are kept.  The map of the table that stays goes into the query as
+ * an array, and the segment the rows are for comes in a setting of the
+ * connection, so the query itself is one for all the segments
  */
-static void
-gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move)
+static bool
+gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
+						 bool broadcast)
 {
 	RangeTblEntry *rte = rt_fetch(move->rti, remote->rtable);
 	Relation	rel;
@@ -805,7 +817,7 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move)
 		if (att->attisdropped)
 		{
 			table_close(rel, AccessShareLock);
-			return;
+			return false;
 		}
 		appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
 						 quote_identifier(NameStr(att->attname)));
@@ -819,12 +831,22 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move)
 						 quote_identifier(NameStr(TupleDescAttr(tupdesc,
 																move->policy.keys[i] - 1)->attname)));
 
-	appendStringInfo(&sql, "SELECT %s FROM %s WHERE (%s)[gp.bucket(%d%s%s) + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4",
-					 cols.data,
-					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-												RelationGetRelationName(rel)),
-					 map.data, stay->policy.nbuckets,
-					 keys.len > 0 ? ", " : "", keys.data);
+	if (broadcast)
+	{
+		appendStringInfo(&sql, "SELECT %s FROM %s",
+						 cols.data,
+						 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+													RelationGetRelationName(rel)));
+	}
+	else
+	{
+		appendStringInfo(&sql, "SELECT %s FROM %s WHERE (%s)[gp.bucket(%d%s%s) + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4",
+						 cols.data,
+						 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+													RelationGetRelationName(rel)),
+						 map.data, stay->policy.nbuckets,
+						 keys.len > 0 ? ", " : "", keys.data);
+	}
 	table_close(rel, AccessShareLock);
 
 	peer_query_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
@@ -851,6 +873,52 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move)
 
 	rte->rtekind = RTE_FUNCTION;
 	rte->functions = list_make1(rtf);
+	return true;
+}
+
+/*
+ * Move the sides of a join of two colocation groups.  An inner join moves
+ * the second table by the hash of the key under the map of the first.  An
+ * outer join broadcasts its null-supplying side instead.  A full join
+ * broadcasts both sides and runs on one segment, as either side can have an
+ * unmatched row
+ */
+static bool
+gp_slice_join_motion(Query *original, List *tables, List *conds,
+					 bool *single_segment)
+{
+	GpJoinTable *stay;
+	GpJoinTable *move;
+	JoinType	jointype;
+
+	*single_segment = false;
+	if (!gp_slice_join_redistributable(original, tables, conds, &stay, &move))
+		return false;
+	jointype = gp_slice_join_type_of(original);
+	switch (jointype)
+	{
+		case JOIN_INNER:
+			if (!gp_slice_redistribute_rte(original, stay, move, false))
+				return false;
+			break;
+		case JOIN_LEFT:
+			if (!gp_slice_redistribute_rte(original, stay, move, true))
+				return false;
+			break;
+		case JOIN_RIGHT:
+			if (!gp_slice_redistribute_rte(original, move, stay, true))
+				return false;
+			break;
+		case JOIN_FULL:
+			if (!gp_slice_redistribute_rte(original, stay, move, true) ||
+				!gp_slice_redistribute_rte(original, move, stay, true))
+				return false;
+			*single_segment = true;
+			break;
+		default:
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -883,14 +951,41 @@ gp_slice_base_column(Plan *plan, TargetEntry *tle, Index *rti,
 }
 
 /*
+ * Whether an outer join can supply nulls for the columns of a base table.
+ * A group by a key of such a table is not local to a segment: unmatched rows
+ * on different segments all belong to its null group, which must be finished
+ * on the coordinator rather than returned as several groups
+ */
+static bool
+gp_slice_join_nullable(Node *node, Index rti, bool nullable)
+{
+	JoinExpr   *join;
+	bool		left_nullable = nullable;
+	bool		right_nullable = nullable;
+
+	if (IsA(node, RangeTblRef))
+		return nullable && ((RangeTblRef *) node)->rtindex == rti;
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	if (join->jointype == JOIN_LEFT || join->jointype == JOIN_FULL)
+		right_nullable = true;
+	if (join->jointype == JOIN_RIGHT || join->jointype == JOIN_FULL)
+		left_nullable = true;
+
+	return gp_slice_join_nullable(join->larg, rti, left_nullable) ||
+		gp_slice_join_nullable(join->rarg, rti, right_nullable);
+}
+
+/*
  * Whether the grouping of the aggregate covers the distribution key of
  * some hashed table of the join, so that every group is on one segment.
  * All hashed tables are colocated by their keys, so grouping by the whole
- * key of any one of them is enough.  The grouping columns are read from
- * the plan
+ * key of any one of them that is not null-supplying is enough.  The grouping
+ * columns are read from the plan
  */
 static bool
-gp_slice_join_agg_keys(Agg *agg, List *tables)
+gp_slice_join_agg_keys(Agg *agg, List *tables, Query *original)
 {
 	ListCell   *lc;
 
@@ -899,7 +994,9 @@ gp_slice_join_agg_keys(Agg *agg, List *tables)
 		GpJoinTable *table = lfirst(lc);
 		bool		all_keys = true;
 
-		if (table->policy.replicated)
+		if (table->policy.replicated ||
+			gp_slice_join_nullable(linitial(original->jointree->fromlist),
+								  table->rti, false))
 			continue;
 		for (int i = 0; i < table->policy.nkeys; i++)
 		{
@@ -971,7 +1068,7 @@ gp_slice_join_query(Query *parse)
 		GpJoinTable *stay;
 		GpJoinTable *move;
 
-		if (gp_slice_join_not_inner(linitial(parse->jointree->fromlist), NULL) ||
+		if (gp_dispatch_in_xact() ||
 			!gp_slice_join_redistributable(parse, tables, conds,
 										   &stay, &move))
 			return NULL;
@@ -1001,6 +1098,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	Plan	   *plan = stmt->planTree;
 	bool		sort_above = false;
 	bool		replicated = true;
+	bool		single_segment = false;
+	bool		motion = false;
 	List	   *tables = NIL;
 	List	   *conds = NIL;
 	ListCell   *lc;
@@ -1026,19 +1125,9 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	conds = lappend(conds, original->jointree->quals);
 	if (!gp_slice_join_colocated(original, tables, conds))
 	{
-		/*
-		 * Two hashed tables of different colocation groups, joined by the
-		 * whole key: the second table moves, pulled from every segment by
-		 * the hash of the join key under the map of the first
-		 */
-		GpJoinTable *stay;
-		GpJoinTable *move;
-
-		if (gp_slice_join_not_inner(linitial(original->jointree->fromlist), NULL) ||
-			!gp_slice_join_redistributable(original, tables, conds,
-										   &stay, &move))
+		if (!gp_slice_join_motion(original, tables, conds, &single_segment))
 			return false;
-		gp_slice_redistribute_rte(original, stay, move);
+		motion = true;
 	}
 	foreach(lc, tables)
 	{
@@ -1047,6 +1136,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		if (!table->policy.replicated)
 			replicated = false;
 	}
+	if (single_segment)
+		replicated = true;
 
 	/* The columns the segments return are the target list of the plan */
 	if (list_length(plan->targetlist) != list_length(original->targetList))
@@ -1063,11 +1154,11 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 				return false;
 			agg = agg->lefttree;
 		}
-		if (agg == NULL || !gp_slice_join_agg_keys((Agg *) agg, tables))
+		if (agg == NULL || !gp_slice_join_agg_keys((Agg *) agg, tables, original))
 			return false;
 	}
 
-	cscan = gp_slice_make(plan, original, replicated, original->sortClause);
+	cscan = gp_slice_make(plan, original, replicated, motion, original->sortClause);
 
 	if (parent == NULL)
 		stmt->planTree = &cscan->scan.plan;
@@ -1108,13 +1199,22 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 		if (!gp_slice_join_collect(linitial(subquery->jointree->fromlist),
 								   &tables, &conds))
 			return false;
+		conds = lappend(conds, subquery->jointree->quals);
+		if (!gp_slice_join_colocated(subquery, tables, conds))
+		{
+			GpJoinTable *stay;
+			GpJoinTable *move;
+
+			/* Both sides of a full join are broadcast to one segment */
+			return gp_slice_join_type_of(subquery) == JOIN_FULL &&
+				gp_slice_join_redistributable(subquery, tables, conds,
+											  &stay, &move);
+		}
 		foreach(lc, tables)
 		{
 			GpJoinTable *table = lfirst(lc);
-			RangeTblEntry *rte = rt_fetch(table->rti, subquery->rtable);
-			GpPolicy	policy;
 
-			if (!gp_policy_get(rte->relid, &policy) || !policy.replicated)
+			if (!table->policy.replicated)
 				return false;
 		}
 		return true;
@@ -1173,6 +1273,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	Query	   *candidate;
 	bool		is_agg;
 	bool		replicated;
+	bool		motion = false;
 	CustomScan *cscan;
 
 	if (plan == NULL)
@@ -1206,7 +1307,39 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		return;
 
 	replicated = gp_slice_subquery_replicated(subquery, !is_agg);
-	cscan = gp_slice_make(plan, subquery, replicated, parse->sortClause);
+	if (!is_agg)
+	{
+		List	   *tables = NIL;
+		List	   *conds = NIL;
+		bool		single_segment = false;
+
+		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
+								   &tables, &conds))
+			return;
+		conds = lappend(conds, candidate->jointree->quals);
+		if (!gp_slice_join_colocated(candidate, tables, conds))
+		{
+			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment))
+				return;
+			motion = true;
+		}
+		replicated = replicated || single_segment;
+		if (subquery->hasAggs && !replicated)
+		{
+			Plan	   *agg = plan;
+
+			while (agg != NULL && !IsA(agg, Agg))
+			{
+				if (agg->righttree != NULL)
+					return;
+				agg = agg->lefttree;
+			}
+			if (agg == NULL ||
+				!gp_slice_join_agg_keys((Agg *) agg, tables, subquery))
+				return;
+		}
+	}
+	cscan = gp_slice_make(plan, candidate, replicated, motion, parse->sortClause);
 	*planp = &cscan->scan.plan;
 }
 
@@ -1513,7 +1646,8 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	cscan->scan.plan.plan_rows = agg->plan.lefttree->plan_rows;
 	cscan->scan.plan.plan_width = agg->plan.lefttree->plan_width;
 	cscan->custom_scan_tlist = copyObject(remote->targetList);
-	cscan->custom_private = list_make2(makeString(pg_get_querydef(remote, false)),
+	cscan->custom_private = list_make3(makeString(pg_get_querydef(remote, false)),
+									   makeBoolean(false),
 									   makeBoolean(false));
 	cscan->methods = &gp_slice_plan_methods;
 
