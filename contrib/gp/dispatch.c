@@ -352,6 +352,16 @@ gp_dispatch_shmem_init(void *arg)
 }
 
 /*
+ * Whether this transaction has sent commands to the segments.  An autonomous
+ * connection of a motion cannot see their uncommitted effects
+ */
+bool
+gp_dispatch_in_xact(void)
+{
+	return ndispatched > 0;
+}
+
+/*
  * The lock of the distributed snapshot, for the recovery worker: a pass
  * of it takes the lock too, and resolves nothing while a commit runs
  */

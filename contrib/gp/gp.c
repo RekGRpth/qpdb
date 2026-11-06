@@ -54,6 +54,7 @@ static const struct config_enum_entry gp_default_distribution_options[] = {
 /* GUC Variables */
 int			gp_role = GP_ROLE_NONE;
 int			gp_segment_id = 0;
+static int	gp_requester_segment = 0;
 char	   *gp_database = NULL;
 int			gp_max_segments = 64;
 int			gp_default_distribution = GP_DEFAULT_COORDINATOR;
@@ -94,6 +95,19 @@ _PG_init(void)
 							INT_MAX,
 							PGC_POSTMASTER,
 							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("gp.requester_segment",
+							"Segment for which a motion connection returns rows.",
+							"Set by another segment on a connection that pulls rows.",
+							&gp_requester_segment,
+							0,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE,
 							NULL,
 							NULL,
 							NULL);

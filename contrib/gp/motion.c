@@ -6,10 +6,11 @@
  * A query that joins two tables of different colocation groups needs the
  * rows of one table to move, so that every row meets its partners on one
  * segment.  The movement goes the pull way: every segment, as it runs the
- * query, asks every segment — itself among them — for the rows that the
- * hash of the join key places on it, and joins what comes with its own
- * rows.  The asking is this function: it takes the query of the rows and
- * answers with the rows of every segment together.
+ * query, asks every segment — itself among them — for rows.  An inner join
+ * asks for the rows that the hash of the join key places on it; an outer
+ * join broadcasts a whole side instead, keeping rows with null keys and
+ * rows without a partner.  The asking is this function: it takes the query
+ * of the rows and answers with the rows of every segment together.
  *
  * The addresses of the segments are not kept here: they are asked of the
  * coordinator at every call, so a cluster that changed stays correct.  The
@@ -139,6 +140,7 @@ gp_peer_query(PG_FUNCTION_ARGS)
 	char	   *db;
 	PGconn	   *conn;
 	PGresult   *segments;
+	MemoryContext oldcontext;
 
 	/* The planner of the coordinator writes the calls; none runs by hand */
 	if (gp_role != GP_ROLE_SEGMENT)
@@ -151,7 +153,7 @@ gp_peer_query(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("set-valued function called in context that cannot accept a set"));
-	if (rsinfo->setDesc == NULL)
+	if (rsinfo->expectedDesc == NULL)
 		ereport(ERROR,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				errmsg("gp.peer_query needs the columns of its answer"));
@@ -160,8 +162,11 @@ gp_peer_query(PG_FUNCTION_ARGS)
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				errmsg("the query of the rows is required"));
 
-	tupdesc = CreateTupleDescCopy(rsinfo->setDesc);
+	/* The result must survive the per-tuple context of the function call */
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
 	store = tuplestore_begin_heap(true, false, work_mem);
+	MemoryContextSwitchTo(oldcontext);
 	sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	/* The segments of the cluster, asked of the coordinator */
@@ -236,6 +241,20 @@ gp_peer_query(PG_FUNCTION_ARGS)
 				 gp_segment_id);
 		rows = libpqsrv_exec_params(peer, set, 0, NULL, NULL, NULL, NULL, 0,
 									gp_motion_event());
+		if (PQresultStatus(rows) != PGRES_COMMAND_OK)
+		{
+			char	   *err = pchomp(PQresultErrorMessage(rows));
+
+			PQclear(rows);
+			libpqsrv_disconnect(peer);
+			PQclear(segments);
+			libpqsrv_disconnect(conn);
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not set the receiving segment on segment %d",
+						   segment_id),
+					errdetail("%s", err));
+		}
 		PQclear(rows);
 
 		rows = libpqsrv_exec_params(peer, sql, 0, NULL, NULL, NULL, NULL, 1,

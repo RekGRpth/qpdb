@@ -382,10 +382,15 @@ the other table, and joins what comes with its own rows.  The asking is
 `gp.peer_query()`, which runs on a segment, as the user of the query:
 it takes the addresses of the segments from the coordinator at every
 call, so a cluster that changed stays correct, and it tells each segment
-which segment its rows are for by a setting of the connection.  Outer
-joins are not redistributed: a row of the moving table with a null key
-would meet no partner on any segment, and an outer join would have to
-keep it.  The extension is created on the segments too, for the motion
+which segment its rows are for by a setting of the connection.  An outer
+join broadcasts its null-supplying side instead: the right side of a left
+join, and the left side of a right join.  A full join broadcasts both
+sides and runs on one segment, because either side can have an unmatched
+row.  The peer connections are autonomous, so they cannot see the writes
+of the transaction that asks.  After a transaction has sent commands to
+the segments, a new plan uses the gather, whose connections are already
+in that transaction; a motion plan made before the write refuses to run
+after it.  The extension is created on the segments too, for the motion
 calls its functions there.  The whole plan of such a join is replaced by
 `GpSlice`, which runs the join of the query on the segments; the sort and
 the limit stay on the coordinator, and a merge join that answers the
@@ -394,11 +399,14 @@ are all colocated by the same argument: a row without a partner on its
 segment has no partner anywhere.  A join by another column, and an
 aggregate whose grouping does not cover the key, are left to the
 coordinator.  An aggregate over a colocated join runs on the segments as
-well, when its grouping covers the key of a hashed table.
+well, when its grouping covers the key of a hashed table that is not
+null-supplying; a null-supplying key would leave a separate null group
+on every segment.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
-table grouped by the key, or a colocated join, runs on the segments even
-inside a subquery of a query that is not colocated itself.  The planner
+table grouped by the key, or a join with redistribution or broadcast,
+runs on the segments even inside a subquery of a query that is not
+colocated itself.  The planner
 often inlines the plan of a simple subquery with no `SubqueryScan` node,
 so the plan below the sort and the limit of the outer query is replaced,
 whatever node it is; a plan that answers the `ORDER BY` by its own order
@@ -536,7 +544,7 @@ start their own clusters:
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, replicated tables, what is not pushed, the same answers as on the coordinator |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
-| `029_redistributed_join.pl` | A join of two colocation groups by the whole key moves one table to the segments of the other; the answers match the coordinator, and outer joins stay |
+| `029_redistributed_join.pl` | A join of two colocation groups by the whole key redistributes one table for an inner join, broadcasts the null-supplying side of an outer join, and broadcasts both sides of a full join to one segment; null keys, unmatched rows, aggregates and subqueries match the coordinator, writes in the transaction and dropped columns fall back safely |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by other columns and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
