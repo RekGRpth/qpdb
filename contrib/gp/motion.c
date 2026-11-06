@@ -3,14 +3,15 @@
  * motion.c
  *		Rows of a query from every segment of the cluster
  *
- * A query that joins two tables of different colocation groups needs the
- * rows of one table to move, so that every row meets its partners on one
+ * A query that joins tables of different colocation groups needs the rows
+ * of some of them to move, so that every row meets its partners on one
  * segment.  The movement goes the pull way: every segment, as it runs the
  * query, asks every segment — itself among them — for rows.  An inner join
- * asks for the rows that the hash of the join key places on it; an outer
- * join broadcasts a whole side instead, keeping rows with null keys and
- * rows without a partner.  The asking is this function: it takes the query
- * of the rows and answers with the rows of every segment together.
+ * asks for the rows that the hash of the join key places on it, however many
+ * tables move; an outer join of two tables broadcasts a whole side instead,
+ * keeping rows with null keys and rows without a partner.  The asking is this
+ * function: it takes the query of the rows and answers with the rows of every
+ * segment together.
  *
  * The addresses of the segments are not kept here: they are asked of the
  * coordinator at every call, so a cluster that changed stays correct.  The
