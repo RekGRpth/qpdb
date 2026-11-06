@@ -15,7 +15,9 @@
  *
  * An aggregate whose grouping columns do not cover the distribution key moves
  * its rows the same way, but hashes those grouping columns: every group lands
- * on one segment, which computes the whole aggregate.
+ * on one segment, which computes the whole aggregate.  An INSERT ... SELECT
+ * hashes its source rows by the distribution key of the target table, so
+ * every segment inserts only the rows that belong to it.
  *
  * The addresses of the segments are not kept here: they are asked of the
  * coordinator at every call, so a cluster that changed stays correct.  The

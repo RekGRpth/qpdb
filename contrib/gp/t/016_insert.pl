@@ -127,6 +127,133 @@ WHERE p.relid = 't'::regclass GROUP BY 1 ORDER BY 1},
 	q{SELECT string_agg(a::text, ',' ORDER BY a) FROM t WHERE a > 100},
 	'and in the segments of their buckets');
 
+# A distributed SELECT moves rows by the key of the target, even when the
+# source columns come in another order
+run('CREATE TABLE src (x int, b text, a int)');
+run("SELECT gp.distribute('src', ARRAY['x'])");
+run('CREATE TABLE dst (a int, b text)');
+run("SELECT gp.distribute('dst', ARRAY['a'])");
+run("INSERT INTO src SELECT g, 's' || g, g FROM generate_series(201, 250) g");
+like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM src'),
+	qr/Custom Scan \(GpDml\)/, 'INSERT ... SELECT redistributes the source');
+($ret, $stdout, $stderr) = $coordinator->psql('postgres',
+	q{DO $$ DECLARE n bigint; BEGIN
+INSERT INTO dst (a, b) SELECT a, b FROM src;
+GET DIAGNOSTICS n = ROW_COUNT; RAISE NOTICE 'rows %', n; END $$});
+like($stderr, qr/NOTICE:  rows 50/, 'a redistributed INSERT counts all target rows');
+placed(
+	q{SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, g)),
+	   string_agg(g::text, ',' ORDER BY g)
+FROM generate_series(201, 250) g, gp.distribution_policy p
+WHERE p.relid = 'dst'::regclass GROUP BY 1 ORDER BY 1},
+	q{SELECT string_agg(a::text, ',' ORDER BY a) FROM dst},
+	'each selected row is on the segment of its target bucket');
+
+run('CREATE TABLE src2 (a int, b int)');
+run("SELECT gp.distribute('src2', ARRAY['a'])");
+run('CREATE TABLE dst2 (x int, y int)');
+run("SELECT gp.distribute('dst2', ARRAY['x'])");
+run("INSERT INTO src2 VALUES (1, 401), (2, 402), (3, 403)");
+like(run('EXPLAIN (COSTS off) INSERT INTO dst2 (x, y) SELECT b, a FROM src2'),
+	qr/Custom Scan \(GpDml\)/, 'the inner projection may have another order');
+run('INSERT INTO dst2 (x, y) SELECT b, a FROM src2');
+placed(
+	q{SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, g)),
+	   string_agg(g::text, ',' ORDER BY g)
+FROM generate_series(401, 403) g, gp.distribution_policy p
+WHERE p.relid = 'dst2'::regclass GROUP BY 1 ORDER BY 1},
+	q{SELECT string_agg(x::text, ',' ORDER BY x) FROM dst2},
+	'the target key follows the inner column, not its position');
+
+like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM dst'),
+	qr/Custom Scan \(GpDml\)/, 'a table can be its own source of motion');
+run('INSERT INTO dst (a, b) SELECT a, b FROM dst');
+is(total('SELECT count(*) FROM dst'), 100, 'self INSERT doubles the rows');
+
+like(run('EXPLAIN (COSTS off) INSERT INTO dst (a) SELECT a FROM src'),
+	qr/Custom Scan \(GpInsert\)/, 'a target default stays on the coordinator');
+like(run("EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b || 'x' FROM src"),
+	qr/Custom Scan \(GpInsert\)/, 'a source expression stays on the coordinator');
+run('CREATE TABLE rep_src (a int)');
+run("SELECT gp.distribute('rep_src', NULL)");
+run('INSERT INTO rep_src VALUES (301), (302)');
+like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, a FROM rep_src'),
+	qr/Custom Scan \(GpInsert\)/, 'a replicated source stays on the coordinator');
+run('CREATE SEQUENCE unused_seq');
+like(run("EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM (SELECT a, b, nextval('unused_seq') AS unused FROM src) q"),
+	qr/Custom Scan \(GpInsert\)/, 'an unused sequence call stays on the coordinator');
+like(run('PREPARE unused_param (int) AS INSERT INTO dst (a, b) SELECT a, b FROM (SELECT a, b, $1 AS unused FROM src) q; EXPLAIN (COSTS off) EXECUTE unused_param (1); DEALLOCATE unused_param'),
+	qr/Custom Scan \(GpInsert\)/, 'an unused parameter stays on the coordinator');
+
+# Only the selected columns are read, so their privileges are enough
+run('CREATE TABLE priv_src (k int, v int, secret int)');
+run("SELECT gp.distribute('priv_src', ARRAY['k'])");
+run('CREATE TABLE priv_dst (k int, v int)');
+run("SELECT gp.distribute('priv_dst', ARRAY['k'])");
+run('CREATE ROLE col_u LOGIN');
+run('GRANT USAGE ON SCHEMA gp TO col_u');
+run('GRANT SELECT (k, v) ON priv_src TO col_u');
+run('GRANT INSERT ON priv_dst TO col_u');
+run('INSERT INTO priv_src VALUES (1, 2, 99), (2, 3, 100)');
+like(run('EXPLAIN (COSTS off) INSERT INTO priv_dst SELECT k, v FROM priv_src'),
+	qr/Custom Scan \(GpDml\)/, 'a column-limited INSERT uses motion');
+($ret, $stdout, $stderr) = $coordinator->psql('postgres',
+	'INSERT INTO priv_dst SELECT k, v FROM priv_src', extra_params => [ '-U', 'col_u' ]);
+is($ret, 0, 'privileges of the selected columns are sufficient');
+is(total('SELECT count(*) FROM priv_dst'), 2, 'both rows were inserted');
+
+# The hash uses the default routing collation, not the source column's one
+if (eval { run("CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level1', deterministic = false)"); 1 })
+{
+	run('CREATE TABLE src_coll (v int, k text COLLATE ci)');
+	run("SELECT gp.distribute('src_coll', ARRAY['v'])");
+	run('CREATE TABLE dst_coll (k text, v int)');
+	run("SELECT gp.distribute('dst_coll', ARRAY['k'])");
+	run("INSERT INTO src_coll VALUES (1, 'A')");
+	like(run('EXPLAIN (COSTS off) INSERT INTO dst_coll SELECT k, v FROM src_coll'),
+		qr/Custom Scan \(GpDml\)/, 'a collated source uses motion');
+	run('INSERT INTO dst_coll SELECT k, v FROM src_coll');
+	placed(
+		q{SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, 'A')),
+		   nullif(count(*), 0)
+FROM gp.distribution_policy p WHERE p.relid = 'dst_coll'::regclass GROUP BY 1},
+		'SELECT nullif(count(*), 0) FROM dst_coll',
+		'the target and the motion use the same collation');
+
+	# Aggregation keeps the collation of its equality instead
+	run("INSERT INTO src_coll VALUES (2, 'a')");
+	like(run('EXPLAIN (COSTS off) SELECT k, count(*) FROM src_coll GROUP BY k'),
+		qr/Custom Scan \(GpSlice\)/, 'a collated aggregate uses motion');
+	is(run('SELECT count(*), sum(n) FROM (SELECT k, count(*) AS n FROM src_coll GROUP BY k) q'),
+		'1|2', 'A and a stay in one case-insensitive group');
+}
+else
+{
+	pass('ICU collation is not available in this build or database encoding');
+}
+
+# After a write the source is read by the old path, in the same transaction
+my $session = $coordinator->background_psql('postgres', on_error_stop => 1);
+$session->query_safe('BEGIN');
+$session->query_safe("INSERT INTO src VALUES (999, 'new', 999)");
+like($session->query_safe('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM src'),
+	qr/Custom Scan \(GpInsert\)/, 'a write makes INSERT ... SELECT use the gather');
+$session->query_safe('INSERT INTO dst (a, b) SELECT a, b FROM src');
+is($session->query_safe('SELECT count(*) FROM dst WHERE a = 999'), 1,
+	'the insert sees the source row of its transaction');
+$session->query_safe('ROLLBACK');
+$session->quit;
+
+# A dropped source or target column cancels the motion, not the INSERT
+run('ALTER TABLE src ADD COLUMN junk int');
+run('ALTER TABLE src DROP COLUMN junk');
+run('ALTER TABLE dst ADD COLUMN junk int');
+run('ALTER TABLE dst DROP COLUMN junk');
+like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM src'),
+	qr/Custom Scan \(GpInsert\)/, 'dropped columns keep the old INSERT path');
+run('INSERT INTO dst (a, b) SELECT a, b FROM src');
+is(total('SELECT count(*) FROM dst'), 150, 'the fallback inserts every row');
+
 # DEFAULT VALUES, and a key from a default
 run('CREATE TABLE d (a int DEFAULT 7, b int DEFAULT 8)');
 run(q{SELECT gp.distribute('d', ARRAY['a'])});

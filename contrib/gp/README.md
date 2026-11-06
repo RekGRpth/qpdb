@@ -154,6 +154,7 @@ while the commands around it go to the segments: rules on tables of the
 cluster.  Extension `gp` is special: its DDL is not dispatched from the
 coordinator; the registration worker of every segment creates its own copy
 in `gp.database` before registering, so motion can call its functions.
+`USAGE` on the schema is granted to `PUBLIC` on every node.
 What is refused: `ALTER TABLE` that computes a column with a non-immutable expression (`ADD COLUMN ... DEFAULT now()`, `serial`,
 identity, `ALTER COLUMN TYPE ... USING random()`), as each segment would
 compute its own values.
@@ -296,6 +297,17 @@ refused, rather than the rows lost.  An `INSERT ... SELECT` takes the rows of
 its `SELECT`, which reads distributed tables as described below.  As the
 source may read the segments on the very connections that the rows go on,
 `GpInsert` first reads all its rows into a store, and sends them after.
+
+When the source is one hashed table and the `SELECT` reads only its plain
+columns, and every target column is filled directly, `GpDml` runs the whole
+`INSERT ... SELECT` on the segments instead.  The source RTE becomes a
+`gp.peer_query` that hashes the rows by the distribution key of the target,
+using the default routing collation, so each segment inserts only its own
+rows.  The target list may reorder the source columns.  Only the needed
+source columns are read; an unused one is a `NULL` placeholder in the peer
+query, which preserves attribute numbers and column privileges.  Expressions,
+defaults, joins, aggregates, limits, replicated tables and a transaction that
+has already written stay on the `GpInsert` path, as do dropped columns.
 
 When the source is `VALUES` or a `SELECT` without a table, and the key
 columns of every row are constants (a default, a folded expression and a
@@ -546,7 +558,7 @@ start their own clusters:
 | `013_nonxact.pl` | `CREATE DATABASE`, `DROP DATABASE`, `VACUUM` and the `CONCURRENTLY` commands on the segments, and their failures |
 | `014_extension.pl` | Extensions on the segments with the same OIDs: create, update, cascade, move, drop, a failing segment; extension `gp` stays |
 | `015_copy.pl` | `COPY FROM` into distributed and replicated tables: placement by bucket, types, transactions, errors, privileges |
-| `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, what is refused, privileges |
+| `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, redistribution of a plain distributed `SELECT`, safe fallbacks and privileges |
 | `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
 | `018_gather.pl` | `SELECT` from distributed tables against the same rows in ordinary tables: aggregates, joins, windows, rescans, replicated and partitioned tables, types, own writes, privileges, what is refused |
 | `019_default_distribution.pl` | `gp.default_distribution`: the key of a new table, partitions, temporary tables, `CREATE TABLE AS`, `SELECT INTO`, a database's setting |

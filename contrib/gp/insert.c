@@ -12,6 +12,12 @@
  * does, see route.c.  The segments check the constraints and compute the
  * generated columns.  The command tag counts the rows.
  *
+ * When the source is one hashed table and every target column comes directly
+ * from it, GpDml runs the whole INSERT ... SELECT on the segments instead:
+ * the source rows move by the distribution key of the target, so every
+ * segment inserts only its own rows.  Expressions and defaults stay on the
+ * coordinator.
+ *
  * If the rows are VALUES whose keys are all constants and fall in one
  * segment, the plan knows that segment, and the rows go to it alone, the
  * other segments not being asked at all (direct dispatch).  The buckets of
@@ -45,12 +51,14 @@
 #include "storage/lmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/tuplestore.h"
 
 #include "gp.h"
 
 static planner_hook_type prev_planner = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze = NULL;
+static const CustomScanMethods gp_dml_plan_methods;
 
 static void gp_dml_lock(Oid relid);
 
@@ -305,7 +313,7 @@ gp_insert_direct_segment(Oid relid, const GpPolicy *policy, Plan *source,
  * table
  */
 static void
-gp_insert_plan(Query *parse, PlannedStmt *stmt)
+gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 {
 	ModifyTable *mt = (ModifyTable *) stmt->planTree;
 	RangeTblEntry *rte = rt_fetch(parse->resultRelation, parse->rtable);
@@ -332,6 +340,21 @@ gp_insert_plan(Query *parse, PlannedStmt *stmt)
 				errmsg("row-level security and WITH CHECK OPTION are not supported on a distributed table"));
 
 	source = outerPlan(mt);
+	if (gp_slice_insert_motion(original))
+	{
+		cscan = makeNode(CustomScan);
+		cscan->scan.plan.startup_cost = mt->plan.startup_cost;
+		cscan->scan.plan.total_cost = mt->plan.total_cost;
+		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
+		cscan->scan.plan.plan_width = mt->plan.plan_width;
+		cscan->scan.scanrelid = 0;
+		cscan->custom_private = list_make3(makeString(pg_get_querydef(original, false)),
+										   makeBoolean(mt->canSetTag),
+										   makeBoolean(true));
+		cscan->methods = &gp_dml_plan_methods;
+		stmt->planTree = &cscan->scan.plan;
+		return;
+	}
 	segment = gp_insert_direct_segment(rte->relid, &policy, source, &buckets);
 	cscan = makeNode(CustomScan);
 	cscan->scan.plan.startup_cost = mt->plan.startup_cost;
@@ -366,6 +389,7 @@ typedef struct GpDmlState
 {
 	CustomScanState css;
 	char	   *sql;
+	bool		motion;
 	bool		done;
 } GpDmlState;
 
@@ -395,6 +419,7 @@ gp_dml_begin(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 
 	state->sql = strVal(linitial(cscan->custom_private));
+	state->motion = boolVal(lthird(cscan->custom_private));
 }
 
 static TupleTableSlot *
@@ -406,6 +431,11 @@ gp_dml_exec(CustomScanState *node)
 	{
 		uint64		rows = 0;
 
+		if (state->motion && gp_dispatch_in_xact())
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("a motion query cannot see writes made earlier in the same transaction"),
+					errhint("Run the query before writing, or prepare it after the write."));
 		state->done = true;
 		gp_dispatch_xact_rows(state->sql, &rows);
 		node->ss.ps.state->es_processed = rows;
@@ -533,8 +563,9 @@ gp_dml_plan(Query *parse, PlannedStmt *stmt, ParamListInfo boundParams,
 		cscan->scan.plan.plan_rows = mt->plan.plan_rows;
 		cscan->scan.plan.plan_width = mt->plan.plan_width;
 		cscan->scan.scanrelid = 0;
-		cscan->custom_private = list_make2(makeString(sql),
-										   makeBoolean(stmt->canSetTag));
+		cscan->custom_private = list_make3(makeString(sql),
+										   makeBoolean(stmt->canSetTag),
+										   makeBoolean(false));
 		cscan->methods = &gp_dml_plan_methods;
 		stmt->planTree = &cscan->scan.plan;
 	}
@@ -579,6 +610,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	PlannedStmt *stmt;
 	Query	   *agg_original = NULL;
 	Query	   *join_original = NULL;
+	Query	   *insert_original = NULL;
 	bool		replaced = false;
 
 	if (IsUnderPostmaster)
@@ -587,6 +619,8 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)
 		join_original = gp_slice_join_query(parse);
+	if (parse->commandType == CMD_INSERT)
+		insert_original = copyObject(parse);
 
 	if (prev_planner)
 		stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
@@ -595,7 +629,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	if (parse->commandType == CMD_INSERT && IsUnderPostmaster &&
 		stmt->planTree != NULL && IsA(stmt->planTree, ModifyTable))
-		gp_insert_plan(parse, stmt);
+		gp_insert_plan(parse, insert_original, stmt);
 	if ((parse->commandType == CMD_UPDATE || parse->commandType == CMD_DELETE) &&
 		IsUnderPostmaster && stmt->planTree != NULL &&
 		IsA(stmt->planTree, ModifyTable))
