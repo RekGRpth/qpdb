@@ -3,6 +3,9 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION gp" to load this file. \quit
 
+-- Distributed queries call the functions here as the session user
+GRANT USAGE ON SCHEMA gp TO PUBLIC;
+
 -- Segments of the cluster, numbered from 1; the coordinator is 0.  The
 -- table is used in the database named by gp.database on the coordinator;
 -- segments add themselves to it with gp.register_segment().

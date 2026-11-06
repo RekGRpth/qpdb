@@ -820,7 +820,9 @@ gp_slice_join_type_of(Query *parse)
  */
 static bool
 gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *move,
-						 bool broadcast, int nkeys, const AttrNumber *keyatts)
+						 bool broadcast, int nkeys, const AttrNumber *keyatts,
+							 const Bitmapset *needed,
+							 bool default_collation)
 {
 	RangeTblEntry *rte = rt_fetch(move->rti, remote->rtable);
 	Relation	rel;
@@ -859,17 +861,24 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 			table_close(rel, AccessShareLock);
 			return false;
 		}
-		appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
-						 quote_identifier(NameStr(att->attname)));
+		if (needed != NULL && !bms_is_member(att->attnum, needed))
+			appendStringInfo(&cols, "%sNULL AS %s", cols.len > 0 ? ", " : "",
+							 quote_identifier(NameStr(att->attname)));
+		else
+			appendStringInfo(&cols, "%s%s", cols.len > 0 ? ", " : "",
+							 quote_identifier(NameStr(att->attname)));
 		coltypes = lappend_oid(coltypes, att->atttypid);
 		coltypmods = lappend_int(coltypmods, att->atttypmod);
 		colnames = lappend(colnames, makeString(pstrdup(NameStr(att->attname))));
 		colcolls = lappend_oid(colcolls, att->attcollation);
 	}
 	for (int i = 0; i < nkeys; i++)
-		appendStringInfo(&keys, "%s%s", keys.len > 0 ? ", " : "",
+		appendStringInfo(&keys, "%s%s%s", keys.len > 0 ? ", " : "",
 						 quote_identifier(NameStr(TupleDescAttr(tupdesc,
-																keyatts[i] - 1)->attname)));
+																keyatts[i] - 1)->attname)),
+						 default_collation &&
+						 TupleDescAttr(tupdesc, keyatts[i] - 1)->attcollation != InvalidOid ?
+						 " COLLATE pg_catalog.default" : "");
 
 	if (broadcast)
 	{
@@ -924,7 +933,8 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
 						 bool broadcast)
 {
 	return gp_slice_redistribute_rte_keys(remote, stay, move, broadcast,
-										 move->policy.nkeys, move->policy.keys);
+										 move->policy.nkeys, move->policy.keys, NULL,
+										 false);
 }
 
 /* Whether gp.bucket() can hash a grouping column of this type */
@@ -1023,10 +1033,152 @@ gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 		keyatts[i] = var->varattno;
 	}
 	if (!gp_slice_redistribute_rte_keys(original, table, table, false,
-										agg->numCols, keyatts))
+										agg->numCols, keyatts, NULL, false))
 		return false;
 	*motion = true;
 	return true;
+}
+
+/*
+ * Rewrite the source of INSERT INTO a hashed table SELECT direct columns of
+ * one hashed table into a pull by the target's distribution key.  Every
+ * segment then inserts only the rows that belong to it.  Expressions and
+ * defaults stay on the coordinator: functions and sequences must keep their
+ * current meaning, and peer connections cannot see earlier writes
+ */
+bool
+gp_slice_insert_motion(Query *parse)
+{
+	RangeTblEntry *target;
+	RangeTblEntry *source;
+	RangeTblRef *ref;
+	Relation	target_rel;
+	Relation	source_rel;
+	Query	   *motion_query = parse;
+	Index		outer_rti;
+	GpJoinTable stay = {0};
+	GpJoinTable move = {0};
+	AttrNumber *keyatts;
+	AttrNumber *sourceatts;
+	Bitmapset  *needed = NULL;
+	int			natts;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_INSERT ||
+		gp_dispatch_in_xact())
+		return false;
+	if (parse->resultRelation <= 0 || parse->hasSubLinks ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasTargetSRFs ||
+		parse->hasRowSecurity || parse->setOperations != NULL ||
+		parse->cteList != NIL || parse->groupClause != NIL ||
+		parse->groupingSets != NIL || parse->distinctClause != NIL ||
+		parse->sortClause != NIL || parse->limitCount != NULL ||
+		parse->limitOffset != NULL || parse->rowMarks != NIL)
+		return false;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
+		parse->jointree->quals != NULL)
+		return false;
+
+	target = rt_fetch(parse->resultRelation, parse->rtable);
+	if (target->rtekind != RTE_RELATION ||
+		!gp_policy_get(target->relid, &stay.policy))
+		return false;
+	if (stay.policy.replicated)
+		return false;
+	stay.rti = parse->resultRelation;
+	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
+	outer_rti = ref->rtindex;
+	source = rt_fetch(outer_rti, parse->rtable);
+	if (source->rtekind == RTE_SUBQUERY)
+	{
+		motion_query = source->subquery;
+		if (motion_query == NULL || motion_query->hasSubLinks ||
+			motion_query->hasAggs || motion_query->hasWindowFuncs ||
+			motion_query->hasTargetSRFs || motion_query->hasRowSecurity ||
+			motion_query->setOperations != NULL || motion_query->cteList != NIL ||
+			motion_query->groupClause != NIL || motion_query->groupingSets != NIL ||
+			motion_query->distinctClause != NIL || motion_query->sortClause != NIL ||
+			motion_query->limitCount != NULL || motion_query->limitOffset != NULL ||
+			motion_query->rowMarks != NIL)
+			return false;
+		if (!IsA(motion_query->jointree, FromExpr) ||
+			list_length(motion_query->jointree->fromlist) != 1 ||
+			!IsA(linitial(motion_query->jointree->fromlist), RangeTblRef) ||
+			motion_query->jointree->quals != NULL)
+			return false;
+		ref = linitial_node(RangeTblRef, motion_query->jointree->fromlist);
+		source = rt_fetch(ref->rtindex, motion_query->rtable);
+	}
+	if (source->rtekind != RTE_RELATION ||
+		!gp_policy_get(source->relid, &move.policy) || move.policy.replicated)
+		return false;
+	move.rti = ref->rtindex;
+
+	target_rel = table_open(target->relid, AccessShareLock);
+	source_rel = table_open(source->relid, AccessShareLock);
+	natts = RelationGetDescr(target_rel)->natts;
+	if (list_length(parse->targetList) != natts)
+		goto unsupported;
+	keyatts = palloc_array(AttrNumber, stay.policy.nkeys);
+	sourceatts = palloc_array(AttrNumber, natts);
+	if (motion_query != parse)
+	{
+		foreach_node(TargetEntry, inner_tle, motion_query->targetList)
+		{
+			Var		   *inner_var;
+
+			if (inner_tle->resjunk || !IsA(inner_tle->expr, Var))
+				goto unsupported;
+			inner_var = (Var *) inner_tle->expr;
+			if (inner_var->varno != move.rti || inner_var->varattno <= 0)
+				goto unsupported;
+		}
+	}
+	for (int attno = 1; attno <= natts; attno++)
+	{
+		TargetEntry *tle = get_tle_by_resno(parse->targetList, attno);
+		Var		   *var;
+
+		if (tle == NULL || tle->resjunk || !IsA(tle->expr, Var))
+			goto unsupported;
+		var = (Var *) tle->expr;
+		if (var->varno != outer_rti || var->varattno <= 0)
+			goto unsupported;
+		sourceatts[attno - 1] = var->varattno;
+		if (motion_query != parse)
+		{
+			TargetEntry *inner_tle = get_tle_by_resno(motion_query->targetList,
+													  var->varattno);
+			Var		   *inner_var;
+
+			if (inner_tle == NULL || inner_tle->resjunk ||
+				!IsA(inner_tle->expr, Var))
+				goto unsupported;
+			inner_var = (Var *) inner_tle->expr;
+			if (inner_var->varno != move.rti || inner_var->varattno <= 0)
+				goto unsupported;
+			sourceatts[attno - 1] = inner_var->varattno;
+		}
+		needed = bms_add_member(needed, sourceatts[attno - 1]);
+	}
+	for (int i = 0; i < stay.policy.nkeys; i++)
+	{
+		if (get_atttype(target->relid, stay.policy.keys[i]) !=
+			get_atttype(source->relid, sourceatts[stay.policy.keys[i] - 1]))
+			goto unsupported;
+		keyatts[i] = sourceatts[stay.policy.keys[i] - 1];
+	}
+	table_close(target_rel, AccessShareLock);
+	table_close(source_rel, AccessShareLock);
+
+	return gp_slice_redistribute_rte_keys(motion_query, &stay, &move, false,
+										  stay.policy.nkeys, keyatts, needed, true);
+
+unsupported:
+	table_close(target_rel, AccessShareLock);
+	table_close(source_rel, AccessShareLock);
+	return false;
 }
 
 /*
