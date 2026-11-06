@@ -1,10 +1,10 @@
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
-# A join of two hashed tables of different colocation groups, joined by the
-# whole key of both, moves the rows of one table: an inner join redistributes
-# them by the key, an outer join broadcasts its null-supplying side, and a
-# full join broadcasts both sides and runs on one segment
+# Inner joins of hashed tables of different colocation groups, connected by
+# the whole keys, move every table of another group by the map of the first.
+# An outer join of two tables broadcasts its null-supplying side, and a full
+# join broadcasts both sides and runs on one segment
 
 use strict;
 use warnings FATAL => 'all';
@@ -50,8 +50,14 @@ run('CREATE TABLE t1 (a int, b text)');
 run("SELECT gp.distribute('t1', ARRAY['a'])");
 run('CREATE TABLE t2 (a int, c text)');
 run("SELECT gp.distribute('t2', ARRAY['a'])");
+run('CREATE TABLE t3 (a int, d text)');
+run("SELECT gp.distribute('t3', ARRAY['a'])");
+run('CREATE TABLE t4 (a int, e text)');
+run("SELECT gp.distribute('t4', ARRAY['a'], colocate_with => 't1')");
 run("INSERT INTO t1 SELECT g, 'b' || g FROM generate_series(1, 100) g");
 run("INSERT INTO t2 SELECT g, 'c' || g FROM generate_series(41, 120) g");
+run("INSERT INTO t3 SELECT g, 'd' || g FROM generate_series(61, 140) g");
+run("INSERT INTO t4 SELECT g, 'e' || g FROM generate_series(81, 160) g");
 run("INSERT INTO t1 VALUES (NULL, 'bnull1'), (NULL, 'bnull2')");
 run("INSERT INTO t2 VALUES (NULL, 'cnull1'), (NULL, 'cnull2')");
 
@@ -71,9 +77,25 @@ WHERE p.relid = 't2'::regclass
 SQL
 run("SELECT gp.policy_changed('t2')");
 
+# t3 has a third map, turned by two buckets; t4 stays with t1
+run(<<'SQL');
+INSERT INTO gp.colocation_groups (key_types, nbuckets, map)
+SELECT key_types, nbuckets,
+       (SELECT array_agg(map[((i + 1) % 1024) + 1] ORDER BY i) FROM generate_series(1, 1024) i)
+FROM gp.colocation_groups WHERE colocation_id = 1
+SQL
+run(<<'SQL');
+UPDATE gp.distribution_policy p
+SET colocation_id = (SELECT max(colocation_id) FROM gp.colocation_groups)
+WHERE p.relid = 't3'::regclass
+SQL
+run("SELECT gp.policy_changed('t3')");
+
 # The same rows in tables of the coordinator, to compare the answers with
 run('CREATE TABLE l1 AS SELECT * FROM t1');
 run('CREATE TABLE l2 AS SELECT * FROM t2');
+run('CREATE TABLE l3 AS SELECT * FROM t3');
+run('CREATE TABLE l4 AS SELECT * FROM t4');
 
 like(plan_for('SELECT t1.a, t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'a join of two colocation groups moves one table');
@@ -91,6 +113,23 @@ unlike(plan_for('SELECT t2.a, count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP
 unlike(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t2.a) s'),
 	qr/GpSlice/,
 	'the null group of a subquery stays on the coordinator too');
+like(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a'),
+	qr/GpSlice/, 'a three-way join moves two tables');
+like(plan_for('SELECT t1.a, t2.c, t3.d FROM t3 JOIN t2 ON t3.a = t2.a JOIN t1 ON t2.a = t1.a'),
+	qr/GpSlice/, 'the last table can stay while the first two move');
+like(plan_for('SELECT a FROM (SELECT t3.a AS a FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a GROUP BY t3.a) s'),
+	qr/GpSlice/, 'a three-way join moves inside a subquery too');
+unlike(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a CROSS JOIN t3'),
+	qr/GpSlice/, 'a disconnected join graph stays on the coordinator');
+like(plan_for('SELECT t1.a, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a JOIN t4 ON t1.a = t4.a'),
+	qr/GpSlice/, 'a four-way join moves only the other colocation groups');
+unlike(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t2.a = t3.a) ON t1.a = t2.a'),
+	qr/GpSlice/, 'an outer join of three tables stays on the coordinator');
+foreach my $jointype (qw(LEFT RIGHT FULL))
+{
+	unlike(plan_for("SELECT t1.a, t2.c, t3.d FROM (t1 $jointype JOIN t2 ON t1.a = t2.a) JOIN t3 ON t2.a = t3.a"),
+		qr/GpSlice/, "a nested $jointype join stays on the coordinator");
+}
 
 # Execute the ordered queries through hash joins too: a merge join answers
 # their ORDER BY itself and deliberately stays on the coordinator
@@ -124,6 +163,26 @@ foreach my $query (@queries)
 	$local =~ s/\bt1\b/l1/g;
 	$local =~ s/\bt2\b/l2/g;
 	is(run($query), run($local), "the same answer as on the coordinator: $query");
+}
+
+my @nway_queries = (
+	'SELECT t1.a, t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a ORDER BY t1.a',
+	'SELECT t1.a, t1.b, t2.c, t3.d FROM t3 JOIN t2 ON t3.a = t2.a JOIN t1 ON t2.a = t1.a ORDER BY t1.a',
+	'SELECT t1.a, t1.b, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a JOIN t4 ON t1.a = t4.a ORDER BY t1.a',
+	'SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a WHERE t3.d > \'d130\' ORDER BY t1.a LIMIT 5',
+	'SELECT t2.a, count(*) FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a GROUP BY t2.a ORDER BY t2.a',
+	'SELECT a FROM (SELECT t3.a AS a FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a GROUP BY t3.a) s ORDER BY a',
+	'SELECT t1.a, t1.b, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t2.a = t3.a) ON t1.a = t2.a ORDER BY t1.a, t1.b, t2.c, t3.d',
+	'SELECT t1.a, t1.b, t2.c, t3.d FROM (t1 LEFT JOIN t2 ON t1.a = t2.a) JOIN t3 ON t2.a = t3.a ORDER BY t1.a, t1.b, t2.c, t3.d',
+);
+foreach my $query (@nway_queries)
+{
+	my $local = $query;
+	$local =~ s/\bt1\b/l1/g;
+	$local =~ s/\bt2\b/l2/g;
+	$local =~ s/\bt3\b/l3/g;
+	$local =~ s/\bt4\b/l4/g;
+	is(run($query), run($local), "the same N-way answer as on the coordinator: $query");
 }
 
 # Autonomous motion connections cannot see the writes of this transaction.

@@ -610,7 +610,7 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 	List	   *connected = NIL;
 	List	   *pending = NIL;
 
-	/* Policies, and one colocation group for all hashed tables */
+	/* Policies of every table, even when their colocation groups differ */
 	foreach(lc, tables)
 	{
 		GpJoinTable *table = lfirst(lc);
@@ -619,6 +619,13 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 		if (rte->rtekind != RTE_RELATION ||
 			!gp_policy_get(rte->relid, &table->policy))
 			return false;
+	}
+
+	/* One colocation group for all hashed tables, if they are colocated */
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
 		if (table->policy.replicated)
 			continue;
 		any_hash = true;
@@ -691,62 +698,134 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 }
 
 /*
- * Whether the join is of two hashed tables of different colocation groups,
- * joined by the whole key of both: the rows of one table can move, placed
- * by the hash of the join key under the map of the other, and every row
- * meets its partners on one segment.  The table that stays and the table
- * that moves are returned
+ * Whether an inner join of hashed tables of different colocation groups is
+ * connected by the whole keys of all of them.  The first table stays; every
+ * table of another group moves by the hash of its key under its map.  The
+ * connected join graph proves that every row meets all its partners on one
+ * segment, even when the key equalities form a chain rather than name the
+ * first table directly.  The table that stays and the tables that move are
+ * returned
  */
 static bool
 gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
-							  GpJoinTable **stay, GpJoinTable **move)
+							  GpJoinTable **stay, List **moves)
 {
-	GpJoinTable *t1;
-	GpJoinTable *t2;
+	GpJoinTable *first;
+	Relation	rel1;
+	List	   *connected;
+	List	   *pending = NIL;
+	ListCell   *lc;
+	int			nkeys;
+	bool		any_move = false;
 
-	if (list_length(tables) != 2)
+	*moves = NIL;
+	if (list_length(tables) < 2)
 		return false;
-	t1 = linitial(tables);
-	t2 = lsecond(tables);
-	if (t1->policy.replicated || t2->policy.replicated ||
-		t1->policy.colocation_id == 0 ||
-		t1->policy.colocation_id == t2->policy.colocation_id ||
-		t1->policy.nkeys != t2->policy.nkeys)
+	first = linitial(tables);
+	if (first->policy.replicated || first->policy.colocation_id == 0 ||
+		first->policy.nkeys == 0)
+		return false;
+	nkeys = first->policy.nkeys;
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (table->policy.replicated || table->policy.colocation_id == 0 ||
+			table->policy.nkeys != nkeys)
+			return false;
+		if (table != first)
+		{
+			pending = lappend(pending, table);
+			if (table->policy.colocation_id != first->policy.colocation_id)
+				any_move = true;
+		}
+	}
+	if (!any_move)
 		return false;
 
 	/* The key columns must hash to one place, so they are of one type */
+	rel1 = table_open(rt_fetch(first->rti, parse->rtable)->relid,
+					  AccessShareLock);
+	foreach(lc, pending)
 	{
-		RangeTblEntry *rte1 = rt_fetch(t1->rti, parse->rtable);
-		RangeTblEntry *rte2 = rt_fetch(t2->rti, parse->rtable);
-		Relation	rel1 = table_open(rte1->relid, AccessShareLock);
-		Relation	rel2 = table_open(rte2->relid, AccessShareLock);
+		GpJoinTable *table = lfirst(lc);
+		Relation	rel2 = table_open(rt_fetch(table->rti, parse->rtable)->relid,
+									AccessShareLock);
 		bool		ok = true;
 
-		for (int i = 0; i < t1->policy.nkeys; i++)
+		for (int i = 0; i < nkeys; i++)
 		{
-			if (TupleDescAttr(RelationGetDescr(rel1), t1->policy.keys[i] - 1)->atttypid !=
-				TupleDescAttr(RelationGetDescr(rel2), t2->policy.keys[i] - 1)->atttypid)
+			if (TupleDescAttr(RelationGetDescr(rel1), first->policy.keys[i] - 1)->atttypid !=
+				TupleDescAttr(RelationGetDescr(rel2), table->policy.keys[i] - 1)->atttypid)
 			{
 				ok = false;
 				break;
 			}
 		}
-		table_close(rel1, AccessShareLock);
 		table_close(rel2, AccessShareLock);
 		if (!ok)
+		{
+			table_close(rel1, AccessShareLock);
 			return false;
+		}
 	}
+	table_close(rel1, AccessShareLock);
 
-	for (int i = 0; i < t1->policy.nkeys; i++)
+	/* Grow the connected set by key pairs, regardless of colocation group */
+	connected = list_make1(first);
+	for (;;)
 	{
-		if (!gp_slice_join_pair_list(conds, t1->rti, t2->rti,
-									 t1->policy.keys[i],
-									 t2->policy.keys[i]))
-			return false;
+		bool		grew = false;
+		ListCell   *lp;
+
+		foreach(lp, pending)
+		{
+			GpJoinTable *table = lfirst(lp);
+			ListCell   *lu;
+
+			foreach(lu, connected)
+			{
+				GpJoinTable *other = lfirst(lu);
+				bool		all_keys = true;
+
+				for (int i = 0; i < nkeys; i++)
+				{
+					if (!gp_slice_join_pair_list(conds, table->rti, other->rti,
+											 table->policy.keys[i],
+											 other->policy.keys[i]))
+					{
+						all_keys = false;
+						break;
+					}
+				}
+				if (all_keys)
+				{
+					connected = lappend(connected, table);
+					pending = list_delete(pending, table);
+					grew = true;
+					break;
+				}
+			}
+			if (grew)
+				break;
+		}
+		if (!grew)
+		{
+			if (pending != NIL)
+				return false;
+			break;
+		}
 	}
 
-	*stay = t1;
-	*move = t2;
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (table->policy.colocation_id != first->policy.colocation_id)
+			*moves = lappend(*moves, table);
+	}
+	*stay = first;
 	return true;
 }
 
@@ -877,11 +956,30 @@ gp_slice_redistribute_rte(Query *remote, GpJoinTable *stay, GpJoinTable *move,
 }
 
 /*
- * Move the sides of a join of two colocation groups.  An inner join moves
- * the second table by the hash of the key under the map of the first.  An
- * outer join broadcasts its null-supplying side instead.  A full join
- * broadcasts both sides and runs on one segment, as either side can have an
- * unmatched row
+ * Whether every join of the tree is inner.  An outer join below an inner
+ * root also makes an N-way motion unsafe
+ */
+static bool
+gp_slice_join_all_inner(Node *node)
+{
+	JoinExpr   *join;
+
+	if (IsA(node, RangeTblRef))
+		return true;
+	if (!IsA(node, JoinExpr))
+		return false;
+	join = (JoinExpr *) node;
+	return join->jointype == JOIN_INNER &&
+		gp_slice_join_all_inner(join->larg) &&
+		gp_slice_join_all_inner(join->rarg);
+}
+
+/*
+ * Move the sides of a join of colocation groups.  An inner join moves every
+ * table of another group by the hash of its key under the map of the first.
+ * An outer join of two tables broadcasts its null-supplying side instead.  A
+ * full join broadcasts both sides and runs on one segment, as either side can
+ * have an unmatched row
  */
 static bool
 gp_slice_join_motion(Query *original, List *tables, List *conds,
@@ -889,27 +987,39 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 {
 	GpJoinTable *stay;
 	GpJoinTable *move;
+	List	   *moves;
+	ListCell   *lc;
 	JoinType	jointype;
 
 	*single_segment = false;
-	if (!gp_slice_join_redistributable(original, tables, conds, &stay, &move))
+	if (!gp_slice_join_redistributable(original, tables, conds, &stay, &moves))
 		return false;
 	jointype = gp_slice_join_type_of(original);
+	if (list_length(tables) != 2 &&
+		!gp_slice_join_all_inner(linitial(original->jointree->fromlist)))
+		return false;
 	switch (jointype)
 	{
 		case JOIN_INNER:
-			if (!gp_slice_redistribute_rte(original, stay, move, false))
-				return false;
+			foreach(lc, moves)
+			{
+				move = lfirst(lc);
+				if (!gp_slice_redistribute_rte(original, stay, move, false))
+					return false;
+			}
 			break;
 		case JOIN_LEFT:
+			move = linitial(moves);
 			if (!gp_slice_redistribute_rte(original, stay, move, true))
 				return false;
 			break;
 		case JOIN_RIGHT:
+			move = linitial(moves);
 			if (!gp_slice_redistribute_rte(original, move, stay, true))
 				return false;
 			break;
 		case JOIN_FULL:
+			move = linitial(moves);
 			if (!gp_slice_redistribute_rte(original, stay, move, true) ||
 				!gp_slice_redistribute_rte(original, move, stay, true))
 				return false;
@@ -1066,11 +1176,11 @@ gp_slice_join_query(Query *parse)
 	if (!gp_slice_join_colocated(parse, tables, conds))
 	{
 		GpJoinTable *stay;
-		GpJoinTable *move;
+		List	   *moves;
 
 		if (gp_dispatch_in_xact() ||
 			!gp_slice_join_redistributable(parse, tables, conds,
-										   &stay, &move))
+										   &stay, &moves))
 			return NULL;
 	}
 
@@ -1203,12 +1313,13 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 		if (!gp_slice_join_colocated(subquery, tables, conds))
 		{
 			GpJoinTable *stay;
-			GpJoinTable *move;
+			List	   *moves;
 
 			/* Both sides of a full join are broadcast to one segment */
-			return gp_slice_join_type_of(subquery) == JOIN_FULL &&
+			return list_length(tables) == 2 &&
+				gp_slice_join_type_of(subquery) == JOIN_FULL &&
 				gp_slice_join_redistributable(subquery, tables, conds,
-											  &stay, &move);
+											  &stay, &moves);
 		}
 		foreach(lc, tables)
 		{
