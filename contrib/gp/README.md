@@ -405,9 +405,12 @@ they need not all name the first table.  The asking is `gp.peer_query()`,
 which runs on a segment, as the user of the query:
 it takes the addresses of the segments from the coordinator at every
 call, so a cluster that changed stays correct, and it tells each segment
-which segment its rows are for by a setting of the connection.  An outer
-join of two tables broadcasts its null-supplying side instead: the right
-side of a left join, and the left side of a right join.  A full join broadcasts both
+which segment its rows are for by a setting of the connection.  When two
+hashed tables have no such colocation, an inner join broadcasts the second
+table instead: its whole copy goes to every segment, so any join condition,
+including an expression or a cross join, works.  An outer join of two tables
+broadcasts its null-supplying side instead: the right side of a left join,
+and the left side of a right join.  A full join broadcasts both
 sides and runs on one segment, because either side can have an unmatched
 row.  The peer connections are autonomous, so they cannot see the writes
 of the transaction that asks.  After a transaction has sent commands to
@@ -420,13 +423,14 @@ plan of such a join is replaced by
 the limit stay on the coordinator, and a merge join that answers the
 `ORDER BY` by itself is left alone.  Inner, left, right and full joins
 are all colocated by the same argument: a row without a partner on its
-segment has no partner anywhere.  A join by another column, an outer
-join of more than two tables, a replicated table in a non-colocated join
-of several groups, and an aggregate over a join whose grouping does not
-cover the key are left to the coordinator.  An aggregate over a colocated join runs on the segments as
+segment has no partner anywhere.  An outer join of more than two tables,
+a replicated table in a non-colocated join of several groups, and an
+aggregate over a join whose grouping does not cover the key are left to
+the coordinator.  An aggregate over a colocated join runs on the segments as
 well, when its grouping covers the key of a hashed table that is not
 null-supplying; a null-supplying key would leave a separate null group
-on every segment.
+on every segment.  A broadcast join allows only the key of its stationary
+table, whose rows are not duplicated across segments.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
 table grouped by the key or redistributed by plain grouping columns, or
@@ -570,7 +574,7 @@ start their own clusters:
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write and dropped-column fallbacks |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
-| `029_redistributed_join.pl` | Inner joins of two and more colocation groups redistribute every table of another group by the whole key; outer joins of two tables broadcast the null-supplying side, and full joins broadcast both sides to one segment; null keys, unmatched rows, aggregates, subqueries, writes in the transaction and dropped columns are checked against the coordinator |
+| `029_redistributed_join.pl` | Inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
