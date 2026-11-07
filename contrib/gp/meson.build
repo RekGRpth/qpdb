@@ -9,6 +9,7 @@ gp_sources = files(
   'gather.c',
   'gp.c',
   'insert.c',
+  'interconnect.c',
   'motion.c',
   'oids.c',
   'recovery.c',

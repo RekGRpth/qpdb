@@ -43,8 +43,12 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
+#include "parser/analyze.h"
+#include "tcop/tcopprot.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
@@ -823,6 +827,27 @@ gp_slice_join_type_of(Query *parse)
 	return ((JoinExpr *) first)->jointype;
 }
 
+/* Plan a fragment with an ordinary scan instead of a gather of its own */
+static PlannedStmt *
+gp_fragment_plan(const char *sql)
+{
+	PlannedStmt *stmt;
+	RawStmt    *raw = linitial(pg_parse_query(sql));
+	Query	   *query = parse_analyze_fixedparams(raw, sql, NULL, 0, NULL);
+	bool		old = gp_gather_fragment(true);
+
+	PG_TRY();
+	{
+		stmt = standard_planner(query, sql, 0, NULL, NULL);
+	}
+	PG_FINALLY();
+	{
+		gp_gather_fragment(old);
+	}
+	PG_END_TRY();
+	return stmt;
+}
+
 /*
  * Rewrite the table that moves into a pull of its rows from every segment:
  * the segment runs the query, and the function asks every segment — itself
@@ -831,7 +856,7 @@ gp_slice_join_type_of(Query *parse)
  * the moving side instead, so that rows with null keys and rows without a
  * partner are kept.  The map of the table that stays goes into the query as
  * an array, and the segment the rows are for comes in a setting of the
- * connection, so the query itself is one for all the segments
+ * connection, so the serialized plan is one for all the segments
  */
 static bool
 gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *move,
@@ -918,7 +943,7 @@ gp_slice_redistribute_rte_keys(Query *remote, GpJoinTable *stay, GpJoinTable *mo
 	peer_query_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
 														  CStringGetDatum("gp.peer_query(text)")));
 	arg = makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
-					PointerGetDatum(cstring_to_text(sql.data)), false, false);
+					PointerGetDatum(cstring_to_text(nodeToString(gp_fragment_plan(sql.data)))), false, false);
 	func = makeNode(FuncExpr);
 	func->funcid = peer_query_oid;
 	func->funcresulttype = RECORDOID;

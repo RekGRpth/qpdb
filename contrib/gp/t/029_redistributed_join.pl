@@ -12,6 +12,9 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use IO::Socket::IP;
+use IO::Socket::UNIX;
+use Socket qw(SOCK_STREAM);
 
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
@@ -267,6 +270,31 @@ foreach my $query (
 	$local =~ s/\bt1\b/l1/g;
 	$local =~ s/\bt2\b/l2/g;
 	is(run($query), run($local), "a dropped column falls back correctly: $query");
+}
+
+# A request without the shared token is not executed
+my $socket;
+if ($segments[0]->host =~ m{^/})
+{
+	$socket = IO::Socket::UNIX->new(
+		Type => SOCK_STREAM,
+		Peer => $segments[0]->host . '/gp_interconnect_' . ($segments[0]->port + 10000) . '.sock');
+}
+else
+{
+	$socket = IO::Socket::IP->new(
+		PeerHost => $segments[0]->host,
+		PeerPort => $segments[0]->port + 10000,
+		Proto => 'tcp',
+		Timeout => 5);
+}
+ok($socket, 'the interconnect accepts a TCP connection');
+if ($socket)
+{
+	print {$socket} 'GPIC0001', pack('N', 1), '0';
+	my $answer = '';
+	$socket->read($answer, 5);
+	is($answer, 'X' . pack('N', 26), 'an invalid token is refused');
 }
 
 $_->stop foreach (@segments, $coordinator);

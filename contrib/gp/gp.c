@@ -24,8 +24,10 @@
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -268,6 +270,8 @@ _PG_init(void)
 	{
 		BackgroundWorker worker = {0};
 
+		gp_interconnect_init();
+
 		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 			BGWORKER_BACKEND_DATABASE_CONNECTION;
 		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -288,12 +292,15 @@ gp_coordinator_conninfo(void)
 }
 
 /*
- * Create the SQL part of the extension on a segment.  Its objects use the
- * local OID range, so they cannot collide with objects of the coordinator
+ * Create the SQL part of the extension on a segment, with the actual OIDs
+ * recorded by the coordinator at its creation
  */
 static void
-gp_segment_extension(void)
+gp_segment_extension(PGconn *conn)
 {
+	PGresult   *res;
+	char	   *oids;
+
 	BackgroundWorkerInitializeConnection(gp_database, NULL, 0);
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -304,15 +311,65 @@ gp_segment_extension(void)
 		ereport(ERROR,
 				errmsg("could not look for extension gp on segment %d",
 					   gp_segment_id));
-	if (SPI_processed == 0 &&
-		(SPI_execute("SET gp.allow_local_ddl = on", false, 0) != SPI_OK_UTILITY ||
-		 SPI_execute("CREATE EXTENSION gp", false, 0) != SPI_OK_UTILITY))
-		ereport(ERROR,
-				errmsg("could not create extension gp on segment %d",
-					   gp_segment_id));
+	if (SPI_processed == 0)
+	{
+		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
+								   0, NULL, NULL, NULL, NULL, 0, 0);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+			ereport(ERROR,
+					errmsg("could not read extension OIDs on the coordinator"));
+		oids = pstrdup(PQgetvalue(res, 0, 0));
+		PQclear(res);
+		if (SPI_execute("SET gp.dispatch_oids_session = on", false, 0) != SPI_OK_UTILITY ||
+			SPI_execute(psprintf("SET gp.dispatch_oids = %s",
+								 quote_literal_cstr(oids)), false, 0) != SPI_OK_UTILITY ||
+			SPI_execute("CREATE EXTENSION gp", false, 0) != SPI_OK_UTILITY)
+			ereport(ERROR,
+					errmsg("could not create extension gp on segment %d",
+						   gp_segment_id));
+	}
 	PopActiveSnapshot();
 	SPI_finish();
 	CommitTransactionCommand();
+}
+
+/* Save the token returned by the coordinator for the interconnect worker */
+static void
+gp_segment_token_save(const char *token)
+{
+	char	   *path = psprintf("%s/gp_interconnect.token", DataDir);
+	char	   *tmp = psprintf("%s/gp_interconnect.token.tmp", DataDir);
+	int			fd = OpenTransientFilePerm(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	int			written = 0;
+
+	if (fd < 0)
+		ereport(ERROR,
+				errmsg("could not create the interconnect token file: %m"));
+	while (written < 64)
+	{
+		ssize_t		n = write(fd, token + written, 64 - written);
+
+		if (n <= 0)
+			ereport(ERROR,
+					errmsg("could not write the interconnect token file: %m"));
+		written += n;
+	}
+	if (fsync(fd) != 0)
+		ereport(ERROR,
+				errmsg("could not sync the interconnect token file: %m"));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				errmsg("could not close the interconnect token file: %m"));
+	if (rename(tmp, path) != 0)
+		ereport(ERROR,
+				errmsg("could not install the interconnect token file: %m"));
+}
+
+/* The address of this segment for other nodes */
+const char *
+gp_host_address(void)
+{
+	return gp_host;
 }
 
 /*
@@ -352,7 +409,7 @@ gp_register_main(Datum main_arg)
 
 	PG_TRY();
 	{
-		gp_segment_extension();
+		gp_segment_extension(conn);
 	}
 	PG_CATCH();
 	{
@@ -378,6 +435,24 @@ gp_register_main(Datum main_arg)
 		libpqsrv_disconnect(conn);
 		proc_exit(1);
 	}
+
+	PG_TRY();
+	{
+		if (PQntuples(res) != 1)
+			ereport(ERROR,
+					errmsg("the coordinator returned no interconnect token"));
+		gp_segment_token_save(PQgetvalue(res, 0, 0));
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		AbortCurrentTransaction();
+		FlushErrorState();
+		PQclear(res);
+		libpqsrv_disconnect(conn);
+		proc_exit(1);
+	}
+	PG_END_TRY();
 
 	PQclear(res);
 	libpqsrv_disconnect(conn);
