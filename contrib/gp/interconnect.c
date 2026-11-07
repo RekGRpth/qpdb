@@ -41,6 +41,7 @@
 #include "storage/lmgr.h"
 #include "tcop/dest.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -348,6 +349,9 @@ gp_ic_unix_path(const char *host, int port, struct sockaddr_un *addr)
 {
 	MemSet(addr, 0, sizeof(*addr));
 	addr->sun_family = AF_UNIX;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+	addr->sun_len = sizeof(*addr);
+#endif
 	if (snprintf(addr->sun_path, sizeof(addr->sun_path),
 				 "%s/gp_interconnect_%d.sock", host, port) >= sizeof(addr->sun_path))
 		ereport(ERROR,
@@ -364,6 +368,7 @@ gp_interconnect_main(Datum main_arg)
 	pgsocket listener = PGINVALID_SOCKET;
 	char		port[12];
 	char	   *token;
+	uint32		wait_event;
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -373,7 +378,10 @@ gp_interconnect_main(Datum main_arg)
 	{
 		token = gp_interconnect_token();
 		if (token == NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
 			pg_usleep(1000000);
+		}
 	}
 	if (token == NULL)
 	{
@@ -386,7 +394,7 @@ gp_interconnect_main(Datum main_arg)
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
-	if (gp_host_address()[0] == '/')
+	if (is_absolute_path(gp_host_address()))
 	{
 		struct sockaddr_un addr;
 
@@ -434,13 +442,32 @@ gp_interconnect_main(Datum main_arg)
 		proc_exit(1);
 	}
 
+	if (!pg_set_noblock(listener))
+	{
+		ereport(LOG,
+				errmsg("could not make the interconnect listener nonblocking"));
+		proc_exit(1);
+	}
+	wait_event = WaitEventExtensionNew("GpInterconnect");
+
 	for (;;)
 	{
-		pgsocket fd = accept(listener, NULL, NULL);
+		long		rc;
+
+		ResetLatch(MyLatch);
+		rc = WaitLatch(MyLatch,
+								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+								   1000, wait_event);
+		pgsocket	fd;
+
+		if (rc & WL_EXIT_ON_PM_DEATH)
+			proc_exit(0);
+		CHECK_FOR_INTERRUPTS();
+		fd = accept(listener, NULL, NULL);
 
 		if (fd == PGINVALID_SOCKET)
 		{
-			if (errno == EINTR)
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			ereport(LOG,
 					errmsg("could not accept an interconnect connection"));
@@ -542,7 +569,7 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 	snprintf(portstr, sizeof(portstr), "%d", port + GP_IC_PORT_OFFSET);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
-	if (host[0] == '/')
+	if (is_absolute_path(host))
 	{
 		struct sockaddr_un addr;
 

@@ -274,7 +274,7 @@ foreach my $query (
 
 # A request without the shared token is not executed
 my $socket;
-if ($segments[0]->host =~ m{^/})
+if ($segments[0]->host =~ m{^/|^[A-Za-z]:[\\/]})
 {
 	$socket = IO::Socket::UNIX->new(
 		Type => SOCK_STREAM,

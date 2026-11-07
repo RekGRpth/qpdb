@@ -436,9 +436,7 @@ gp_extension_oids(PG_FUNCTION_ARGS)
 	snprintf(path, sizeof(path), "%s/gp_extension_oids", DataDir);
 	file = AllocateFile(path, "r");
 	if (file == NULL)
-		ereport(ERROR,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("extension OIDs are not recorded yet"));
+		PG_RETURN_NULL();
 	initStringInfo(&list);
 	while (fgets(buf, sizeof(buf), file) != NULL)
 	{

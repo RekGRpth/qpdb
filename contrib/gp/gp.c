@@ -315,9 +315,22 @@ gp_segment_extension(PGconn *conn)
 	{
 		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
 								   0, NULL, NULL, NULL, NULL, 0, 0);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
-			ereport(ERROR,
-					errmsg("could not read extension OIDs on the coordinator"));
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			PQclear(res);
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+			return;
+		}
+		if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
+		{
+			PQclear(res);
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+			return;
+		}
 		oids = pstrdup(PQgetvalue(res, 0, 0));
 		PQclear(res);
 		if (SPI_execute("SET gp.dispatch_oids_session = on", false, 0) != SPI_OK_UTILITY ||
