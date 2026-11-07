@@ -80,8 +80,8 @@ like(plan_for('SELECT r1.a, r2.e FROM r1 JOIN r2 ON r1.a = r2.a'), qr/GpSlice/,
 	'two replicated tables join on one segment');
 like(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.a = j2.a AND j1.b = j2.c'),
 	qr/GpSlice/, 'a condition on top of the key is a filter, not a redistribution');
-unlike(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.b = j2.c'), qr/GpSlice/,
-	'a join not by the key is not pushed');
+like(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.b = j2.c'), qr/GpSlice/,
+	'a join not by the key is broadcast to the segments');
 like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a'),
 	qr/GpSlice/, 'an aggregate over a colocated join by the key is pushed');
 unlike(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a'),
@@ -112,6 +112,7 @@ my @queries = (
 	'SELECT j1.a, j2.a, j2.c FROM j1 RIGHT JOIN j2 ON j1.a = j2.a ORDER BY j2.a',
 	'SELECT j1.a, j2.a, j1.b, j2.c FROM j1 FULL JOIN j2 ON j1.a = j2.a ORDER BY j1.a, j2.a',
 	'SELECT j1.a, j1.b, j2.c FROM j1 JOIN j2 ON j1.a = j2.a WHERE j1.b > \'b90\' ORDER BY j1.a LIMIT 5',
+	'SELECT j1.a, j1.b, j2.c FROM j1 JOIN j2 ON j1.b = j2.c ORDER BY j1.a, j1.b, j2.c',
 	'SELECT j1.a, r1.d FROM j1 JOIN r1 ON j1.a = r1.a ORDER BY j1.a LIMIT 5',
 	'SELECT r1.a, r2.e FROM r1 JOIN r2 ON r1.a = r2.a ORDER BY r1.a LIMIT 5',
 	'SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a LIMIT 3',

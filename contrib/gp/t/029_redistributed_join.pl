@@ -3,8 +3,9 @@
 
 # Inner joins of hashed tables of different colocation groups, connected by
 # the whole keys, move every table of another group by the map of the first.
-# An outer join of two tables broadcasts its null-supplying side, and a full
-# join broadcasts both sides and runs on one segment
+# Without such a key, a two-table join broadcasts its second table instead.
+# An outer join broadcasts its null-supplying side, and a full join broadcasts
+# both sides and runs on one segment
 
 use strict;
 use warnings FATAL => 'all';
@@ -127,6 +128,22 @@ foreach my $jointype (qw(LEFT RIGHT FULL))
 	unlike(plan_for("SELECT t1.a, t2.c, t3.d FROM (t1 $jointype JOIN t2 ON t1.a = t2.a) JOIN t3 ON t2.a = t3.a"),
 		qr/GpSlice/, "a nested $jointype join stays on the coordinator");
 }
+like(plan_for('SELECT t1.a, t2.c FROM t1 JOIN t2 ON t1.a + 20 = t2.a'),
+	qr/GpSlice/, 'an inner join by another expression broadcasts a table');
+like(plan_for('SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a + 20 = t2.a'),
+	qr/GpSlice/, 'a left join by another expression broadcasts its right side');
+like(plan_for('SELECT t1.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a + 20 = t2.a'),
+	qr/GpSlice/, 'a right join by another expression broadcasts its left side');
+like(plan_for('SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a + 20 = t2.a'),
+	qr/GpSlice/, 'a full join by another expression broadcasts both sides');
+like(plan_for('SELECT t1.a, t2.c FROM t1 CROSS JOIN t2'),
+	qr/GpSlice/, 'a cross join broadcasts a table too');
+like(plan_for('SELECT a FROM (SELECT t1.a AS a FROM t1 FULL JOIN t2 ON t1.a + 20 = t2.a GROUP BY t1.a) s'),
+	qr/GpSlice/, 'a full join by another expression moves inside a subquery');
+unlike(plan_for('SELECT t2.a, count(*) FROM t1 CROSS JOIN t2 GROUP BY t2.a'),
+	qr/GpSlice/, 'an aggregate by the broadcast side stays on the coordinator');
+unlike(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 JOIN t2 ON t1.a + 20 = t2.a GROUP BY t2.a) s'),
+	qr/GpSlice/, 'a broadcast-side aggregate in a subquery stays too');
 
 # Execute the ordered queries through hash joins too: a merge join answers
 # their ORDER BY itself and deliberately stays on the coordinator
@@ -153,6 +170,16 @@ my @queries = (
 	'SELECT a, n FROM (SELECT t1.a AS a, count(t2.c) AS n FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t1.a) s ORDER BY a',
 	'SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t2.a) s ORDER BY a',
 	'SELECT a, n FROM (SELECT t1.a AS a, count(t2.c) AS n FROM t1 FULL JOIN t2 ON t1.a = t2.a GROUP BY t1.a) s ORDER BY a',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t1 JOIN t2 ON t1.a + 20 = t2.a ORDER BY t1.a, t2.a',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t2 JOIN t1 ON t2.a = t1.a + 20 ORDER BY t1.a, t2.a',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a + 20 = t2.a ORDER BY t1.a, t1.b, t2.a, t2.c',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a + 20 = t2.a ORDER BY t2.a, t2.c, t1.a, t1.b',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t1 FULL JOIN t2 ON t1.a + 20 = t2.a ORDER BY t1.a, t1.b, t2.a, t2.c',
+	'SELECT t1.a, count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a + 20 = t2.a GROUP BY t1.a ORDER BY t1.a',
+	'SELECT t2.a, count(*) FROM t1 CROSS JOIN t2 GROUP BY t2.a ORDER BY t2.a',
+	'SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 JOIN t2 ON t1.a + 20 = t2.a GROUP BY t2.a) s ORDER BY a',
+	'SELECT a FROM (SELECT t1.a AS a FROM t1 FULL JOIN t2 ON t1.a + 20 = t2.a GROUP BY t1.a) s ORDER BY a',
+	'SELECT t1.a, t1.b, t2.a, t2.c FROM t1 CROSS JOIN t2 WHERE t1.a + 20 = t2.a ORDER BY t1.a, t2.a',
 );
 foreach my $query (@queries)
 {
