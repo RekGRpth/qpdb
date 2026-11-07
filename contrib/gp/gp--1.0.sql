@@ -19,6 +19,14 @@ CREATE TABLE gp.segments (
 
 SELECT pg_catalog.pg_extension_config_dump('gp.segments', '');
 
+-- A shared secret of interconnect connections, returned to a segment when it
+-- registers.  It is not readable by ordinary users.
+CREATE TABLE gp.interconnect_secret (
+	singleton bool PRIMARY KEY DEFAULT true CHECK (singleton),
+	token bytea NOT NULL
+);
+REVOKE ALL ON gp.interconnect_secret FROM PUBLIC;
+
 -- The coordinator keeps a copy of gp.segments in shared memory, for any
 -- database.  A transaction that changes the table updates the copy when it
 -- commits.
@@ -38,16 +46,24 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_cluster_segments'
 LANGUAGE C STRICT;
 
+-- Generate a new cluster token; only the first one is kept
+CREATE FUNCTION gp.interconnect_secret()
+RETURNS text
+AS 'MODULE_PATHNAME', 'gp_interconnect_secret'
+LANGUAGE C VOLATILE;
+REVOKE ALL ON FUNCTION gp.interconnect_secret() FROM PUBLIC;
+
 -- Register a segment, or confirm the registration of a known one.  A
 -- segment keeps its number and address: a number registered at another
 -- address, or an address registered under another number, is an error.
 CREATE FUNCTION gp.register_segment(segment_id int, host text, port int)
-RETURNS void
+RETURNS text
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	known gp.segments;
+	secret text;
 BEGIN
 	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
 		RAISE EXCEPTION 'segments register on the coordinator only';
@@ -59,6 +75,10 @@ BEGIN
 
 	-- Registrations come one at a time, so the checks below hold
 	LOCK TABLE gp.segments IN SHARE ROW EXCLUSIVE MODE;
+	INSERT INTO gp.interconnect_secret
+	SELECT true, decode(gp.interconnect_secret(), 'hex')
+	ON CONFLICT (singleton) DO NOTHING;
+	SELECT encode(token, 'hex') INTO secret FROM gp.interconnect_secret;
 
 	SELECT * INTO known FROM gp.segments s
 	WHERE s.segment_id = register_segment.segment_id;
@@ -70,7 +90,7 @@ BEGIN
 		END IF;
 		UPDATE gp.segments s SET registered = now()
 		WHERE s.segment_id = register_segment.segment_id;
-		RETURN;
+		RETURN secret;
 	END IF;
 
 	SELECT * INTO known FROM gp.segments s
@@ -90,6 +110,7 @@ BEGIN
 	INSERT INTO gp.segments (segment_id, host, port)
 	VALUES (register_segment.segment_id, register_segment.host,
 			register_segment.port);
+	RETURN secret;
 END
 $$;
 
@@ -112,6 +133,13 @@ CREATE FUNCTION gp.recorded_oids()
 RETURNS text
 AS 'MODULE_PATHNAME', 'gp_recorded_oids'
 LANGUAGE C STRICT;
+
+-- The actual creation OIDs of this extension, for a segment that registers
+CREATE FUNCTION gp.extension_oids()
+RETURNS text
+AS 'MODULE_PATHNAME', 'gp_extension_oids'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION gp.extension_oids() FROM PUBLIC;
 
 -- Colocation groups: tables of a group have keys of the same types and the
 -- same number of buckets, so rows with equal keys are on the same segment

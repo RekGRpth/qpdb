@@ -10,6 +10,7 @@ OBJS = \
 	gather.o \
 	gp.o \
 	insert.o \
+	interconnect.o \
 	motion.o \
 	oids.o \
 	recovery.o \

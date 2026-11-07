@@ -370,6 +370,34 @@ The policy of a table is read once, by a session, from `gp.distribution_policy`,
 and kept; `gp.distribute()` and the drop of a table invalidate it through
 the relcache entry of the table, and a change of an extension drops it.
 
+### Interconnect (`interconnect.c`, `motion.c`)
+
+`gp.peer_query()` receives a serialized `PlannedStmt`, not SQL text.  While
+the coordinator builds that fragment, `GpGather` is disabled so that the
+fragment contains an ordinary scan.  A `gp interconnect` worker on each
+segment listens on `PostPortNumber + 10000`.  A request names the database,
+user, receiving segment and plan; the worker authenticates it with the
+cluster token, deserializes the plan, locks the range table and runs the
+executor.  It returns binary tuples followed by EOS, or an error message.
+Closing a connection cancels the query.  The receiver materializes the rows,
+so a writer never waits for a reader of another motion while blocked on this
+one.  The lock of the distributed snapshot is held until the first answer,
+as for the gather.
+
+At the first registration the coordinator generates a 32-byte token and
+returns it as hex.  The segment stores it in `gp_interconnect.token` in its
+data directory with mode 0600.  Ordinary users cannot read the coordinator's
+`gp.interconnect_secret` table.  The token protects the endpoint; it is not a
+replacement for the distributed transaction.  Motion is still refused after
+a write in the current transaction because the peer execution has no shared
+snapshot with it.
+
+The actual OIDs of `gp` are saved by `CREATE EXTENSION` in the coordinator's
+data directory.  `gp.extension_oids()` returns them to a registering segment,
+which creates its copy with exactly those OIDs, so a serialized plan can
+call its functions.  Local maintenance objects can use the separate high
+OID range instead.
+
 ### Aggregates and joins on the segments (`slice.c`)
 
 When a query groups by the whole key of the distribution, every row of a

@@ -6,7 +6,9 @@
  * A query that joins tables of different colocation groups needs the rows
  * of some of them to move, so that every row meets its partners on one
  * segment.  The movement goes the pull way: every segment, as it runs the
- * query, asks every segment — itself among them — for rows.  An inner join
+ * query, asks every segment — itself among them — for rows.  A fragment is
+ * sent as a serialized PlannedStmt, never as SQL text, and the answer is a
+ * stream of binary tuples.  An inner join
  * either asks for the rows that the hash of the join key places on it, however
  * many tables move, or broadcasts a whole table when there is no such key.  An
  * outer join of two tables broadcasts a whole side instead, keeping rows with
@@ -60,72 +62,6 @@ gp_motion_event(void)
 	if (gp_motion_wait_event == 0)
 		gp_motion_wait_event = WaitEventExtensionNew("GpMotion");
 	return gp_motion_wait_event;
-}
-
-/*
- * Read the rows of one answer into the tuplestore.  The columns of the
- * answer are those the caller says the query returns, in the binary
- * format, which takes every type as it is
- */
-static void
-gp_motion_read(Tuplestorestate *store, TupleDesc tupdesc, PGresult *res,
-			   int segment_id)
-{
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
-	FmgrInfo   *recv = palloc0_array(FmgrInfo, tupdesc->natts);
-	Oid		   *ioparam = palloc_array(Oid, tupdesc->natts);
-	MemoryContext rowcxt;
-	MemoryContext oldcontext;
-
-	if (PQnfields(res) != tupdesc->natts)
-		ereport(ERROR,
-				errcode(ERRCODE_DATA_CORRUPTED),
-				errmsg("segment %d returned %d columns, but the query takes %d",
-					   segment_id, PQnfields(res), tupdesc->natts));
-
-	for (int i = 0; i < tupdesc->natts; i++)
-	{
-		Oid			recvfn;
-
-		getTypeBinaryInputInfo(TupleDescAttr(tupdesc, i)->atttypid,
-							   &recvfn, &ioparam[i]);
-		fmgr_info(recvfn, &recv[i]);
-	}
-
-	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "motion row",
-								   ALLOCSET_DEFAULT_SIZES);
-	for (int row = 0; row < PQntuples(res); row++)
-	{
-		ExecClearTuple(slot);
-		oldcontext = MemoryContextSwitchTo(rowcxt);
-		for (int i = 0; i < tupdesc->natts; i++)
-		{
-			StringInfoData buf;
-
-			slot->tts_isnull[i] = true;
-			slot->tts_values[i] = (Datum) 0;
-			if (PQgetisnull(res, row, i))
-				continue;
-
-			/* libpq ends every value with a zero byte, as the receive functions expect */
-			buf.data = PQgetvalue(res, row, i);
-			buf.len = PQgetlength(res, row, i);
-			buf.maxlen = buf.len + 1;
-			buf.cursor = 0;
-			slot->tts_values[i] = ReceiveFunctionCall(&recv[i], &buf,
-													  ioparam[i],
-													  TupleDescAttr(tupdesc, i)->atttypmod);
-			slot->tts_isnull[i] = false;
-		}
-		MemoryContextSwitchTo(oldcontext);
-		ExecStoreVirtualTuple(slot);
-		tuplestore_puttupleslot(store, slot);
-		MemoryContextReset(rowcxt);
-		CHECK_FOR_INTERRUPTS();
-	}
-
-	MemoryContextDelete(rowcxt);
-	ExecDropSingleTupleTableSlot(slot);
 }
 
 /*
@@ -211,77 +147,12 @@ gp_peer_query(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < PQntuples(segments); i++)
 	{
-		const char *keywords[] = {"host", "port", "dbname", "user",
-			"application_name", NULL};
-		const char *values[5];
-		char		set[64];
-		char	   *host = pstrdup(PQgetvalue(segments, i, 1));
-		char	   *port = pstrdup(PQgetvalue(segments, i, 2));
-		int			segment_id = atoi(PQgetvalue(segments, i, 0));
-		PGconn	   *peer;
-		PGresult   *rows;
+		const char *host = PQgetvalue(segments, i, 1);
+		int			port = atoi(PQgetvalue(segments, i, 2));
+		int			requester = gp_segment_id;
 
-		values[0] = host;
-		values[1] = port;
-		values[2] = db;
-		values[3] = GetUserNameFromId(GetUserId(), false);
-		values[4] = "gp motion";
-
-		peer = libpqsrv_connect_params(keywords, values, false,
-									   gp_motion_event());
-		if (PQstatus(peer) != CONNECTION_OK)
-		{
-			char	   *err = pchomp(PQerrorMessage(peer));
-
-			libpqsrv_disconnect(peer);
-			PQclear(segments);
-			libpqsrv_disconnect(conn);
-			ereport(ERROR,
-					errcode(ERRCODE_CONNECTION_FAILURE),
-					errmsg("could not connect to segment %d at %s:%s",
-						   segment_id, host, port),
-					errdetail("%s", err));
-		}
-
-		/* Tell the segment which segment its rows are for */
-		snprintf(set, sizeof(set), "SET gp.requester_segment = %d",
-				 gp_segment_id);
-		rows = libpqsrv_exec_params(peer, set, 0, NULL, NULL, NULL, NULL, 0,
-									gp_motion_event());
-		if (PQresultStatus(rows) != PGRES_COMMAND_OK)
-		{
-			char	   *err = pchomp(PQresultErrorMessage(rows));
-
-			PQclear(rows);
-			libpqsrv_disconnect(peer);
-			PQclear(segments);
-			libpqsrv_disconnect(conn);
-			ereport(ERROR,
-					errcode(ERRCODE_CONNECTION_FAILURE),
-					errmsg("could not set the receiving segment on segment %d",
-						   segment_id),
-					errdetail("%s", err));
-		}
-		PQclear(rows);
-
-		rows = libpqsrv_exec_params(peer, sql, 0, NULL, NULL, NULL, NULL, 1,
-									gp_motion_event());
-		if (PQresultStatus(rows) != PGRES_TUPLES_OK)
-		{
-			char	   *err = pchomp(PQresultErrorMessage(rows));
-
-			PQclear(rows);
-			libpqsrv_disconnect(peer);
-			PQclear(segments);
-			libpqsrv_disconnect(conn);
-			ereport(ERROR,
-					errcode(ERRCODE_CONNECTION_FAILURE),
-					errmsg("could not read the rows of segment %d", segment_id),
-					errdetail("%s", err));
-		}
-		gp_motion_read(store, tupdesc, rows, segment_id);
-		PQclear(rows);
-		libpqsrv_disconnect(peer);
+		gp_interconnect_query(store, tupdesc, db, GetUserNameFromId(GetUserId(), false),
+							  sql, host, port, requester);
 	}
 
 	PQclear(segments);

@@ -21,6 +21,7 @@
 #include "tcop/cmdtag.h"
 #include "utils/guc.h"
 #include "utils/relcache.h"
+#include "utils/tuplestore.h"
 
 /* Role of the server in the cluster */
 enum
@@ -50,6 +51,7 @@ typedef struct GpSegment
 
 /* GUC variables */
 extern const char *gp_coordinator_conninfo(void);
+extern const char *gp_host_address(void);
 extern int	gp_role;
 extern int	gp_segment_id;
 extern char *gp_database;
@@ -94,6 +96,7 @@ extern void gp_insert_init(void);
 /* gather.c */
 extern void gp_gather_init(void);
 extern bool gp_is_gather(Plan *plan);
+extern bool gp_gather_fragment(bool enable);
 
 /* slice.c */
 extern void gp_slice_init(void);
@@ -104,6 +107,12 @@ extern bool gp_slice_join_plan(Query *original, PlannedStmt *stmt);
 extern void gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt);
 extern void gp_slice_partial_plan(Query *parse, PlannedStmt *stmt);
 extern bool gp_slice_insert_motion(Query *parse);
+
+/* interconnect.c */
+extern void gp_interconnect_init(void);
+extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
+								  const char *db, const char *user, const char *sql,
+								  const char *host, int port, int requester);
 
 /* recovery.c */
 extern void gp_recovery_init(void);
@@ -141,6 +150,7 @@ extern void gp_assign_dispatch_oids(const char *newval, void *extra);
 extern int	gp_oids_mark(void);
 extern void gp_oids_keep(bool keep);
 extern char *gp_oids_since(int mark);
+extern void gp_oids_save_extension(int mark);
 extern bool gp_oids_depend_on_local(int mark);
 
 /* ddl.c */
