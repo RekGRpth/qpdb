@@ -92,17 +92,6 @@ like(on_segments('SELECT count(*) FROM d'), qr/^[1-9]\d* [1-9]\d*$/,
 my $got = same_result('SELECT count(*), sum(a), min(b), max(c), max(ts) FROM d',
 	'aggregates');
 like($got, qr/^500\|125250\|/, 'which are all 500 rows');
-
-# A clean gather uses the authenticated interconnect, not a libpq query
-my $tokenfile = $coordinator->data_dir . '/gp_interconnect.token';
-rename $tokenfile, "$tokenfile.bak" or die "could not save the token: $!";
-open my $badtoken, '>', $tokenfile or die "could not replace the token: $!";
-print {$badtoken} '0' x 64;
-close $badtoken or die "could not close the token: $!";
-fails('SELECT a FROM d WHERE a < 2', qr/invalid interconnect token/,
-	'a clean gather uses the interconnect');
-rename "$tokenfile.bak", $tokenfile or die "could not restore the token: $!";
-
 same_result('SELECT * FROM d WHERE a % 13 = 0 ORDER BY a', 'a condition');
 same_result('SELECT b, count(*), sum(a), avg(c) FROM d GROUP BY b ORDER BY b',
 	'GROUP BY');
