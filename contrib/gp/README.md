@@ -344,27 +344,35 @@ The rows of a distributed table are on the segments, so a query cannot read
 the table on the coordinator.  The hook of the paths of a relation makes
 the only path to a distributed table a custom scan, `GpGather`, and the
 planner plans the rest, the joins, the aggregates, the sorts and the
-windows, on the coordinator as for any table.  `GpGather` sends `SELECT
-columns FROM table` to all segments at once and reads their rows in the
-binary format, which takes every type as it is, into a tuplestore, from which
-the rows go up the plan; a rescan, as in a nested loop, reads them from the
-store again.  The conditions of the query and the projection run on the
-coordinator, so the result is always correct, if not always cheap: all rows
-of the table come, none is chosen on the segments, and the planner does not
-yet know how many that is.  A replicated table has all its rows on every
-segment, so only one of them is asked, by the process number.  A partitioned
-table is read as a whole, the partitions of the coordinator being empty.
-`EXPLAIN (VERBOSE)` shows the query that the segments run.
+windows, on the coordinator as for any table.  A clean `GpGather` serializes
+an ordinary scan of the table and sends that plan to every segment over the
+interconnect.  Their binary rows go into a tuplestore, from which the rows go
+up the plan; a rescan, as in a nested loop, reads them from the store again.
+The conditions of the query and the projection run on the coordinator, so the
+result is always correct, if not always cheap: all rows of the table come,
+none is chosen on the segments, and the planner does not yet know how many
+that is.  A replicated table has all its rows on every segment, so only one of
+them is asked, by the process number.  A partitioned table is read as a whole,
+the partitions of the coordinator being empty.  Dropped columns are typed NULL
+placeholders in the serialized fragment, preserving the table's tuple
+descriptor.  `EXPLAIN (VERBOSE)` shows the query that the segments run.
 
-A segment that the transaction has written to answers in that transaction,
-so it shows what the transaction has written.  The segments answer at their
-own moments, as there is no distributed snapshot yet: a transaction that is
-committing may show on some segments and not on others.  `FOR UPDATE` and
-`TABLESAMPLE` on a distributed table are refused, and so are `UPDATE`,
-`DELETE` and `MERGE` of one, and a data-modifying statement of `WITH` on
-one, which would otherwise change nothing on the coordinator and say
-nothing: they wait for the distributed `DML`.  `TRUNCATE` goes to the
-segments with the other DDL.
+After the transaction has sent a write to the segments, `GpGather` instead
+uses their dispatched libpq connections, which belong to the same transaction
+and therefore see its writes.  RLS tables and `SET ROLE`/SECURITY DEFINER use
+that path too, preserving session settings, `session_user` and `current_user`.
+REPEATABLE READ and SERIALIZABLE require an explicit `BEGIN`/`START
+TRANSACTION` (or `SET TRANSACTION`) before distributed access.  From then
+until `PRE_COMMIT`, a shared lock excludes distributed commits, so a local
+coordinator snapshot and the first remote snapshot cannot drift apart; an
+implicit transaction with that isolation is refused instead.  Remote
+transactions use the same isolation level.  All remote scans of one statement
+share a commit-exclusion lock until `ExecutorEnd`, so a distributed commit is
+visible everywhere or nowhere and cannot appear between two inputs of the
+statement.  A caught subtransaction restores those locks on its abort path.
+READ COMMITTED can use the interconnect.  `FOR UPDATE` and `TABLESAMPLE` on a
+distributed table are refused.  `TRUNCATE` goes to the segments with the other
+DDL.
 
 The policy of a table is read once, by a session, from `gp.distribution_policy`,
 and kept; `gp.distribute()` and the drop of a table invalidate it through
@@ -372,22 +380,32 @@ the relcache entry of the table, and a change of an extension drops it.
 
 ### Interconnect (`interconnect.c`, `motion.c`)
 
-`gp.peer_query()` receives a serialized `PlannedStmt`, not SQL text.  While
-the coordinator builds that fragment, `GpGather` is disabled so that the
-fragment contains an ordinary scan.  A `gp interconnect` worker on each
-segment listens on `PostPortNumber + 10000`.  A request names the database,
-user, receiving segment and plan; the worker authenticates it with the
-cluster token, deserializes the plan, locks the range table and runs the
-executor.  It returns binary tuples followed by EOS, or an error message.
+`gp.peer_query()` and a clean `GpGather` receive a serialized `PlannedStmt`,
+not SQL text.  While the coordinator builds that fragment, `GpGather` is
+disabled so that the fragment contains an ordinary scan.  A `gp interconnect`
+worker on each segment listens on `PostPortNumber + 10000`.  A request names
+the database, user, receiving segment and plan; the worker authenticates it
+with the cluster token, deserializes the plan, locks the range table and runs
+the executor.  It returns binary tuples followed by EOS, or an error message.
 Closing a connection cancels the query.  The receiver materializes the rows,
 so a writer never waits for a reader of another motion while blocked on this
-one.  The lock of the distributed snapshot is held until the first answer,
-as for the gather.
+one.  The listener waits for its socket to become readable, without adding a
+polling delay to every request.  A direct Gather shares the distributed
+commit-exclusion lock with the other remote scans of its statement.
+
+A worker keeps one database and role, including a NOLOGIN effective role.  A
+request for another identity receives RETRY; the worker closes the connection
+and restarts, and Motion reconnects after the new listener is ready.  A Gather
+may use its dispatched libpq connections instead.  The executor starts only
+after a READY/GO handshake.  A transport failure before that confirmation is
+retried, including a connection reset left by the old listener's backlog.  A
+failure after GO is an error, never a retry that could repeat a volatile
+function of the fragment.
 
 At the first registration the coordinator generates a 32-byte token and
-returns it as hex.  The segment stores it in `gp_interconnect.token` in its
-data directory with mode 0600.  Ordinary users cannot read the coordinator's
-`gp.interconnect_secret` table.  The token protects the endpoint; it is not a
+returns it as hex.  The coordinator and the registering segment each store it
+in `gp_interconnect.token` in their data directories with mode 0600.
+Ordinary users cannot read the coordinator's `gp.interconnect_secret` table.  The token protects the endpoint; it is not a
 replacement for the distributed transaction.  Motion is still refused after
 a write in the current transaction because the peer execution has no shared
 snapshot with it.
@@ -639,10 +657,11 @@ by the patch and `contrib/gp`.
    list allowed, the same computation inside a subquery in FROM, and
    aggregates by other columns answered partly on the segments; next is
    the locus model for the rest.
-6. **Interconnect** — in progress: a join of two colocation groups by
-   the whole key moves one table, pulled by every segment from every
-   segment; next are joins of more shapes and a faster transport than a
-   query per segment.
+6. **Interconnect** — in progress: joins move tables by redistribution or
+   broadcast over a serialized-plan transport with binary tuples; clean
+   gathers use the same transport, while a transaction's writes stay on its
+   dispatched connections; next are a `CustomScan Motion` and multiple slices
+   per segment.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
 8. **More kinds of distribution** — replicated with the coordinator, on the

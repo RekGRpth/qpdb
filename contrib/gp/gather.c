@@ -7,19 +7,15 @@
  * segments.  The hook of the paths of a relation puts a custom scan,
  * GpGather, in place of every path to a distributed table; the planner
  * plans the rest, the joins, the aggregates and the sorts, on the
- * coordinator as it would for any table.  GpGather sends `SELECT columns
- * FROM table` to all segments at once and reads their rows in the binary
- * format, which takes every type as it is, into a tuplestore, from which
- * the rows go up the plan.  The conditions of the query and the
- * projection run on the coordinator, so what comes is always correct, if
- * not always cheap.  A replicated table has all its rows on every
- * segment, so only one of them is asked.
+ * coordinator as it would for any table.  GpGather sends a serialized scan to all segments and reads their binary
+ * rows into a tuplestore, from which the rows go up the plan.  The conditions
+ * of the query and the projection run on the coordinator, so what comes is
+ * always correct, if not always cheap.  A replicated table has all its rows on
+ * every segment, so only one of them is asked.
  *
- * A segment that the transaction of the coordinator has written to answers
- * in that transaction, and shows its rows.  Segments answer at their own
- * moments, as there is no distributed snapshot yet: a transaction that is
- * committing may show on some segments and not on others.
- *
+ * A clean read goes over the interconnect under the lock of the distributed
+ * snapshot.  A segment that the transaction of the coordinator has written to
+ * instead answers on its dispatched libpq connection, so it shows those writes.
  * FOR UPDATE and TABLESAMPLE on a distributed table are refused.
  *
  * Copyright (c) 2026, Georgy Shelkovy
@@ -33,6 +29,7 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
@@ -79,6 +76,7 @@ typedef struct GpGatherState
 	CustomScanState css;
 	char	   *sql;
 	bool		replicated;
+	bool		inherit;
 	Tuplestorestate *store;		/* all rows, once read */
 } GpGatherState;
 
@@ -90,11 +88,82 @@ static const CustomScanMethods gp_gather_plan_methods = {
 };
 
 /*
- * Read all rows of the query from the segments into the tuplestore.  The
- * columns of the result are those of the table that are not dropped, in order.
+ * Read a clean query over the interconnect.  Dropped columns are explicit
+ * typed nulls in the fragment, so its answer has the table's full tupledesc.
+ * The statement's commit lock covers every remote scan, including autonomous
+ * listeners that take their own snapshots.
+ */
+static bool
+gp_gather_load_interconnect(GpGatherState *state)
+{
+	ScanState  *ss = &state->css.ss;
+	Relation	rel = ss->ss_currentRelation;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData cols;
+	StringInfoData sql;
+	GpSegment  *segments;
+	char	   *plan;
+	char	   *db;
+	const char *user;
+	int			nsegments;
+	int			only = 0;
+
+	/* The listener does not carry session_user or the session's RLS settings */
+	if (GetUserId() != GetSessionUserId() || rel->rd_rel->relrowsecurity ||
+		rel->rd_rel->relforcerowsecurity)
+		return false;
+
+	initStringInfo(&cols);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		appendStringInfo(&cols, "%s", cols.len > 0 ? ", " : "");
+		if (att->attisdropped)
+			appendStringInfo(&cols, "NULL::pg_catalog.int4 AS %s",
+							 quote_identifier(NameStr(att->attname)));
+		else
+			appendStringInfoString(&cols, quote_identifier(NameStr(att->attname)));
+	}
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT %s FROM %s%s", cols.data,
+					 state->inherit ? "" : "ONLY ",
+					 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+											  RelationGetRelationName(rel)));
+	plan = gp_interconnect_plan(sql.data);
+	db = get_database_name(MyDatabaseId);
+	user = GetUserNameFromId(GetUserId(), false);
+	state->store = tuplestore_begin_heap(true, false, work_mem);
+	nsegments = gp_segments_get(&segments);
+	if (state->replicated)
+	{
+		if (nsegments == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("the cluster has no segments"));
+		only = segments[MyProcPid % nsegments].segment_id;
+	}
+
+	for (int i = 0; i < nsegments; i++)
+	{
+		if (only != 0 && segments[i].segment_id != only)
+			continue;
+		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
+								   segments[i].host, segments[i].port, 0))
+		{
+			tuplestore_end(state->store);
+			state->store = NULL;
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * A dispatched connection is still needed to see this transaction's writes.
  */
 static void
-gp_gather_load(GpGatherState *state)
+gp_gather_load_libpq(GpGatherState *state)
 {
 	ScanState  *ss = &state->css.ss;
 	TupleDesc	tupdesc = RelationGetDescr(ss->ss_currentRelation);
@@ -188,6 +257,16 @@ gp_gather_load(GpGatherState *state)
 }
 
 static void
+gp_gather_load(GpGatherState *state)
+{
+	gp_dtx_statement_start(state->css.ss.ps.state);
+	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+		gp_gather_load_interconnect(state))
+		return;
+	gp_gather_load_libpq(state);
+}
+
+static void
 gp_gather_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	GpGatherState *state = (GpGatherState *) node;
@@ -195,6 +274,7 @@ gp_gather_begin(CustomScanState *node, EState *estate, int eflags)
 
 	state->sql = strVal(linitial(cscan->custom_private));
 	state->replicated = boolVal(lsecond(cscan->custom_private));
+	state->inherit = boolVal(lthird(cscan->custom_private));
 }
 
 static TupleTableSlot *
@@ -203,6 +283,7 @@ gp_gather_next(ScanState *ss)
 	GpGatherState *state = (GpGatherState *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
+	gp_dtx_statement_start(state->css.ss.ps.state);
 	if (state->store == NULL)
 		gp_gather_load(state);
 
@@ -396,8 +477,9 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->path.pathkeys = NIL;
 	cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cpath->custom_paths = NIL;
-	cpath->custom_private = list_make2(makeString(gp_gather_sql(rte)),
-									   makeBoolean(policy.replicated));
+	cpath->custom_private = list_make3(makeString(gp_gather_sql(rte)),
+									   makeBoolean(policy.replicated),
+									   makeBoolean(rte->inh));
 	cpath->methods = &gp_gather_path_methods;
 
 	add_path(rel, &cpath->path);

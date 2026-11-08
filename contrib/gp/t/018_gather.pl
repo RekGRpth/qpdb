@@ -92,6 +92,17 @@ like(on_segments('SELECT count(*) FROM d'), qr/^[1-9]\d* [1-9]\d*$/,
 my $got = same_result('SELECT count(*), sum(a), min(b), max(c), max(ts) FROM d',
 	'aggregates');
 like($got, qr/^500\|125250\|/, 'which are all 500 rows');
+
+# A clean gather uses the authenticated interconnect, not a libpq query
+my $tokenfile = $coordinator->data_dir . '/gp_interconnect.token';
+rename $tokenfile, "$tokenfile.bak" or die "could not save the token: $!";
+open my $badtoken, '>', $tokenfile or die "could not replace the token: $!";
+print {$badtoken} '0' x 64;
+close $badtoken or die "could not close the token: $!";
+fails('SELECT a FROM d WHERE a < 2', qr/invalid interconnect token/,
+	'a clean gather uses the interconnect');
+rename "$tokenfile.bak", $tokenfile or die "could not restore the token: $!";
+
 same_result('SELECT * FROM d WHERE a % 13 = 0 ORDER BY a', 'a condition');
 same_result('SELECT b, count(*), sum(a), avg(c) FROM d GROUP BY b ORDER BY b',
 	'GROUP BY');
@@ -170,6 +181,59 @@ SELECT count(*) FROM d WHERE a > 1000;
 COMMIT}), 10, 'including those of COPY');
 is(run('SELECT count(*) FROM d WHERE a > 1000'), 10, 'and after a commit');
 
+# An explicit repeatable-read transaction excludes distributed commits from
+# BEGIN to PRE_COMMIT, so local and remote snapshots cannot drift apart
+sub insert_blocked
+{
+	my ($value) = @_;
+	my $writer = $coordinator->background_psql('postgres', on_error_stop => 1);
+
+	$writer->query_until(qr/start/,
+		"\\echo start\nINSERT INTO d (a) VALUES ($value);\n");
+	$coordinator->poll_query_until('postgres',
+		"SELECT count(*) = 1 FROM pg_stat_activity
+		 WHERE wait_event = 'gp dtx' AND backend_type = 'client backend'")
+	  or die 'the writer does not wait for the repeatable read';
+	return $writer;
+}
+
+my $repeatable = $coordinator->background_psql('postgres', on_error_stop => 1);
+$repeatable->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+is($repeatable->query_safe('SELECT count(*) FROM d'), 510,
+	'a repeatable read takes its first snapshot');
+my $writer = insert_blocked(2000);
+is($repeatable->query_safe('SELECT count(*) FROM d'), 510,
+	'a later commit is invisible in the same repeatable read');
+$repeatable->query_safe('ROLLBACK');
+$writer->quit;
+run('DELETE FROM d WHERE a = 2000');
+
+$repeatable->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+$repeatable->query_safe('INSERT INTO d (a) VALUES (2000)');
+$writer = insert_blocked(2001);
+is($repeatable->query_safe('SELECT count(*) FROM d WHERE a >= 2000'), 1,
+	'a transaction that wrote first keeps its isolation level');
+$repeatable->query_safe('ROLLBACK');
+$writer->quit;
+run('DELETE FROM d WHERE a >= 2000');
+
+$repeatable->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+is($repeatable->query_safe('SELECT count(*) FROM r'), 500,
+	'a local statement takes the coordinator snapshot first');
+$writer = insert_blocked(2000);
+is($repeatable->query_safe('SELECT count(*) FROM d WHERE a = 2000'), 0,
+	'a later distributed read uses that same cluster state');
+$repeatable->query_safe('ROLLBACK');
+$writer->quit;
+run('DELETE FROM d WHERE a = 2000');
+$repeatable->quit;
+fails(q{SET default_transaction_isolation = 'repeatable read'; SELECT count(*) FROM d},
+	qr/requires an explicit BEGIN/,
+	'an implicit transaction cannot drift between local and remote snapshots');
+fails(q{SET default_transaction_isolation = 'repeatable read'; INSERT INTO d (a) VALUES (2000)},
+	qr/requires an explicit BEGIN/,
+	'the same restriction applies to distributed DML');
+
 # A prepared statement
 is(run(q{PREPARE q (int) AS SELECT count(*) FROM d WHERE a > $1;
 EXECUTE q (100); EXECUTE q (200); EXECUTE q (300); EXECUTE q (400);
@@ -210,6 +274,24 @@ is($out, '510', 'a user with SELECT reads the rows');
 fails('SELECT count(*) FROM d', qr/permission denied for table d/,
 	'a user without SELECT cannot', extra_params => [ '-U', 'u2' ]);
 
+# The listener must not evaluate RLS as the role of an earlier request
+run('CREATE TABLE rls_t (a int)');
+run(q{SELECT gp.distribute('rls_t', ARRAY['a'])});
+run('INSERT INTO rls_t SELECT g FROM generate_series(1, 10) g');
+run('ALTER TABLE rls_t ENABLE ROW LEVEL SECURITY');
+run("CREATE POLICY rls_p ON rls_t USING (current_user = 'u1')");
+on_segments("SET gp.allow_local_ddl = on; CREATE POLICY rls_p ON rls_t USING (current_user = 'u1')");
+run('GRANT SELECT ON rls_t TO u1, u2');
+my $rls_out;
+$coordinator->psql('postgres', 'SELECT count(*) FROM rls_t',
+	extra_params => [ '-U', 'u1' ], stdout => \$rls_out);
+chomp $rls_out;
+is($rls_out, 10, 'RLS runs as the role named by the request');
+$coordinator->psql('postgres', 'SELECT count(*) FROM rls_t',
+	extra_params => [ '-U', 'u2' ], stdout => \$rls_out);
+chomp $rls_out;
+is($rls_out, 0, 'and not as the first role attached to the listener');
+
 # What is not supported yet is refused, not done on the coordinator alone
 fails(q{WITH ins AS (INSERT INTO d (a) VALUES (7)) SELECT 1},
 	qr/a data-modifying statement in WITH of a distributed table is not supported yet/,
@@ -226,6 +308,39 @@ is(run('SELECT count(*) FROM d'), 510, 'and they leave the rows as they were');
 is(run('SELECT gp.segment_id()'), 0, 'the coordinator is segment 0');
 is(run('SELECT count(*) FROM d WHERE gp.segment_id() = 0'), 510,
 	'a query reads a distributed table with the function in it');
+
+# A caught subtransaction must not release the statement lock twice
+run(q{CREATE FUNCTION caught_error() RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+	BEGIN
+		RETURN 1 / 0;
+	EXCEPTION WHEN OTHERS THEN
+		RETURN 1;
+	END;
+END$$});
+is(run('SELECT a, caught_error() FROM d WHERE a < 3 ORDER BY a'), "1|1\n2|1",
+	'a caught subtransaction preserves the statement lock');
+run(q{CREATE FUNCTION inner_caught_error() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	BEGIN
+		PERFORM 1 / a FROM d WHERE a = 0;
+	EXCEPTION WHEN division_by_zero THEN
+		NULL;
+	END;
+END$$});
+is(run('SELECT inner_caught_error()'), '',
+	'a failed inner executor is forgotten after its subtransaction');
+run('INSERT INTO d (a) VALUES (2000)');
+run('DELETE FROM d WHERE a = 2000');
+
+# A NOLOGIN role can be the first identity of a fresh listener too
+run('CREATE ROLE app NOLOGIN');
+run('GRANT SELECT ON d TO app');
+$_->restart foreach @segments;
+$seg1->wait_for_log(qr/registered as segment 1/);
+$seg2->wait_for_log(qr/registered as segment 2/);
+is(run('SET ROLE app; SELECT count(*) FROM d'), 510,
+	'a NOLOGIN role can execute the first interconnect request');
 
 $_->stop foreach (@segments, $coordinator);
 

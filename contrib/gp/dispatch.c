@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -110,6 +111,11 @@ static struct
 	LWLock		lock;
 }		   *dtx_shared = NULL;
 static bool dtx_held = false;
+static bool dtx_xact_held = false;
+
+/* Estates whose remote scans share one distributed commit-exclusion lock */
+static List *dtx_statements = NIL;
+static ExecutorEnd_hook_type prev_executor_end = NULL;
 
 /* The transaction has a segment that commits with it, alone */
 static bool one_phase_any = false;
@@ -377,6 +383,85 @@ gp_dtx_unlock(void)
 	LWLockRelease(&dtx_shared->lock);
 }
 
+/* Keep distributed commits away while an interconnect query takes snapshots */
+void
+gp_dtx_read_lock(void)
+{
+	LWLockAcquire(&dtx_shared->lock, LW_SHARED);
+}
+
+void
+gp_dtx_read_unlock(void)
+{
+	/* ERROR resets the holdoff before entering a cleanup */
+	if (InterruptHoldoffCount == 0)
+		HOLD_INTERRUPTS();
+	LWLockRelease(&dtx_shared->lock);
+}
+
+/* All remote scans of one statement exclude distributed commits together */
+void
+gp_dtx_statement_start(EState *estate)
+{
+	MemoryContext oldcontext;
+
+	if (list_member_ptr(dtx_statements, estate))
+		return;
+	gp_dtx_read_lock();
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	dtx_statements = lappend(dtx_statements, estate);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static void
+gp_dtx_statement_end(EState *estate)
+{
+	if (!list_member_ptr(dtx_statements, estate))
+		return;
+	dtx_statements = list_delete_ptr(dtx_statements, estate);
+	if (LWLockHeldByMe(&dtx_shared->lock))
+		gp_dtx_read_unlock();
+}
+
+/* A transaction snapshot needs commit exclusion from its explicit BEGIN */
+void
+gp_dtx_xact_snapshot(void)
+{
+	if (!IsolationUsesXactSnapshot() || dtx_xact_held)
+		return;
+	gp_dtx_read_lock();
+	dtx_xact_held = true;
+}
+
+static void
+gp_dtx_xact_release(void)
+{
+	if (!dtx_xact_held)
+		return;
+	gp_dtx_read_unlock();
+	dtx_xact_held = false;
+}
+
+static void
+gp_dtx_require_xact_snapshot(void)
+{
+	if (IsolationUsesXactSnapshot() && !dtx_xact_held)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("distributed access in a transaction with a transaction snapshot requires an explicit BEGIN"),
+				errhint("Use BEGIN or START TRANSACTION before accessing distributed tables."));
+}
+
+static void
+gp_dispatch_executor_end(QueryDesc *queryDesc)
+{
+	gp_dtx_statement_end(queryDesc->estate);
+	if (prev_executor_end)
+		prev_executor_end(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+}
+
 static void
 gp_connections_xact_callback(XactEvent event, void *arg)
 {
@@ -384,6 +469,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_PRE_COMMIT:
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			gp_dtx_xact_release();
 			if (diverged)
 				ereport(ERROR,
 						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -406,6 +492,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 			}
 			break;
 		case XACT_EVENT_PRE_PREPARE:
+			gp_dtx_xact_release();
 			if (diverged || ndispatched > 0)
 				ereport(ERROR,
 						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -463,6 +550,9 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		one_phase_any = false;
 		copy_segments = NULL;
 		copy_nsegments = 0;
+		list_free(dtx_statements);
+		dtx_statements = NIL;
+		dtx_xact_held = false;
 	}
 }
 
@@ -491,6 +581,12 @@ gp_connections_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					diverged = true;
 				subxact_marks = list_delete_first(subxact_marks);
 			}
+			/* AbortSubTransaction released every LWLock: restore ours */
+			if (dtx_xact_held)
+				gp_dtx_read_lock();
+			/* Surviving scans register again on their next call */
+			list_free(dtx_statements);
+			dtx_statements = NIL;
 			break;
 		default:
 			break;
@@ -506,6 +602,8 @@ gp_dispatch_init(void)
 	RegisterShmemCallbacks(&gp_dispatch_shmem_callbacks);
 	RegisterXactCallback(gp_connections_xact_callback, NULL);
 	RegisterSubXactCallback(gp_connections_subxact_callback, NULL);
+	prev_executor_end = ExecutorEnd_hook;
+	ExecutorEnd_hook = gp_dispatch_executor_end;
 }
 
 /*
@@ -953,11 +1051,12 @@ gp_dispatch(const GpSegment *segments, GpConnection **entries, int nsegments,
 static int
 gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 {
-	int			nsegments = gp_segments_get(segments);
+	int			nsegments;
 	char	  **commands;
 	PGresult  **results;
 	StringInfoData settings;
 
+	nsegments = gp_segments_get(segments);
 	gp_connections_forget(*segments, nsegments);
 	if (only != 0)
 	{
@@ -999,6 +1098,9 @@ gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 	return nsegments;
 }
 
+static void gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows,
+									 bool user_dml);
+
 /*
  * Run a command on all segments in the transactions that follow the
  * transaction of the coordinator, opening them if needed
@@ -1006,15 +1108,35 @@ gp_connections_ready(GpSegment **segments, GpConnection ***entries, int only)
 void
 gp_dispatch_xact(const char *sql)
 {
-	gp_dispatch_xact_rows(sql, NULL);
+	gp_dispatch_xact_rows_impl(sql, NULL, false);
+}
+
+/* User DML, unlike maintenance DDL, needs a transaction-wide snapshot */
+void
+gp_dispatch_xact_rows(const char *sql, uint64 *rows)
+{
+	gp_dispatch_xact_rows_impl(sql, rows, true);
+}
+
+/*
+ * Open a remote transaction with the isolation of the coordinator
+ */
+static const char *
+gp_xact_begin(void)
+{
+	if (XactIsoLevel == XACT_SERIALIZABLE)
+		return "BEGIN ISOLATION LEVEL SERIALIZABLE";
+	if (XactIsoLevel == XACT_REPEATABLE_READ)
+		return "BEGIN ISOLATION LEVEL REPEATABLE READ";
+	return "BEGIN";
 }
 
 /*
  * Send a command in the transaction of the coordinator, and set the number
  * of the rows the segments changed, as the command tags of them say
  */
-void
-gp_dispatch_xact_rows(const char *sql, uint64 *rows)
+static void
+gp_dispatch_xact_rows_impl(const char *sql, uint64 *rows, bool user_dml)
 {
 	GpSegment  *segments;
 	GpConnection **entries;
@@ -1022,10 +1144,12 @@ gp_dispatch_xact_rows(const char *sql, uint64 *rows)
 	char	  **commands = palloc_array(char *, nsegments);
 	PGresult  **results;
 
+	if (user_dml)
+		gp_dtx_require_xact_snapshot();
 	for (int i = 0; i < nsegments; i++)
 	{
 		commands[i] = entries[i]->in_xact ? (char *) sql :
-			psprintf("BEGIN; %s", sql);
+			psprintf("%s; %s", gp_xact_begin(), sql);
 		entries[i]->in_xact = true;
 	}
 	ndispatched++;
@@ -1055,9 +1179,10 @@ gp_copy_open(const char *sql, int only, GpSegment **segments)
 	char	  **commands = palloc_array(char *, nsegments);
 	PGresult  **results;
 
+	gp_dtx_require_xact_snapshot();
 	for (int i = 0; i < nsegments; i++)
 	{
-		commands[i] = entries[i]->in_xact ? NULL : "BEGIN";
+		commands[i] = entries[i]->in_xact ? NULL : (char *) gp_xact_begin();
 		entries[i]->in_xact = true;
 	}
 	ndispatched++;
@@ -1176,8 +1301,38 @@ gp_query_start(const char *sql, int only)
 	GpQuery    *query = palloc0_object(GpQuery);
 	GpConnection **entries;
 
+	gp_dtx_require_xact_snapshot();
 	query->nsegments = gp_connections_ready(&query->segments, &entries, only);
 	query->first = palloc0_array(PGresult *, query->nsegments);
+
+	/* A transaction snapshot must be the same on every later statement */
+	if (IsolationUsesXactSnapshot())
+	{
+		char	  **commands = palloc_array(char *, query->nsegments);
+		PGresult  **results;
+		bool		begin = false;
+
+		for (int i = 0; i < query->nsegments; i++)
+		{
+			if (entries[i]->in_xact)
+			{
+				commands[i] = NULL;
+				continue;
+			}
+			commands[i] = (char *) gp_xact_begin();
+			entries[i]->in_xact = true;
+			begin = true;
+		}
+		if (begin)
+		{
+			results = gp_dispatch(query->segments, entries, query->nsegments,
+								  commands, "beginning a transaction");
+			ndispatched++;
+			for (int i = 0; i < query->nsegments; i++)
+				PQclear(results[i]);
+		}
+	}
+
 	for (int i = 0; i < query->nsegments; i++)
 	{
 		PGconn	   *conn = entries[i]->conn;

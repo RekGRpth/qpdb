@@ -1155,6 +1155,14 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 									params, queryEnv, dest, qc);
 
+		if ((IsA(parsetree, TransactionStmt) &&
+			 (((TransactionStmt *) parsetree)->kind == TRANS_STMT_BEGIN ||
+			  ((TransactionStmt *) parsetree)->kind == TRANS_STMT_START)) ||
+			(IsA(parsetree, VariableSetStmt) &&
+			 ((VariableSetStmt *) parsetree)->kind == VAR_SET_MULTI &&
+			 strcmp(((VariableSetStmt *) parsetree)->name, "TRANSACTION") == 0))
+			gp_dtx_xact_snapshot();
+
 		if (mode == GP_DISPATCH_NONXACT)
 		{
 			MemoryContextSwitchTo(oldcontext);
