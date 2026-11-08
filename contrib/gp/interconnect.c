@@ -189,6 +189,17 @@ gp_ic_write_error(pgsocket fd, const char *message)
 	return gp_ic_write_message(fd, GP_IC_ERROR, message, strlen(message));
 }
 
+/* Do not reset a response that the client has not read yet */
+static void
+gp_ic_shutdown_write(pgsocket fd)
+{
+#ifdef WIN32
+	(void) shutdown(fd, SD_SEND);
+#else
+	(void) shutdown(fd, SHUT_WR);
+#endif
+}
+
 typedef struct GpFragmentDest
 {
 	DestReceiver pub;
@@ -304,6 +315,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 		timingsafe_bcmp(provided, token, 64) != 0)
 	{
 		(void) gp_ic_write_error(fd, "invalid interconnect token");
+		gp_ic_shutdown_write(fd);
 		return false;
 	}
 	db = gp_ic_read_string(fd);
@@ -333,12 +345,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 			/* Do not execute under the identity of an earlier request */
 			(void) gp_ic_write_message(fd, GP_IC_RETRY, NULL, 0);
 			/* Let the client read the retry before the worker goes away */
-			{
-				char		ignored;
-
-				while (gp_ic_read(fd, &ignored, 1))
-					;
-			}
+			gp_ic_shutdown_write(fd);
 			restart = true;
 		}
 		/* No executor or snapshot runs before the client confirms GO */
@@ -496,7 +503,8 @@ gp_interconnect_main(Datum main_arg)
 		ResetLatch(MyLatch);
 		rc = WaitLatchOrSocket(MyLatch,
 								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
-								   WL_SOCKET_READABLE | WL_TIMEOUT,
+								   WL_SOCKET_READABLE | WL_SOCKET_ACCEPT |
+								   WL_TIMEOUT,
 								   listener, 1000, wait_event);
 		if (rc & WL_EXIT_ON_PM_DEATH)
 			proc_exit(0);
