@@ -78,7 +78,7 @@ ERROR:  segments of the cluster are known on the coordinator only
 -- Segments register on the coordinator only
 SELECT gp.register_segment(1, 'localhost', 9001);
 ERROR:  segments register on the coordinator only
-CONTEXT:  PL/pgSQL function gp.register_segment(integer,text,integer) line 6 at RAISE
+CONTEXT:  PL/pgSQL function gp.register_segment(integer,text,integer) line 7 at RAISE
 -- Only a superuser registers segments by default
 SELECT has_function_privilege('public', 'gp.register_segment(int, text, int)',
 							  'EXECUTE');

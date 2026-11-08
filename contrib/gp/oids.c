@@ -37,6 +37,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -47,6 +48,7 @@
 
 /* The coordinator never assigns this range; segments use it for local objects */
 #define GP_LOCAL_OID_OFFSET (UINT64_C(1) << 30)
+#define GP_OIDS_FILE_MAX (16 * 1024 * 1024)
 
 /* A new catalog row and its OID */
 typedef struct GpOid
@@ -360,6 +362,92 @@ gp_oids_since(int mark)
 		appendStringInfo(&buf, "%s%u:%u", i > mark ? "," : "",
 						 recorded[i].catalog, recorded[i].oid);
 	return buf.data;
+}
+
+/* Keep the actual creation list for segments that register later */
+void
+gp_oids_save_extension(int mark)
+{
+	char	   *list = gp_oids_since(mark);
+	char	   *path = psprintf("%s/gp_extension_oids", DataDir);
+	char	   *tmp = psprintf("%s/gp_extension_oids.tmp", DataDir);
+	int			fd;
+	size_t		len;
+	size_t		written = 0;
+
+	if (gp_role != GP_ROLE_COORDINATOR || list[0] == '\0')
+		return;
+	fd = OpenTransientFilePerm(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	len = strlen(list);
+	if (fd < 0)
+		ereport(ERROR,
+				errmsg("could not create the extension OID file: %m"));
+	while (written < len)
+	{
+		ssize_t		n = write(fd, list + written, len - written);
+
+		if (n <= 0)
+			ereport(ERROR,
+					errmsg("could not write the extension OID file: %m"));
+		written += n;
+	}
+	if (fsync(fd) != 0)
+		ereport(ERROR,
+				errmsg("could not sync the extension OID file: %m"));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				errmsg("could not close the extension OID file: %m"));
+	if (rename(tmp, path) != 0)
+		ereport(ERROR,
+				errmsg("could not install the extension OID file: %m"));
+}
+
+PG_FUNCTION_INFO_V1(gp_interconnect_secret);
+
+Datum
+gp_interconnect_secret(PG_FUNCTION_ARGS)
+{
+	unsigned char bytes[32];
+	char		hex[65];
+
+	if (!pg_strong_random(bytes, sizeof(bytes)))
+		ereport(ERROR,
+				errcode(ERRCODE_INTERNAL_ERROR),
+				errmsg("could not generate the interconnect token"));
+	hex_encode((const char *) bytes, sizeof(bytes), hex);
+	hex[64] = '\0';
+	PG_RETURN_TEXT_P(cstring_to_text(hex));
+}
+
+PG_FUNCTION_INFO_V1(gp_extension_oids);
+
+Datum
+gp_extension_oids(PG_FUNCTION_ARGS)
+{
+	char		path[MAXPGPATH];
+	FILE	   *file;
+	StringInfoData list;
+	char		buf[8192];
+
+	if (gp_role != GP_ROLE_COORDINATOR)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("extension OIDs are read on the coordinator only"));
+	snprintf(path, sizeof(path), "%s/gp_extension_oids", DataDir);
+	file = AllocateFile(path, "r");
+	if (file == NULL)
+		PG_RETURN_NULL();
+	initStringInfo(&list);
+	while (fgets(buf, sizeof(buf), file) != NULL)
+	{
+		if (list.len > GP_OIDS_FILE_MAX)
+			ereport(ERROR,
+					errcode(ERRCODE_DATA_CORRUPTED),
+					errmsg("the extension OID file is too long"));
+		appendStringInfoString(&list, buf);
+	}
+	FreeFile(file);
+	PG_RETURN_TEXT_P(cstring_to_text(list.data));
 }
 
 /*

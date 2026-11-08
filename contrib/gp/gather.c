@@ -62,6 +62,17 @@
 #define GP_GATHER_ROW_COST_FACTOR 10.0
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist = NULL;
+static bool fragment_plan = false;
+
+/* Let a fragment for a segment have an ordinary scan, not another gather */
+bool
+gp_gather_fragment(bool enable)
+{
+	bool		old = fragment_plan;
+
+	fragment_plan = enable;
+	return old;
+}
 
 typedef struct GpGatherState
 {
@@ -339,7 +350,7 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
 
-	if (!IsUnderPostmaster || rte->rtekind != RTE_RELATION ||
+	if (!IsUnderPostmaster || fragment_plan || rte->rtekind != RTE_RELATION ||
 		rel->reloptkind != RELOPT_BASEREL ||
 		(rte->relkind != RELKIND_RELATION &&
 		 rte->relkind != RELKIND_PARTITIONED_TABLE))

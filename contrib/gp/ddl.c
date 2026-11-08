@@ -1129,7 +1129,7 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	like_local = mode == GP_DISPATCH_XACT && IsA(parsetree, CreateStmt) &&
 		gp_create_like_local((CreateStmt *) parsetree);
 
-	if (mode != GP_DISPATCH_NONE)
+	if (mode != GP_DISPATCH_NONE || IsA(parsetree, CreateExtensionStmt))
 		mark = gp_oids_mark();
 
 	/*
@@ -1170,6 +1170,10 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 			gp_oids_keep(false);
 	}
 	PG_END_TRY();
+
+	if (IsA(parsetree, CreateExtensionStmt) &&
+		strcmp(((CreateExtensionStmt *) parsetree)->extname, "gp") == 0)
+		gp_oids_save_extension(mark);
 
 	/* A view of a temporary table is temporary itself */
 	if (mode == GP_DISPATCH_XACT && IsA(parsetree, ViewStmt) &&

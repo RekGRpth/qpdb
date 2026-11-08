@@ -80,6 +80,21 @@ $coordinator->poll_query_until('postgres',
   or die 'segment 1 did not register again';
 pass('a restarted segment registers again');
 
+# The coordinator has gp, but its OID file was lost: do not register a
+# segment that would have no SQL functions with matching OIDs
+my $oidfile = $coordinator->data_dir . '/gp_extension_oids';
+rename $oidfile, "$oidfile.bak";
+my $seg4 = new_segment('seg4', 4);
+$seg4->start;
+$seg4->wait_for_log(qr/could not read extension OIDs on the coordinator/);
+is( segments(),
+	join("\n",
+		map { $_ + 1 . '|' . $segments[$_]->host . '|' . $segments[$_]->port }
+		  0 .. 1),
+	'a missing OID file prevents registration');
+$seg4->stop;
+rename "$oidfile.bak", $oidfile;
+
 # A segment with the number of another one does not take its place
 my $seg3 = new_segment('seg3', 1);
 $seg3->start;
