@@ -313,9 +313,13 @@ gp_segment_extension(PGconn *conn)
 					   gp_segment_id));
 	if (SPI_processed == 0)
 	{
-		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
+		res = libpqsrv_exec_params(conn,
+								   "SELECT 1 FROM pg_extension WHERE extname = 'gp'",
 								   0, NULL, NULL, NULL, NULL, 0, 0);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			ereport(ERROR,
+					errmsg("could not look for extension gp on the coordinator"));
+		if (PQntuples(res) == 0)
 		{
 			PQclear(res);
 			PopActiveSnapshot();
@@ -323,14 +327,13 @@ gp_segment_extension(PGconn *conn)
 			CommitTransactionCommand();
 			return;
 		}
-		if (PQntuples(res) != 1 || PQgetisnull(res, 0, 0))
-		{
-			PQclear(res);
-			PopActiveSnapshot();
-			SPI_finish();
-			CommitTransactionCommand();
-			return;
-		}
+		PQclear(res);
+		res = libpqsrv_exec_params(conn, "SELECT gp.extension_oids()",
+								   0, NULL, NULL, NULL, NULL, 0, 0);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+			PQgetisnull(res, 0, 0))
+			ereport(ERROR,
+					errmsg("could not read extension OIDs on the coordinator"));
 		oids = pstrdup(PQgetvalue(res, 0, 0));
 		PQclear(res);
 		if (SPI_execute("SET gp.dispatch_oids_session = on", false, 0) != SPI_OK_UTILITY ||

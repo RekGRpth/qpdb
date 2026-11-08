@@ -338,6 +338,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 		AbortCurrentTransaction();
 		(void) gp_ic_write_error(fd, edata->message);
 		FreeErrorData(edata);
+		EmitErrorReport();
 		FlushErrorState();
 	}
 	PG_END_TRY();
@@ -372,23 +373,6 @@ gp_interconnect_main(Datum main_arg)
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-
-	token = NULL;
-	for (int i = 0; i < 60 && token == NULL; i++)
-	{
-		token = gp_interconnect_token();
-		if (token == NULL)
-		{
-			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000000);
-		}
-	}
-	if (token == NULL)
-	{
-		ereport(LOG,
-				errmsg("the interconnect token is not installed yet"));
-		proc_exit(1);
-	}
 
 	snprintf(port, sizeof(port), "%d", PostPortNumber + GP_IC_PORT_OFFSET);
 	hints.ai_family = AF_UNSPEC;
@@ -448,18 +432,35 @@ gp_interconnect_main(Datum main_arg)
 				errmsg("could not make the interconnect listener nonblocking"));
 		proc_exit(1);
 	}
+	/* Accept registrations that finish while their first motion connects */
+	token = NULL;
+	for (int i = 0; i < 60 && token == NULL; i++)
+	{
+		token = gp_interconnect_token();
+		if (token == NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000000);
+		}
+	}
+	if (token == NULL)
+	{
+		ereport(LOG,
+				errmsg("the interconnect token is not installed yet"));
+		proc_exit(1);
+	}
+
 	wait_event = WaitEventExtensionNew("GpInterconnect");
 
 	for (;;)
 	{
 		long		rc;
+		pgsocket	fd;
 
 		ResetLatch(MyLatch);
 		rc = WaitLatch(MyLatch,
 								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
 								   1000, wait_event);
-		pgsocket	fd;
-
 		if (rc & WL_EXIT_ON_PM_DEATH)
 			proc_exit(0);
 		CHECK_FOR_INTERRUPTS();
@@ -472,6 +473,13 @@ gp_interconnect_main(Datum main_arg)
 			ereport(LOG,
 					errmsg("could not accept an interconnect connection"));
 			proc_exit(1);
+		}
+		if (!pg_set_block(fd))
+		{
+			closesocket(fd);
+			ereport(LOG,
+					errmsg("could not make an interconnect connection blocking"));
+			continue;
 		}
 		gp_ic_serve(fd, token);
 		closesocket(fd);
