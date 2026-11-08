@@ -53,6 +53,13 @@ AS 'MODULE_PATHNAME', 'gp_interconnect_secret'
 LANGUAGE C VOLATILE;
 REVOKE ALL ON FUNCTION gp.interconnect_secret() FROM PUBLIC;
 
+-- Keep the token file for interconnect clients on the coordinator too
+CREATE FUNCTION gp.interconnect_token_save(token text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gp_interconnect_token_save'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION gp.interconnect_token_save(text) FROM PUBLIC;
+
 -- Register a segment, or confirm the registration of a known one.  A
 -- segment keeps its number and address: a number registered at another
 -- address, or an address registered under another number, is an error.
@@ -79,6 +86,7 @@ BEGIN
 	SELECT true, decode(gp.interconnect_secret(), 'hex')
 	ON CONFLICT (singleton) DO NOTHING;
 	SELECT encode(token, 'hex') INTO secret FROM gp.interconnect_secret;
+	PERFORM gp.interconnect_token_save(secret);
 
 	SELECT * INTO known FROM gp.segments s
 	WHERE s.segment_id = register_segment.segment_id;

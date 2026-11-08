@@ -35,6 +35,8 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/readfuncs.h"
+#include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
 #include "storage/fd.h"
@@ -64,6 +66,9 @@
 #define GP_IC_ROW 'R'
 #define GP_IC_EOS 'E'
 #define GP_IC_ERROR 'X'
+#define GP_IC_RETRY 'I'
+#define GP_IC_READY 'Y'
+#define GP_IC_GO 'G'
 
 pg_noreturn PGDLLEXPORT void gp_interconnect_main(Datum main_arg);
 
@@ -102,6 +107,11 @@ gp_ic_read(pgsocket fd, void *buf, int len)
 	{
 		ssize_t		n = recv(fd, p, len, 0);
 
+		if (n < 0 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
 		if (n <= 0)
 			return false;
 		p += n;
@@ -119,6 +129,11 @@ gp_ic_write(pgsocket fd, const void *buf, int len)
 	{
 		ssize_t		n = send(fd, p, len, 0);
 
+		if (n < 0 && errno == EINTR)
+		{
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
 		if (n <= 0)
 			return false;
 		p += n;
@@ -172,6 +187,23 @@ static bool
 gp_ic_write_error(pgsocket fd, const char *message)
 {
 	return gp_ic_write_message(fd, GP_IC_ERROR, message, strlen(message));
+}
+
+/* Do not reset a response that the client has not read yet */
+static void
+gp_ic_shutdown_write(pgsocket fd)
+{
+#ifdef WIN32
+	(void) shutdown(fd, SD_SEND);
+#else
+	(void) shutdown(fd, SHUT_WR);
+#endif
+	ResetLatch(MyLatch);
+	(void) WaitLatchOrSocket(MyLatch,
+							 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
+							 WL_SOCKET_READABLE | WL_TIMEOUT,
+							 fd, 1000,
+							 WaitEventExtensionNew("GpInterconnectClose"));
 }
 
 typedef struct GpFragmentDest
@@ -268,7 +300,7 @@ gp_ic_execute(pgsocket fd, const char *serialized)
 }
 
 /* Execute the request of one connection and answer it */
-static void
+static bool
 gp_ic_serve(pgsocket fd, const char *token)
 {
 	char		magic[GP_IC_MAGIC_LEN];
@@ -277,59 +309,74 @@ gp_ic_serve(pgsocket fd, const char *token)
 	char	   *user = NULL;
 	char	   *sql = NULL;
 	int32		requester;
-	static Oid	connected_db = InvalidOid;
-	static Oid	connected_user = InvalidOid;
+	bool		restart = false;
+	static char *connected_db = NULL;
+	static char *connected_user = NULL;
 
 	if (!gp_ic_read(fd, magic, sizeof(magic)) ||
 		memcmp(magic, GP_IC_MAGIC, sizeof(magic)) != 0)
-		return;
+		return false;
 	provided = gp_ic_read_string(fd);
 	if (provided == NULL || strlen(provided) != 64 ||
 		timingsafe_bcmp(provided, token, 64) != 0)
 	{
 		(void) gp_ic_write_error(fd, "invalid interconnect token");
-		return;
+		gp_ic_shutdown_write(fd);
+		return false;
 	}
 	db = gp_ic_read_string(fd);
 	user = gp_ic_read_string(fd);
 	if (db == NULL || user == NULL ||
 		!gp_ic_read_i32(fd, &requester))
-		return;
+		return false;
 	sql = gp_ic_read_string(fd);
 	if (sql == NULL)
-		return;
+		return false;
 
 	PG_TRY();
 	{
 		char		set[64];
+		char		go;
 
-		if (!OidIsValid(connected_db) || connected_db != MyDatabaseId ||
-			connected_user != GetUserId())
+		if (connected_db == NULL)
 		{
-			if (OidIsValid(connected_db))
-				proc_exit(0);
-			BackgroundWorkerInitializeConnection(db, user, 0);
-			connected_db = MyDatabaseId;
-			connected_user = GetUserId();
+			BackgroundWorkerInitializeConnection(db, user,
+										 BGWORKER_BYPASS_ROLELOGINCHECK);
+			connected_db = MemoryContextStrdup(TopMemoryContext, db);
+			connected_user = MemoryContextStrdup(TopMemoryContext, user);
 		}
-		snprintf(set, sizeof(set), "SET gp.requester_segment = %d", requester);
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		SPI_connect();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		if (SPI_execute(set, false, 0) != SPI_OK_UTILITY)
-			ereport(ERROR,
-					errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("could not set the receiving segment"));
-		gp_ic_execute(fd, sql);
+		else if (strcmp(connected_db, db) != 0 ||
+				 strcmp(connected_user, user) != 0)
+		{
+			/* Do not execute under the identity of an earlier request */
+			(void) gp_ic_write_message(fd, GP_IC_RETRY, NULL, 0);
+			/* Let the client read the retry before the worker goes away */
+			gp_ic_shutdown_write(fd);
+			restart = true;
+		}
+		/* No executor or snapshot runs before the client confirms GO */
+		if (!restart && gp_ic_write_message(fd, GP_IC_READY, NULL, 0) &&
+			gp_ic_read(fd, &go, 1) && go == GP_IC_GO)
+		{
+			snprintf(set, sizeof(set), "SET gp.requester_segment = %d", requester);
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			SPI_connect();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			if (SPI_execute(set, false, 0) != SPI_OK_UTILITY)
+				ereport(ERROR,
+						errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("could not set the receiving segment"));
+			gp_ic_execute(fd, sql);
 
-		if (!gp_ic_write_message(fd, GP_IC_EOS, NULL, 0))
-			ereport(ERROR,
-					errcode(ERRCODE_CONNECTION_FAILURE),
-					errmsg("could not finish the motion answer"));
-		PopActiveSnapshot();
-		SPI_finish();
-		CommitTransactionCommand();
+			if (!gp_ic_write_message(fd, GP_IC_EOS, NULL, 0))
+				ereport(ERROR,
+						errcode(ERRCODE_CONNECTION_FAILURE),
+						errmsg("could not finish the motion answer"));
+			PopActiveSnapshot();
+			SPI_finish();
+			CommitTransactionCommand();
+		}
 	}
 	PG_CATCH();
 	{
@@ -342,6 +389,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+	return restart;
 }
 
 /* A Unix socket in gp.host's directory, used by the TAP clusters */
@@ -456,11 +504,14 @@ gp_interconnect_main(Datum main_arg)
 	{
 		long		rc;
 		pgsocket	fd;
+		bool		restart;
 
 		ResetLatch(MyLatch);
-		rc = WaitLatch(MyLatch,
-								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
-								   1000, wait_event);
+		rc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
+								   WL_SOCKET_READABLE | WL_SOCKET_ACCEPT |
+								   WL_TIMEOUT,
+								   listener, 1000, wait_event);
 		if (rc & WL_EXIT_ON_PM_DEATH)
 			proc_exit(0);
 		CHECK_FOR_INTERRUPTS();
@@ -481,8 +532,10 @@ gp_interconnect_main(Datum main_arg)
 					errmsg("could not make an interconnect connection blocking"));
 			continue;
 		}
-		gp_ic_serve(fd, token);
+		restart = gp_ic_serve(fd, token);
 		closesocket(fd);
+		if (restart)
+			proc_exit(1);
 	}
 }
 
@@ -495,12 +548,33 @@ gp_interconnect_init(void)
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	worker.bgw_restart_time = 1;
 	strlcpy(worker.bgw_library_name, "gp", BGW_MAXLEN);
 	strlcpy(worker.bgw_function_name, "gp_interconnect_main", BGW_MAXLEN);
 	strlcpy(worker.bgw_name, "gp interconnect", BGW_MAXLEN);
 	strlcpy(worker.bgw_type, "gp interconnect", BGW_MAXLEN);
 	RegisterBackgroundWorker(&worker);
+}
+
+/* Plan a fragment locally; only its serialized plan goes over the protocol */
+char *
+gp_interconnect_plan(const char *sql)
+{
+	PlannedStmt *stmt;
+	RawStmt    *raw = linitial(pg_parse_query(sql));
+	Query	   *query = parse_analyze_fixedparams(raw, sql, NULL, 0, NULL);
+	bool		old = gp_gather_fragment(true);
+
+	PG_TRY();
+	{
+		stmt = standard_planner(query, sql, 0, NULL, NULL);
+	}
+	PG_FINALLY();
+	{
+		gp_gather_fragment(old);
+	}
+	PG_END_TRY();
+	return nodeToString(stmt);
 }
 
 /* Read a row into the store of the caller */
@@ -553,9 +627,9 @@ gp_interconnect_row(Tuplestorestate *store, TupleDesc tupdesc,
 	ExecDropSingleTupleTableSlot(slot);
 }
 
-/* Ask one peer for its rows of the query */
-void
-gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
+/* Ask one peer for its rows; false asks for a dispatched-connection fallback */
+bool
+gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
 					  const char *host, int port, int requester)
 {
@@ -567,6 +641,7 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 	Oid		   *ioparam;
 	MemoryContext rowcxt;
 	char	   *token;
+	bool		retry = false;
 
 	token = gp_interconnect_token();
 	if (token == NULL)
@@ -609,9 +684,7 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 	}
 	pg_freeaddrinfo_all(hints.ai_family, addrs);
 	if (fd == PGINVALID_SOCKET)
-		ereport(ERROR,
-				errcode(ERRCODE_CONNECTION_FAILURE),
-				errmsg("could not connect to the interconnect of %s", host));
+		return false;
 
 	recv = palloc0_array(FmgrInfo, tupdesc->natts);
 	ioparam = palloc_array(Oid, tupdesc->natts);
@@ -619,6 +692,8 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 	{
 		Oid			recvfn;
 
+		if (TupleDescAttr(tupdesc, i)->attisdropped)
+			continue;
 		getTypeBinaryInputInfo(TupleDescAttr(tupdesc, i)->atttypid,
 							   &recvfn, &ioparam[i]);
 		fmgr_info(recvfn, &recv[i]);
@@ -638,11 +713,46 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 			!gp_ic_write_i32(fd, requester) ||
 			!gp_ic_write_i32(fd, strlen(sql)) ||
 			!gp_ic_write(fd, sql, strlen(sql)))
-			ereport(ERROR,
-					errcode(ERRCODE_CONNECTION_FAILURE),
-					errmsg("could not send the motion query to %s", host));
+			retry = true;
 
-		for (;;)
+		/* Until GO is sent, the peer has not executed the fragment */
+		if (!retry)
+		{
+			char		type;
+			int32		len;
+			char	   *data;
+			char		go = GP_IC_GO;
+
+			if (!gp_ic_read(fd, &type, 1) || !gp_ic_read_i32(fd, &len) ||
+				len < 0 || len > GP_IC_MAX_STRING)
+				retry = true;
+			else
+			{
+				data = palloc(len);
+				if (!gp_ic_read(fd, data, len))
+					retry = true;
+				else if (type == GP_IC_RETRY && len == 0)
+					retry = true;
+				else if (type == GP_IC_READY && len == 0)
+				{
+					if (!gp_ic_write(fd, &go, 1))
+						ereport(ERROR,
+								errcode(ERRCODE_CONNECTION_FAILURE),
+								errmsg("could not start the motion query on %s", host));
+				}
+				else if (type == GP_IC_ERROR)
+					ereport(ERROR,
+							errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("the segment returned an error: %.*s", len, data));
+				else
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("an unknown start of the interconnect answer"));
+				pfree(data);
+			}
+		}
+
+		for (; !retry;)
 		{
 			char		type;
 			int32		len;
@@ -659,6 +769,10 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
 						errmsg("could not read the interconnect answer of %s", host));
+			if (type == GP_IC_RETRY)
+				ereport(ERROR,
+						errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("a retry after the start of the interconnect query"));
 			if (type == GP_IC_EOS)
 			{
 				if (len != 0)
@@ -693,4 +807,24 @@ gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 	}
 	PG_END_TRY();
 	MemoryContextDelete(rowcxt);
+	return !retry;
+}
+
+void
+gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
+					  const char *db, const char *user, const char *sql,
+					  const char *host, int port, int requester)
+{
+	for (int i = 0; i < 60; i++)
+	{
+		if (gp_interconnect_query_try(store, tupdesc, db, user, sql,
+									  host, port, requester))
+			return;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(100000);
+	}
+	ereport(ERROR,
+			errcode(ERRCODE_CONNECTION_FAILURE),
+			errmsg("could not connect to the interconnect of %s with the requested database and role",
+				   host));
 }

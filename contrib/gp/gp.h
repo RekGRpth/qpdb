@@ -23,6 +23,8 @@
 #include "utils/relcache.h"
 #include "utils/tuplestore.h"
 
+typedef struct EState EState;
+
 /* Role of the server in the cluster */
 enum
 {
@@ -110,7 +112,11 @@ extern bool gp_slice_insert_motion(Query *parse);
 
 /* interconnect.c */
 extern void gp_interconnect_init(void);
+extern char *gp_interconnect_plan(const char *sql);
 extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
+								  const char *db, const char *user, const char *sql,
+								  const char *host, int port, int requester);
+extern bool gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
 								  const char *host, int port, int requester);
 
@@ -122,6 +128,10 @@ extern void gp_dispatch_init(void);
 extern bool gp_dispatch_in_xact(void);
 extern void gp_dtx_lock(void);
 extern void gp_dtx_unlock(void);
+extern void gp_dtx_read_lock(void);
+extern void gp_dtx_read_unlock(void);
+extern void gp_dtx_statement_start(EState *estate);
+extern void gp_dtx_xact_snapshot(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);
 extern void gp_dispatch_xact_rows(const char *sql, uint64 *rows);

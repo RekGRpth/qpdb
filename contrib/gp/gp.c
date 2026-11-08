@@ -381,6 +381,27 @@ gp_segment_token_save(const char *token)
 				errmsg("could not install the interconnect token file: %m"));
 }
 
+/* Install the actual cluster token on the coordinator as well */
+PG_FUNCTION_INFO_V1(gp_interconnect_token_save);
+
+Datum
+gp_interconnect_token_save(PG_FUNCTION_ARGS)
+{
+	char	   *token = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	if (gp_role != GP_ROLE_COORDINATOR)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("the interconnect token is saved on the coordinator only"));
+	if (strlen(token) != 64 ||
+		strspn(token, "0123456789abcdefABCDEF") != 64)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg("an interconnect token must be 64 hexadecimal characters"));
+	gp_segment_token_save(token);
+	PG_RETURN_VOID();
+}
+
 /* The address of this segment for other nodes */
 const char *
 gp_host_address(void)
