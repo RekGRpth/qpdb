@@ -24,6 +24,7 @@
 #include "postgres.h"
 
 #include <ctype.h>
+#include <time.h>
 #include <sys/un.h>
 
 #include "access/xact.h"
@@ -39,6 +40,9 @@
 #include "parser/analyze.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
+#include "port/atomics.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "tcop/dest.h"
@@ -69,8 +73,37 @@
 #define GP_IC_RETRY 'I'
 #define GP_IC_READY 'Y'
 #define GP_IC_GO 'G'
+#define GP_IC_ASSIGN 'A'
+
+#define GP_IC_SLOTS 64
+
+typedef enum GpIcSlotState
+{
+	GP_IC_SLOT_FREE = 0,
+	GP_IC_SLOT_STARTING,
+	GP_IC_SLOT_READY,
+	GP_IC_SLOT_ASSIGNED,
+	GP_IC_SLOT_BUSY,
+} GpIcSlotState;
+
+typedef struct GpIcSlot
+{
+	slock_t		lock;
+	pg_atomic_uint32 state;
+	pg_atomic_uint32 port;
+	uint64		generation;
+	pid_t		pid;
+	time_t		started;
+	Latch	   *latch;
+	char		db[NAMEDATALEN];
+	char		user[NAMEDATALEN];
+} GpIcSlot;
+
+static GpIcSlot *gp_ic_slots = NULL;
+static BackgroundWorkerHandle *gp_ic_handles[GP_IC_SLOTS];
 
 pg_noreturn PGDLLEXPORT void gp_interconnect_main(Datum main_arg);
+pg_noreturn PGDLLEXPORT void gp_interconnect_request_main(Datum main_arg);
 
 /* Read the shared secret installed by the registration worker */
 static char *
@@ -408,21 +441,14 @@ gp_ic_unix_path(const char *host, int port, struct sockaddr_un *addr)
 				errmsg("the interconnect socket path is too long"));
 }
 
-/* The listener of a segment, one request at a time */
-void
-gp_interconnect_main(Datum main_arg)
+/* Bind a listener on gp.host; TCP port 0 asks the OS for a free port */
+static pgsocket
+gp_ic_listen(const char *port)
 {
 	struct addrinfo *addrs = NULL;
 	struct addrinfo hints = {0};
-	pgsocket listener = PGINVALID_SOCKET;
-	char		port[12];
-	char	   *token;
-	uint32		wait_event;
+	pgsocket	listener = PGINVALID_SOCKET;
 
-	pqsignal(SIGTERM, die);
-	BackgroundWorkerUnblockSignals();
-
-	snprintf(port, sizeof(port), "%d", PostPortNumber + GP_IC_PORT_OFFSET);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
@@ -430,8 +456,7 @@ gp_interconnect_main(Datum main_arg)
 	{
 		struct sockaddr_un addr;
 
-		gp_ic_unix_path(gp_host_address(), PostPortNumber + GP_IC_PORT_OFFSET,
-						&addr);
+		gp_ic_unix_path(gp_host_address(), atoi(port), &addr);
 		listener = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (listener != PGINVALID_SOCKET)
 		{
@@ -445,11 +470,7 @@ gp_interconnect_main(Datum main_arg)
 		}
 	}
 	else if (pg_getaddrinfo_all(NULL, port, &hints, &addrs) != 0)
-	{
-		ereport(LOG,
-				errmsg("could not resolve the interconnect address"));
-		proc_exit(1);
-	}
+		return PGINVALID_SOCKET;
 	for (struct addrinfo *ai = addrs; ai != NULL; ai = ai->ai_next)
 	{
 		int			on = 1;
@@ -466,6 +487,332 @@ gp_interconnect_main(Datum main_arg)
 		listener = PGINVALID_SOCKET;
 	}
 	pg_freeaddrinfo_all(hints.ai_family, addrs);
+	return listener;
+}
+
+/* Invalidate a stale worker before freeing its slot for another generation */
+static void
+gp_ic_slot_invalidate(GpIcSlot *slot)
+{
+	SpinLockAcquire(&slot->lock);
+	slot->generation++;
+	slot->latch = NULL;
+	pg_atomic_write_u32(&slot->state, GP_IC_SLOT_FREE);
+	SpinLockRelease(&slot->lock);
+}
+
+/* Reap workers whose request has finished or whose startup has failed */
+static void
+gp_ic_reap_slots(void)
+{
+	for (int i = 0; i < GP_IC_SLOTS; i++)
+	{
+		GpIcSlot   *slot = &gp_ic_slots[i];
+		GpIcSlotState state = pg_atomic_read_u32(&slot->state);
+		pid_t		pid;
+
+		if (gp_ic_handles[i] != NULL)
+		{
+			if (GetBackgroundWorkerPid(gp_ic_handles[i], &pid) == BGWH_STOPPED)
+			{
+				gp_ic_slot_invalidate(slot);
+				pfree(gp_ic_handles[i]);
+				gp_ic_handles[i] = NULL;
+			}
+			continue;
+		}
+		if (state == GP_IC_SLOT_FREE)
+			continue;
+
+		/* A stale STARTING generation must not block a replacement broker */
+		if (state == GP_IC_SLOT_STARTING &&
+			time(NULL) - slot->started >= 60)
+		{
+			gp_ic_slot_invalidate(slot);
+			continue;
+		}
+		if (slot->pid != 0 &&
+			GetBackgroundWorkerTypeByPid(slot->pid) != NULL)
+		{
+			/* Its old latch belongs to the broker that died */
+			SpinLockAcquire(&slot->lock);
+			slot->latch = NULL;
+			SpinLockRelease(&slot->lock);
+			continue;
+		}
+		gp_ic_slot_invalidate(slot);
+	}
+}
+
+/* Assign one request a dynamic worker and its own ephemeral listener */
+static bool gp_ic_slot_assignment(GpIcSlot *slot, uint64 generation,
+								 uint32 *port);
+
+static bool
+gp_ic_assign(pgsocket fd, const char *token)
+{
+	char		magic[GP_IC_MAGIC_LEN];
+	char	   *provided;
+	char	   *db = NULL;
+	char	   *user = NULL;
+	char	   *sql = NULL;
+	int32		requester;
+	int			slot_id = -1;
+	BackgroundWorker worker = {0};
+	GpIcSlot   *slot = NULL;
+	pid_t		pid;
+	uint64		generation = 0;
+	bool		assigned = false;
+
+	if (!gp_ic_read(fd, magic, sizeof(magic)) ||
+		memcmp(magic, GP_IC_MAGIC, sizeof(magic)) != 0)
+		return false;
+	provided = gp_ic_read_string(fd);
+	if (provided == NULL || strlen(provided) != 64 ||
+		timingsafe_bcmp(provided, token, 64) != 0)
+	{
+		(void) gp_ic_write_error(fd, "invalid interconnect token");
+		gp_ic_shutdown_write(fd);
+		return false;
+	}
+	pfree(provided);
+	db = gp_ic_read_string(fd);
+	user = gp_ic_read_string(fd);
+	if (db == NULL || user == NULL ||
+		!gp_ic_read_i32(fd, &requester))
+		return false;
+	sql = gp_ic_read_string(fd);
+	if (sql == NULL)
+		return false;
+	/* The plan is sent again to the assigned worker, not kept in shmem */
+	pfree(sql);
+
+	gp_ic_reap_slots();
+	for (int i = 0; i < GP_IC_SLOTS; i++)
+		if (pg_atomic_read_u32(&gp_ic_slots[i].state) == GP_IC_SLOT_FREE &&
+			gp_ic_handles[i] == NULL)
+		{
+			slot_id = i;
+			break;
+		}
+	if (slot_id >= 0)
+	{
+		slot = &gp_ic_slots[slot_id];
+		SpinLockAcquire(&slot->lock);
+		strlcpy(slot->db, db, sizeof(slot->db));
+		strlcpy(slot->user, user, sizeof(slot->user));
+		slot->latch = MyLatch;
+		slot->pid = 0;
+		slot->started = time(NULL);
+		slot->generation++;
+		generation = slot->generation;
+		pg_atomic_write_u32(&slot->port, 0);
+		pg_atomic_write_u32(&slot->state, GP_IC_SLOT_STARTING);
+		SpinLockRelease(&slot->lock);
+
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+			BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = BGW_NEVER_RESTART;
+		worker.bgw_main_arg = UInt64GetDatum((generation << 16) |
+										   (uint64) slot_id);
+		strlcpy(worker.bgw_library_name, "gp", BGW_MAXLEN);
+		strlcpy(worker.bgw_function_name, "gp_interconnect_request_main", BGW_MAXLEN);
+		strlcpy(worker.bgw_name, "gp interconnect request", BGW_MAXLEN);
+		strlcpy(worker.bgw_type, "gp interconnect request", BGW_MAXLEN);
+		if (!RegisterDynamicBackgroundWorker(&worker, &gp_ic_handles[slot_id]))
+		{
+			gp_ic_slot_invalidate(slot);
+			gp_ic_handles[slot_id] = NULL;
+			slot = NULL;
+		}
+	}
+
+	for (int i = 0; slot != NULL && i < 600; i++)
+	{
+		uint32		port;
+
+		if (gp_ic_slot_assignment(slot, generation, &port))
+		{
+			uint32		net_port = htonl(port);
+
+			assigned = gp_ic_write_message(fd, GP_IC_ASSIGN,
+										   &net_port, sizeof(net_port));
+			break;
+		}
+		if (GetBackgroundWorkerPid(gp_ic_handles[slot_id], &pid) == BGWH_STOPPED)
+			break;
+		ResetLatch(MyLatch);
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
+						 WL_TIMEOUT, 100, WaitEventExtensionNew("GpInterconnectAssign"));
+	}
+	pfree(db);
+	pfree(user);
+	if (!assigned)
+		(void) gp_ic_write_message(fd, GP_IC_RETRY, NULL, 0);
+	if (!assigned)
+		gp_ic_shutdown_write(fd);
+	return assigned;
+}
+
+static void
+gp_ic_slot_signal(GpIcSlot *slot)
+{
+	if (slot->latch != NULL)
+		SetLatch(slot->latch);
+}
+
+static void
+gp_ic_slot_publish(GpIcSlot *slot, uint64 generation, GpIcSlotState state)
+{
+	SpinLockAcquire(&slot->lock);
+	if (slot->generation == generation)
+	{
+		pg_atomic_write_u32(&slot->state, state);
+		gp_ic_slot_signal(slot);
+	}
+	SpinLockRelease(&slot->lock);
+}
+
+static void
+gp_ic_slot_set_port(GpIcSlot *slot, uint64 generation, uint32 port)
+{
+	SpinLockAcquire(&slot->lock);
+	if (slot->generation == generation)
+		pg_atomic_write_u32(&slot->port, port);
+	SpinLockRelease(&slot->lock);
+}
+
+static bool
+gp_ic_slot_start(GpIcSlot *slot, uint64 generation)
+{
+	bool		current;
+
+	SpinLockAcquire(&slot->lock);
+	current = slot->generation == generation;
+	if (current)
+		slot->pid = MyProcPid;
+	SpinLockRelease(&slot->lock);
+	return current;
+}
+
+static bool
+gp_ic_slot_assignment(GpIcSlot *slot, uint64 generation, uint32 *port)
+{
+	bool		ready;
+
+	SpinLockAcquire(&slot->lock);
+	ready = slot->generation == generation &&
+		pg_atomic_read_u32(&slot->state) == GP_IC_SLOT_READY;
+	if (ready)
+	{
+		*port = pg_atomic_read_u32(&slot->port);
+		pg_atomic_write_u32(&slot->state, GP_IC_SLOT_ASSIGNED);
+	}
+	SpinLockRelease(&slot->lock);
+	return ready;
+}
+
+/* A dynamic worker accepts one request on a listener of its own */
+void
+gp_interconnect_request_main(Datum main_arg)
+{
+	uint64		request = DatumGetUInt64(main_arg);
+	int			slot_id = request & 0xffff;
+	uint64		generation = request >> 16;
+	GpIcSlot   *slot = &gp_ic_slots[slot_id];
+	pgsocket	listener;
+	pgsocket	fd;
+	char		service[12];
+	char	   *token;
+	uint32		wait_event;
+
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	if (!gp_ic_slot_start(slot, generation))
+		proc_exit(0);
+	if (is_absolute_path(gp_host_address()))
+		snprintf(service, sizeof(service), "%u",
+				 (unsigned) (PostPortNumber + 20000 + (generation % 20000)));
+	else
+		strlcpy(service, "0", sizeof(service));
+	listener = gp_ic_listen(service);
+	if (listener == PGINVALID_SOCKET)
+	{
+		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+		proc_exit(1);
+	}
+	if (!is_absolute_path(gp_host_address()))
+	{
+		struct sockaddr_storage addr;
+		socklen_t	len = sizeof(addr);
+
+		if (getsockname(listener, (struct sockaddr *) &addr, &len) != 0)
+		{
+			closesocket(listener);
+			gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+			proc_exit(1);
+		}
+		if (addr.ss_family == AF_INET)
+			gp_ic_slot_set_port(slot, generation,
+								ntohs(((struct sockaddr_in *) &addr)->sin_port));
+		else
+			gp_ic_slot_set_port(slot, generation,
+								ntohs(((struct sockaddr_in6 *) &addr)->sin6_port));
+	}
+	else
+		gp_ic_slot_set_port(slot, generation,
+							PostPortNumber + 20000 + (generation % 20000));
+	pg_write_barrier();
+	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_READY);
+
+	if (!pg_set_noblock(listener))
+	{
+		closesocket(listener);
+		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+		proc_exit(1);
+	}
+	wait_event = WaitEventExtensionNew("GpInterconnectRequest");
+	ResetLatch(MyLatch);
+	(void) WaitLatchOrSocket(MyLatch,
+							 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
+							 WL_SOCKET_READABLE | WL_SOCKET_ACCEPT | WL_TIMEOUT,
+							 listener, 60000, wait_event);
+	CHECK_FOR_INTERRUPTS();
+	fd = accept(listener, NULL, NULL);
+	closesocket(listener);
+	if (fd == PGINVALID_SOCKET || !pg_set_block(fd))
+	{
+		if (fd != PGINVALID_SOCKET)
+			closesocket(fd);
+		gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+		proc_exit(1);
+	}
+	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_BUSY);
+	token = gp_interconnect_token();
+	if (token != NULL)
+	{
+		(void) gp_ic_serve(fd, token);
+		closesocket(fd);
+	}
+	gp_ic_slot_publish(slot, generation, GP_IC_SLOT_FREE);
+	proc_exit(0);
+}
+
+/* The listener of a segment, one request at a time */
+void
+gp_interconnect_main(Datum main_arg)
+{
+	pgsocket listener = PGINVALID_SOCKET;
+	char		port[12];
+	char	   *token;
+	uint32		wait_event;
+
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	snprintf(port, sizeof(port), "%d", PostPortNumber + GP_IC_PORT_OFFSET);
+	listener = gp_ic_listen(port);
 	if (listener == PGINVALID_SOCKET)
 	{
 		ereport(LOG,
@@ -498,13 +845,13 @@ gp_interconnect_main(Datum main_arg)
 		proc_exit(1);
 	}
 
+	gp_ic_reap_slots();
 	wait_event = WaitEventExtensionNew("GpInterconnect");
 
 	for (;;)
 	{
 		long		rc;
 		pgsocket	fd;
-		bool		restart;
 
 		ResetLatch(MyLatch);
 		rc = WaitLatchOrSocket(MyLatch,
@@ -532,18 +879,43 @@ gp_interconnect_main(Datum main_arg)
 					errmsg("could not make an interconnect connection blocking"));
 			continue;
 		}
-		restart = gp_ic_serve(fd, token);
+		(void) gp_ic_assign(fd, token);
 		closesocket(fd);
-		if (restart)
-			proc_exit(1);
 	}
 }
+
+static void
+gp_ic_shmem_request(void *arg)
+{
+	ShmemRequestStruct(.name = "gp interconnect requests",
+					   .size = mul_size(sizeof(GpIcSlot), GP_IC_SLOTS),
+					   .ptr = (void **) &gp_ic_slots);
+}
+
+static void
+gp_ic_shmem_init(void *arg)
+{
+	MemSet(gp_ic_slots, 0, sizeof(GpIcSlot) * GP_IC_SLOTS);
+	for (int i = 0; i < GP_IC_SLOTS; i++)
+	{
+		SpinLockInit(&gp_ic_slots[i].lock);
+		pg_atomic_init_u32(&gp_ic_slots[i].state, GP_IC_SLOT_FREE);
+		pg_atomic_init_u32(&gp_ic_slots[i].port, 0);
+	}
+}
+
+static const ShmemCallbacks gp_ic_shmem_callbacks = {
+	.request_fn = gp_ic_shmem_request,
+	.init_fn = gp_ic_shmem_init,
+};
 
 /* Called from _PG_init() on a segment */
 void
 gp_interconnect_init(void)
 {
 	BackgroundWorker worker = {0};
+
+	RegisterShmemCallbacks(&gp_ic_shmem_callbacks);
 
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -627,36 +999,23 @@ gp_interconnect_row(Tuplestorestate *store, TupleDesc tupdesc,
 	ExecDropSingleTupleTableSlot(slot);
 }
 
-/* Ask one peer for its rows; false asks for a dispatched-connection fallback */
-bool
-gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
-					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int requester)
+/* Connect to the broker or to an assigned worker */
+static pgsocket
+gp_ic_connect(const char *host, int port)
 {
 	struct addrinfo *addrs = NULL;
 	struct addrinfo hints = {0};
-	pgsocket fd = PGINVALID_SOCKET;
+	pgsocket	fd = PGINVALID_SOCKET;
 	char		portstr[12];
-	FmgrInfo   *recv;
-	Oid		   *ioparam;
-	MemoryContext rowcxt;
-	char	   *token;
-	bool		retry = false;
 
-	token = gp_interconnect_token();
-	if (token == NULL)
-		ereport(ERROR,
-				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				errmsg("the interconnect token is not installed yet"));
-
-	snprintf(portstr, sizeof(portstr), "%d", port + GP_IC_PORT_OFFSET);
+	snprintf(portstr, sizeof(portstr), "%d", port);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	if (is_absolute_path(host))
 	{
 		struct sockaddr_un addr;
 
-		gp_ic_unix_path(host, port + GP_IC_PORT_OFFSET, &addr);
+		gp_ic_unix_path(host, port, &addr);
 		fd = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (fd != PGINVALID_SOCKET && connect(fd, (struct sockaddr *) &addr,
 											sizeof(addr)) != 0)
@@ -683,6 +1042,46 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 		}
 	}
 	pg_freeaddrinfo_all(hints.ai_family, addrs);
+	return fd;
+}
+
+/* Send the full request; no executor runs until the later READY/GO */
+static bool
+gp_ic_send_query(pgsocket fd, const char *token, const char *db,
+				 const char *user, int requester, const char *sql)
+{
+	return gp_ic_write(fd, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
+		gp_ic_write_i32(fd, strlen(token)) &&
+		gp_ic_write(fd, token, strlen(token)) &&
+		gp_ic_write_i32(fd, strlen(db)) &&
+		gp_ic_write(fd, db, strlen(db)) &&
+		gp_ic_write_i32(fd, strlen(user)) &&
+		gp_ic_write(fd, user, strlen(user)) &&
+		gp_ic_write_i32(fd, requester) &&
+		gp_ic_write_i32(fd, strlen(sql)) &&
+		gp_ic_write(fd, sql, strlen(sql));
+}
+
+/* Ask one peer for its rows; false asks for a dispatched-connection fallback */
+bool
+gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
+					  const char *db, const char *user, const char *sql,
+					  const char *host, int port, int requester)
+{
+	pgsocket fd = PGINVALID_SOCKET;
+	FmgrInfo   *recv;
+	Oid		   *ioparam;
+	MemoryContext rowcxt;
+	char	   *token;
+	bool		retry = false;
+
+	token = gp_interconnect_token();
+	if (token == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("the interconnect token is not installed yet"));
+
+	fd = gp_ic_connect(host, port + GP_IC_PORT_OFFSET);
 	if (fd == PGINVALID_SOCKET)
 		return false;
 
@@ -703,17 +1102,51 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 
 	PG_TRY();
 	{
-		if (!gp_ic_write(fd, GP_IC_MAGIC, GP_IC_MAGIC_LEN) ||
-			!gp_ic_write_i32(fd, strlen(token)) ||
-			!gp_ic_write(fd, token, strlen(token)) ||
-			!gp_ic_write_i32(fd, strlen(db)) ||
-			!gp_ic_write(fd, db, strlen(db)) ||
-			!gp_ic_write_i32(fd, strlen(user)) ||
-			!gp_ic_write(fd, user, strlen(user)) ||
-			!gp_ic_write_i32(fd, requester) ||
-			!gp_ic_write_i32(fd, strlen(sql)) ||
-			!gp_ic_write(fd, sql, strlen(sql)))
+		if (!gp_ic_send_query(fd, token, db, user, requester, sql))
 			retry = true;
+
+		/* The broker answers with the port of a dynamic worker */
+		if (!retry)
+		{
+			char		type;
+			int32		len;
+			uint32		net_port = 0;
+
+			if (!gp_ic_read(fd, &type, 1) || !gp_ic_read_i32(fd, &len) ||
+				len < 0 || len > GP_IC_MAX_STRING)
+				retry = true;
+			else if (type == GP_IC_ASSIGN && len == sizeof(net_port))
+			{
+				if (!gp_ic_read(fd, &net_port, sizeof(net_port)))
+					retry = true;
+			}
+			else if (type == GP_IC_RETRY && len == 0)
+				retry = true;
+			else if (type == GP_IC_ERROR)
+			{
+				char	   *data = palloc(len);
+
+				if (!gp_ic_read(fd, data, len))
+					retry = true;
+				else
+					ereport(ERROR,
+							errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("the segment returned an error: %.*s", len, data));
+			}
+			else
+				ereport(ERROR,
+						errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("an unknown assignment of the interconnect"));
+			closesocket(fd);
+			fd = PGINVALID_SOCKET;
+			if (!retry)
+			{
+				fd = gp_ic_connect(host, (int) ntohl(net_port));
+				if (fd == PGINVALID_SOCKET ||
+					!gp_ic_send_query(fd, token, db, user, requester, sql))
+					retry = true;
+			}
+		}
 
 		/* Until GO is sent, the peer has not executed the fragment */
 		if (!retry)
