@@ -383,24 +383,27 @@ the relcache entry of the table, and a change of an extension drops it.
 `gp.peer_query()` and a clean `GpGather` receive a serialized `PlannedStmt`,
 not SQL text.  While the coordinator builds that fragment, `GpGather` is
 disabled so that the fragment contains an ordinary scan.  A `gp interconnect`
-worker on each segment listens on `PostPortNumber + 10000`.  A request names
-the database, user, receiving segment and plan; the worker authenticates it
-with the cluster token, deserializes the plan, locks the range table and runs
-the executor.  It returns binary tuples followed by EOS, or an error message.
+broker on each segment listens on `PostPortNumber + 10000` only to assign the
+request a dynamic background worker.  The worker creates its own ephemeral TCP
+listener, or a per-slot Unix-domain socket, and the broker returns its port.
+The client connects there and sends the serialized plan again; no plan or
+accepted socket has to be passed between processes.  The worker authenticates
+the request with the cluster token, connects to the requested database and
+role, deserializes the plan, locks the range table and runs the executor.  It
+returns binary tuples followed by EOS, or an error message, and exits.  Shared
+slots pass through STARTING, READY, ASSIGNED and BUSY back to FREE, and the
+broker reaps stopped workers.  Nested Motion to the same segment therefore
+gets another worker instead of waiting for a busy single listener.
+
 Closing a connection cancels the query.  The receiver materializes the rows,
 so a writer never waits for a reader of another motion while blocked on this
-one.  The listener waits for its socket to become readable, without adding a
-polling delay to every request.  A direct Gather shares the distributed
-commit-exclusion lock with the other remote scans of its statement.
-
-A worker keeps one database and role, including a NOLOGIN effective role.  A
-request for another identity receives RETRY; the worker closes the connection
-and restarts, and Motion reconnects after the new listener is ready.  A Gather
-may use its dispatched libpq connections instead.  The executor starts only
-after a READY/GO handshake.  A transport failure before that confirmation is
-retried, including a connection reset left by the old listener's backlog.  A
-failure after GO is an error, never a retry that could repeat a volatile
-function of the fragment.
+one.  A direct Gather shares the distributed commit-exclusion lock with the
+other remote scans of its statement.  The executor starts only after a
+READY/GO handshake.  A transport failure before that confirmation is retried,
+including a connection reset left by an old listener's backlog.  A failure
+after GO is an error, never a retry that could repeat a volatile function of
+the fragment.  Error and retry responses finish with a bounded graceful close,
+so Windows cannot turn them into an undelivered connection reset.
 
 At the first registration the coordinator generates a 32-byte token and
 returns it as hex.  The coordinator and the registering segment each store it
