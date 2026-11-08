@@ -198,6 +198,12 @@ gp_ic_shutdown_write(pgsocket fd)
 #else
 	(void) shutdown(fd, SHUT_WR);
 #endif
+	ResetLatch(MyLatch);
+	(void) WaitLatchOrSocket(MyLatch,
+							 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
+							 WL_SOCKET_READABLE | WL_TIMEOUT,
+							 fd, 1000,
+							 WaitEventExtensionNew("GpInterconnectClose"));
 }
 
 typedef struct GpFragmentDest
