@@ -34,6 +34,8 @@
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "libpq-fe.h"
+#include "libpq/libpq-be-fe-helpers.h"
 #include "miscadmin.h"
 #include "nodes/readfuncs.h"
 #include "optimizer/planner.h"
@@ -490,6 +492,90 @@ gp_ic_listen(const char *port)
 	return listener;
 }
 
+/*
+ * Bind the listener of a segment on the port it names.  Over TCP, when
+ * another process holds that port, any free port serves instead, and the
+ * caller reads it back.  A Unix-domain socket lives in the directory of its
+ * own segment, where no other process competes for it.
+ */
+static pgsocket
+gp_interconnect_listen(int *port)
+{
+	char		service[12];
+	pgsocket	listener;
+
+	snprintf(service, sizeof(service), "%d", *port);
+	listener = gp_ic_listen(service);
+	if (listener != PGINVALID_SOCKET || is_absolute_path(gp_host_address()))
+		return listener;
+
+	listener = gp_ic_listen("0");
+	if (listener != PGINVALID_SOCKET)
+	{
+		struct sockaddr_storage addr;
+		socklen_t	len = sizeof(addr);
+
+		if (getsockname(listener, (struct sockaddr *) &addr, &len) == 0)
+		{
+			if (addr.ss_family == AF_INET)
+				*port = ntohs(((struct sockaddr_in *) &addr)->sin_port);
+			else
+				*port = ntohs(((struct sockaddr_in6 *) &addr)->sin6_port);
+			return listener;
+		}
+		closesocket(listener);
+	}
+	return PGINVALID_SOCKET;
+}
+
+/*
+ * Tell the coordinator the port the broker listens on, so that clients need
+ * no rule to find it.  A failure restarts the broker, which binds again and
+ * reports again; nothing is served before the report is through.
+ */
+static void
+gp_interconnect_register(int port)
+{
+	const char *keywords[] = {"dbname", "dbname", "application_name", NULL};
+	const char *values[3];
+	uint32		wait_event = WaitEventExtensionNew("GpInterconnectRegister");
+	PGconn	   *conn;
+	PGresult   *res;
+	char		sql[64];
+
+	values[0] = gp_coordinator_conninfo();
+	values[1] = gp_database;
+	values[2] = "gp interconnect";
+	conn = libpqsrv_connect_params(keywords, values, true, wait_event);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		char	   *err = pchomp(PQerrorMessage(conn));
+
+		libpqsrv_disconnect(conn);
+		ereport(LOG,
+				errmsg("could not register the interconnect port on the coordinator"),
+				errdetail("%s", err));
+		proc_exit(1);
+	}
+	snprintf(sql, sizeof(sql), "SELECT gp.register_interconnect(%d, %d)",
+			 gp_segment_id, port);
+	res = libpqsrv_exec_params(conn, sql, 0, NULL, NULL, NULL, NULL, 0,
+							   wait_event);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		char	   *err = pchomp(PQresultErrorMessage(res));
+
+		PQclear(res);
+		libpqsrv_disconnect(conn);
+		ereport(LOG,
+				errmsg("could not register the interconnect port on the coordinator"),
+				errdetail("%s", err));
+		proc_exit(1);
+	}
+	PQclear(res);
+	libpqsrv_disconnect(conn);
+}
+
 /* Invalidate a stale worker before freeing its slot for another generation */
 static void
 gp_ic_slot_invalidate(GpIcSlot *slot)
@@ -804,20 +890,20 @@ void
 gp_interconnect_main(Datum main_arg)
 {
 	pgsocket listener = PGINVALID_SOCKET;
-	char		port[12];
+	int			listen_port;
 	char	   *token;
 	uint32		wait_event;
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
-	snprintf(port, sizeof(port), "%d", PostPortNumber + GP_IC_PORT_OFFSET);
-	listener = gp_ic_listen(port);
+	listen_port = PostPortNumber + GP_IC_PORT_OFFSET;
+	listener = gp_interconnect_listen(&listen_port);
 	if (listener == PGINVALID_SOCKET)
 	{
 		ereport(LOG,
 				errmsg("could not listen on interconnect port %d",
-					   PostPortNumber + GP_IC_PORT_OFFSET));
+					   listen_port));
 		proc_exit(1);
 	}
 
@@ -844,6 +930,9 @@ gp_interconnect_main(Datum main_arg)
 				errmsg("the interconnect token is not installed yet"));
 		proc_exit(1);
 	}
+
+	/* The row of this segment exists once its registration is through */
+	gp_interconnect_register(listen_port);
 
 	gp_ic_reap_slots();
 	wait_event = WaitEventExtensionNew("GpInterconnect");
@@ -1062,7 +1151,22 @@ gp_ic_send_query(pgsocket fd, const char *token, const char *db,
 		gp_ic_write(fd, sql, strlen(sql));
 }
 
-/* Ask one peer for its rows; false asks for a dispatched-connection fallback */
+/*
+ * The port of the broker of a segment: the one it reported, or the usual
+ * choice of the port of the segment plus the offset while it has not
+ * reported yet
+ */
+int
+gp_interconnect_port(int port, int interconnect_port)
+{
+	return interconnect_port != 0 ? interconnect_port :
+		port + GP_IC_PORT_OFFSET;
+}
+
+/*
+ * Ask one peer for its rows; false asks for a dispatched-connection
+ * fallback.  The port is that of the peer's broker, not of its server
+ */
 bool
 gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
@@ -1081,7 +1185,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("the interconnect token is not installed yet"));
 
-	fd = gp_ic_connect(host, port + GP_IC_PORT_OFFSET);
+	fd = gp_ic_connect(host, port);
 	if (fd == PGINVALID_SOCKET)
 		return false;
 

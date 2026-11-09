@@ -13,6 +13,8 @@ CREATE TABLE gp.segments (
 	segment_id int PRIMARY KEY CHECK (segment_id > 0),
 	host text NOT NULL CHECK (octet_length(host) < 256),
 	port int NOT NULL CHECK (port BETWEEN 1 AND 65535),
+	interconnect_port int CHECK (interconnect_port IS NULL OR
+		interconnect_port BETWEEN 1 AND 65535),
 	registered timestamptz NOT NULL DEFAULT now(),	-- last registration
 	UNIQUE (host, port)
 );
@@ -41,7 +43,8 @@ FOR EACH STATEMENT EXECUTE FUNCTION gp.segments_changed();
 
 -- Segments of the cluster as the coordinator knows them, from any database
 CREATE FUNCTION gp.cluster_segments(OUT segment_id int, OUT host text,
-									OUT port int)
+									OUT port int,
+									OUT interconnect_port int)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gp_cluster_segments'
 LANGUAGE C STRICT;
@@ -123,6 +126,35 @@ END
 $$;
 
 REVOKE ALL ON FUNCTION gp.register_segment(int, text, int) FROM PUBLIC;
+
+-- Report the port the interconnect broker of a segment listens on.  The
+-- broker takes the port of the segment plus 10000 when it is free, and any
+-- free port when it is not; this is how clients learn the address they
+-- connect to, instead of a rule of the port.
+CREATE FUNCTION gp.register_interconnect(segment_id int, port int)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	IF current_setting('gp.role', true) IS DISTINCT FROM 'coordinator' THEN
+		RAISE EXCEPTION 'interconnect ports register on the coordinator only';
+	END IF;
+	IF current_database() <> current_setting('gp.database') THEN
+		RAISE EXCEPTION 'interconnect ports register in database "%" only',
+			current_setting('gp.database');
+	END IF;
+
+	UPDATE gp.segments s SET interconnect_port = register_interconnect.port
+	WHERE s.segment_id = register_interconnect.segment_id;
+	IF NOT FOUND THEN
+		RAISE EXCEPTION 'segment % is not registered',
+			register_interconnect.segment_id;
+	END IF;
+END
+$$;
+
+REVOKE ALL ON FUNCTION gp.register_interconnect(int, int) FROM PUBLIC;
 
 -- Run a command on all segments at once and return the command status of
 -- each; rows of a query are discarded.  Each segment runs the command in a

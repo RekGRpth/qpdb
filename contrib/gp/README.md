@@ -54,7 +54,10 @@ part of `gp` in `gp.database`, connects to `gp.coordinator`, calls
 coordinator is down or has no extension, the worker retries every
 `gp.register_retry_interval`, so segments may start before the coordinator.
 A number registered at another address, or an address under another number,
-is refused.
+is refused.  The interconnect broker of the segment then reports the port it
+listens on in the same way, with `gp.register_interconnect(segment_id, port)`,
+so the row of a segment in `gp.segments` carries both its server port and its
+broker port.
 
 ### Connections and commands (`dispatch.c`)
 
@@ -388,7 +391,11 @@ columns of the source.  The SQL function remains as a compatibility wrapper,
 but a fragment contains no `FunctionScan` for it.  While the coordinator builds
 that fragment, `GpGather` is disabled so that the fragment contains an ordinary
 scan.  A `gp interconnect`
-broker on each segment listens on `PostPortNumber + 10000` only to assign the
+broker on each segment listens on the port of its server plus 10000, or on
+any free port when another process holds that one, and reports the port it
+took to the coordinator with `gp.register_interconnect()`; clients connect to
+the port each segment reported, and fall back to the usual choice only until
+the report arrives.  The broker assigns the
 request a dynamic background worker.  The worker creates its own ephemeral TCP
 listener, or a per-slot Unix-domain socket, and the broker returns its port.
 The client connects there and sends the serialized plan again; no plan or
@@ -589,7 +596,7 @@ All are set at server start unless noted.
 | Function | What it does |
 |---|---|
 | `gp.register_segment(segment_id, host, port)` | Register a segment; called by the segment itself |
-| `gp.cluster_segments()` | Segments as the coordinator knows them, from any database |
+| `gp.cluster_segments()` | Segments as the coordinator knows them, with the port of each interconnect broker, from any database |
 | `gp.exec_on_all(sql)` | Run a command on all segments, return the status of each |
 | `gp.recorded_oids()` | OIDs of the new catalog rows of the transaction on the coordinator |
 | `gp.distribute(table, key, colocate_with)` | Distribute an empty table by hash of `key`, or replicate it |
@@ -636,6 +643,7 @@ start their own clusters:
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
+| `030_interconnect_port.pl` | A broker takes the port of its segment plus 10000 when free and any free port when another process holds it, reports the port it took, and clients connect to the reported port alone |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
@@ -677,8 +685,9 @@ by the patch and `contrib/gp`.
    tuples; clean
    gathers and immutable slices use the same transport, while mutable plans,
    special session semantics and a transaction's writes stay on its dispatched
-   connections; next are dynamic exchange of slice addresses and multiple
-   slices per segment.
+   connections; the broker of a segment reports its port to the coordinator,
+   so no client computes the address by a rule; next are multiple slices per
+   segment and full cancellation.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
 8. **More kinds of distribution** — replicated with the coordinator, on the

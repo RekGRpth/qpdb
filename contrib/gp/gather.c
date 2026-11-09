@@ -149,7 +149,10 @@ gp_gather_load_interconnect(GpGatherState *state)
 		if (only != 0 && segments[i].segment_id != only)
 			continue;
 		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
-								   segments[i].host, segments[i].port, 0))
+								   segments[i].host,
+								   gp_interconnect_port(segments[i].port,
+														segments[i].interconnect_port),
+								   0))
 		{
 			tuplestore_end(state->store);
 			state->store = NULL;

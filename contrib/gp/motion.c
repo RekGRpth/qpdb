@@ -135,7 +135,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 				errdetail("%s", err));
 	}
 	segments = libpqsrv_exec_params(conn,
-									"SELECT segment_id, host, port FROM gp.cluster_segments()",
+									"SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
 									0, NULL, NULL, NULL, NULL, 0,
 									gp_motion_event());
 	if (PQresultStatus(segments) != PGRES_TUPLES_OK)
@@ -154,11 +154,14 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	{
 		const char *host = PQgetvalue(segments, i, 1);
 		int			port = atoi(PQgetvalue(segments, i, 2));
+		int			broker = PQgetisnull(segments, i, 3) ? 0 :
+			atoi(PQgetvalue(segments, i, 3));
 		int			requester = gp_segment_id;
 
 		gp_interconnect_query(store, tupdesc, db,
 							  GetUserNameFromId(GetUserId(), false), serialized,
-							  host, port, requester);
+							  host, gp_interconnect_port(port, broker),
+							  requester);
 	}
 
 	PQclear(segments);

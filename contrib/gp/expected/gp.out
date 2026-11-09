@@ -62,8 +62,8 @@ SELECT extconfig::regclass[] FROM pg_extension WHERE extname = 'gp';
 (1 row)
 
 SELECT * FROM gp.segments;
- segment_id | host | port | registered 
-------------+------+------+------------
+ segment_id | host | port | interconnect_port | registered 
+------------+------+------+-------------------+------------
 (0 rows)
 
 -- The coordinator keeps the segments in shared memory

@@ -283,7 +283,10 @@ gp_slice_load_interconnect(GpSliceState *state)
 		if (only != 0 && segments[i].segment_id != only)
 			continue;
 		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
-								   segments[i].host, segments[i].port, 0))
+								   segments[i].host,
+								   gp_interconnect_port(segments[i].port,
+														segments[i].interconnect_port),
+								   0))
 		{
 			/* Earlier workers may have returned rows already */
 			tuplestore_end(state->store);
