@@ -475,13 +475,23 @@ gp_ic_listen(const char *port)
 		return PGINVALID_SOCKET;
 	for (struct addrinfo *ai = addrs; ai != NULL; ai = ai->ai_next)
 	{
-		int			on = 1;
-
 		listener = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (listener == PGINVALID_SOCKET)
 			continue;
-		(void) setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
-						  (const char *) &on, sizeof(on));
+		/*
+		 * On Windows this option does not wait out a closed listener: it
+		 * takes the port of a listening one, as the comment in pqcomm.c
+		 * says.  A broker must not take the port of another server, so
+		 * there it binds with no option at all, as the postmaster does.
+		 */
+#ifndef WIN32
+		{
+			int			on = 1;
+
+			(void) setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+							  (const char *) &on, sizeof(on));
+		}
+#endif
 #ifdef IPV6_V6ONLY
 		/*
 		 * One listener serves both families, for a client may name either
