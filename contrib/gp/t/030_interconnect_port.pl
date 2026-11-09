@@ -39,25 +39,36 @@ $coordinator->poll_query_until('postgres',
 	'SELECT interconnect_port = port + 10000 FROM gp.cluster_segments() WHERE segment_id = 1')
   or die 'the broker of segment 1 did not report its port';
 
-# Another process holds the usual port of segment 2 before it starts.  Any
-# connection the process answers is a client that ignores the report, which
-# counts against the query below
+# Another process holds the usual port of segment 2 before it starts, on
+# every family the broker might bind, and without SO_REUSEADDR, which on
+# Windows would let the broker bind over it.  Any connection the process
+# answers is a client that ignores the report, which counts against the
+# query below
 my $seg2 = PostgreSQL::Test::Cluster->new('seg2');
-my $busy = IO::Socket::IP->new(
-	LocalAddr => '127.0.0.1',
-	LocalPort => $seg2->port + 10000,
-	Proto => 'tcp',
-	Listen => 1,
-	Blocking => 0,
-	ReuseAddr => 1,
-) or die 'could not hold the usual interconnect port of segment 2';
+my @busy;
+for my $addr ('0.0.0.0', '::')
+{
+	my $sock = IO::Socket::IP->new(
+		LocalAddr => $addr,
+		LocalPort => $seg2->port + 10000,
+		Proto => 'tcp',
+		Listen => 1,
+		Blocking => 0,
+	);
+	die "could not hold the usual interconnect port of segment 2 on $addr"
+		if $addr eq '0.0.0.0' && !$sock;
+	push @busy, $sock if $sock;
+}
 my $hits = 0;
 sub drain_busy
 {
-	while (my $client = $busy->accept)
+	for my $sock (@busy)
 	{
-		$hits++;
-		close $client;
+		while (my $client = $sock->accept)
+		{
+			$hits++;
+			close $client;
+		}
 	}
 }
 
@@ -92,7 +103,7 @@ is($coordinator->safe_psql('postgres', 'SELECT count(*) FROM t'), 20,
 drain_busy();
 is($hits, 0, 'no client connects to the port another process holds');
 
-close($busy);
+close($_) foreach @busy;
 $_->stop foreach ($seg2, $seg1, $coordinator);
 
 done_testing();

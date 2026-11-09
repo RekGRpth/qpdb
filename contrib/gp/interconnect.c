@@ -482,6 +482,21 @@ gp_ic_listen(const char *port)
 			continue;
 		(void) setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
 						  (const char *) &on, sizeof(on));
+#ifdef IPV6_V6ONLY
+		/*
+		 * One listener serves both families, for a client may name either
+		 * address; Windows keeps an IPv6 listener apart from IPv4 unless
+		 * this says otherwise.  A system that cannot mix the families may
+		 * still bind the IPv4 address below.
+		 */
+		if (ai->ai_family == AF_INET6)
+		{
+			int			off = 0;
+
+			(void) setsockopt(listener, IPPROTO_IPV6, IPV6_V6ONLY,
+							  (const char *) &off, sizeof(off));
+		}
+#endif
 		if (bind(listener, ai->ai_addr, ai->ai_addrlen) == 0 &&
 			listen(listener, GP_IC_LISTEN_BACKLOG) == 0)
 			break;
