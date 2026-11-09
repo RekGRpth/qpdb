@@ -391,11 +391,15 @@ columns of the source.  The SQL function remains as a compatibility wrapper,
 but a fragment contains no `FunctionScan` for it.  While the coordinator builds
 that fragment, `GpGather` is disabled so that the fragment contains an ordinary
 scan.  A `gp interconnect`
-broker on each segment listens on the port of its server plus 10000, or on
-any free port when another process holds that one, and reports the port it
-took to the coordinator with `gp.register_interconnect()`; clients connect to
-the port each segment reported, and fall back to the usual choice only until
-the report arrives.  The broker assigns the
+broker on each segment takes any free TCP port — the port of its server
+says nothing about what a bind may take, for on Windows two sockets can
+hold the same port unless one of them refuses — and reports the port to
+the coordinator with `gp.register_interconnect()`.  Clients connect to
+the port each segment reported and to no other address; until the report
+arrives, a gather falls back to its dispatched connections, and a motion
+waits the way it waits for an unreachable broker.  A broker on a
+Unix-domain socket keeps its usual path in the directory of its own
+segment, where no other process competes for it.  The broker assigns the
 request a dynamic background worker.  The worker creates its own ephemeral TCP
 listener, or a per-slot Unix-domain socket, and the broker returns its port.
 The client connects there and sends the serialized plan again; no plan or

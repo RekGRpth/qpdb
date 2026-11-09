@@ -1,10 +1,10 @@
 # Copyright (c) 2026, Georgy Shelkovy
 # Licensed under the PostgreSQL License, see LICENSE
 
-# The broker of a segment takes the port of the segment plus 10000 when it
-# is free, and any free port when another server holds that one.  The
-# broker reports the port it took to the coordinator, and clients connect
-# to the port each segment reported, not to the one a rule computes
+# The broker of a segment takes any free TCP port and reports it to the
+# coordinator; clients connect to the reported port alone, and no rule
+# computes an address.  A Unix-domain broker keeps its usual socket in
+# the directory of its own segment
 
 use strict;
 use warnings FATAL => 'all';
@@ -12,7 +12,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Connections that reach the server holding the port by mistake: the
+# Connections that reach the server holding a port by mistake: the
 # interconnect protocol is no startup packet, and the server says so
 sub holder_complaints
 {
@@ -35,7 +35,7 @@ $coordinator->append_conf('postgresql.conf',
 $coordinator->start;
 $coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
 
-# The brokers listen on TCP, where another server can hold the usual port
+# The brokers listen on TCP, where the port of the server says nothing
 my $seg1 = PostgreSQL::Test::Cluster->new('seg1');
 $seg1->init;
 $seg1->append_conf('postgresql.conf', "listen_addresses = '127.0.0.1'
@@ -49,14 +49,8 @@ max_prepared_transactions = 10
 ");
 $seg1->start;
 
-# The usual port of segment 1 is free: its broker takes it and reports it
-$coordinator->poll_query_until('postgres',
-	'SELECT interconnect_port = port + 10000 FROM gp.cluster_segments() WHERE segment_id = 1')
-  or die 'the broker of segment 1 did not report its port';
-
-# Another server holds the usual port of segment 2 before it starts, on
-# every family a broker might bind: a live postmaster keeps its ports
-# against any bind, on every platform
+# Another server sits on the port of segment 2 plus 10000, the address a
+# rule would compute: nothing of the cluster may ever go there
 my $seg2 = PostgreSQL::Test::Cluster->new('seg2');
 my $holder = PostgreSQL::Test::Cluster->new('holder',
 	port => $seg2->port + 10000);
@@ -76,13 +70,15 @@ max_prepared_transactions = 10
 ");
 $seg2->start;
 
-# The broker of segment 2 takes another port and reports that one instead
+# Each segment reports the free port its broker took; the holder keeps
+# the one a rule would compute, so the report cannot be that one
 $coordinator->poll_query_until('postgres',
-	'SELECT interconnect_port IS NOT NULL AND interconnect_port <> port + 10000 FROM gp.cluster_segments() WHERE segment_id = 2')
-  or die 'the broker of segment 2 did not take another port';
-my ($reported) = $coordinator->safe_psql('postgres',
-	'SELECT interconnect_port FROM gp.cluster_segments() WHERE segment_id = 2');
-like($reported, qr/^\d+$/, "segment 2 reports its own port $reported");
+	'SELECT count(*) = 2 FROM gp.cluster_segments() WHERE interconnect_port IS NOT NULL')
+  or die 'the brokers did not report their ports';
+my ($seg2_port, $seg2_ic) = split /\|/, $coordinator->safe_psql('postgres',
+	'SELECT port, interconnect_port FROM gp.cluster_segments() WHERE segment_id = 2');
+isnt($seg2_ic, $seg2_port + 10000,
+	"segment 2 reports its own port $seg2_ic, not $seg2_port + 10000");
 
 # A clean query reads both segments through their reported ports; a client
 # that ignored the report would speak to the server holding the port

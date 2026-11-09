@@ -267,7 +267,6 @@ gp_slice_load_interconnect(GpSliceState *state)
 	plan = gp_interconnect_plan(state->sql);
 	db = get_database_name(MyDatabaseId);
 	user = GetUserNameFromId(GetUserId(), false);
-	state->store = tuplestore_begin_heap(true, false, work_mem);
 	nsegments = gp_segments_get(&segments);
 	if (state->replicated)
 	{
@@ -278,15 +277,23 @@ gp_slice_load_interconnect(GpSliceState *state)
 		only = segments[MyProcPid % nsegments].segment_id;
 	}
 
+	/* A segment whose broker has not reported its port is not ready yet */
+	for (int i = 0; i < nsegments; i++)
+	{
+		if (only != 0 && segments[i].segment_id != only)
+			continue;
+		if (segments[i].interconnect_port == 0)
+			return false;
+	}
+
+	state->store = tuplestore_begin_heap(true, false, work_mem);
 	for (int i = 0; i < nsegments; i++)
 	{
 		if (only != 0 && segments[i].segment_id != only)
 			continue;
 		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
 								   segments[i].host,
-								   gp_interconnect_port(segments[i].port,
-														segments[i].interconnect_port),
-								   0))
+								   segments[i].interconnect_port, 0))
 		{
 			/* Earlier workers may have returned rows already */
 			tuplestore_end(state->store);

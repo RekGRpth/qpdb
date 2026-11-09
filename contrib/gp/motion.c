@@ -134,34 +134,59 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 				errmsg("could not ask the coordinator for the segments"),
 				errdetail("%s", err));
 	}
-	segments = libpqsrv_exec_params(conn,
-									"SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
-									0, NULL, NULL, NULL, NULL, 0,
-									gp_motion_event());
-	if (PQresultStatus(segments) != PGRES_TUPLES_OK)
+	/*
+	 * The registry is the only address of a broker: there is no rule to
+	 * fall back to.  A segment registers itself a moment before its broker
+	 * reports its port, so that moment is waited out the way an
+	 * unreachable broker is, not failed at once
+	 */
+	segments = NULL;
+	for (int attempt = 0;; attempt++)
 	{
-		char	   *err = pchomp(PQresultErrorMessage(segments));
+		bool		reported = true;
 
-		PQclear(segments);
-		libpqsrv_disconnect(conn);
-		ereport(ERROR,
-				errcode(ERRCODE_CONNECTION_FAILURE),
-				errmsg("could not read the segments of the cluster"),
-				errdetail("%s", err));
+		if (segments != NULL)
+			PQclear(segments);
+		segments = libpqsrv_exec_params(conn,
+										"SELECT segment_id, host, port, interconnect_port FROM gp.cluster_segments()",
+										0, NULL, NULL, NULL, NULL, 0,
+										gp_motion_event());
+		if (PQresultStatus(segments) != PGRES_TUPLES_OK)
+		{
+			char	   *err = pchomp(PQresultErrorMessage(segments));
+
+			PQclear(segments);
+			libpqsrv_disconnect(conn);
+			ereport(ERROR,
+					errcode(ERRCODE_CONNECTION_FAILURE),
+					errmsg("could not read the segments of the cluster"),
+					errdetail("%s", err));
+		}
+		for (int i = 0; i < PQntuples(segments); i++)
+			if (PQgetisnull(segments, i, 3))
+				reported = false;
+		if (reported || attempt >= 59)
+			break;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(100000);
 	}
 
 	for (int i = 0; i < PQntuples(segments); i++)
 	{
 		const char *host = PQgetvalue(segments, i, 1);
-		int			port = atoi(PQgetvalue(segments, i, 2));
+		int			segment_id = atoi(PQgetvalue(segments, i, 0));
 		int			broker = PQgetisnull(segments, i, 3) ? 0 :
 			atoi(PQgetvalue(segments, i, 3));
 		int			requester = gp_segment_id;
 
+		if (broker == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("segment %d has not reported its interconnect port yet",
+						   segment_id));
 		gp_interconnect_query(store, tupdesc, db,
 							  GetUserNameFromId(GetUserId(), false), serialized,
-							  host, gp_interconnect_port(port, broker),
-							  requester);
+							  host, broker, requester);
 	}
 
 	PQclear(segments);

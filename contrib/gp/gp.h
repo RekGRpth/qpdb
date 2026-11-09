@@ -117,7 +117,6 @@ extern void gp_motion_init(void);
 /* interconnect.c */
 extern void gp_interconnect_init(void);
 extern char *gp_interconnect_plan(const char *sql);
-extern int	gp_interconnect_port(int port, int interconnect_port);
 extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
 								  const char *host, int port, int requester);

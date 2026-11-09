@@ -478,20 +478,6 @@ gp_ic_listen(const char *port)
 		listener = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if (listener == PGINVALID_SOCKET)
 			continue;
-		/*
-		 * On Windows this option does not wait out a closed listener: it
-		 * takes the port of a listening one, as the comment in pqcomm.c
-		 * says.  A broker must not take the port of another server, so
-		 * there it binds with no option at all, as the postmaster does.
-		 */
-#ifndef WIN32
-		{
-			int			on = 1;
-
-			(void) setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
-							  (const char *) &on, sizeof(on));
-		}
-#endif
 #ifdef IPV6_V6ONLY
 		/*
 		 * One listener serves both families, for a client may name either
@@ -518,21 +504,25 @@ gp_ic_listen(const char *port)
 }
 
 /*
- * Bind the listener of a segment on the port it names.  Over TCP, when
- * another process holds that port, any free port serves instead, and the
- * caller reads it back.  A Unix-domain socket lives in the directory of its
- * own segment, where no other process competes for it.
+ * Bind the listener of a segment.  A Unix-domain socket keeps its usual
+ * name, in the directory of its own segment, where no other process
+ * competes for it.  Over TCP the port of the server says nothing about
+ * what a bind may take: on Windows two sockets can hold the same port
+ * unless one of them refuses, so the broker asks the operating system
+ * for any free port and reports it, and the registry is the only address
+ * there is.
  */
 static pgsocket
 gp_interconnect_listen(int *port)
 {
-	char		service[12];
 	pgsocket	listener;
+	char		service[12];
 
-	snprintf(service, sizeof(service), "%d", *port);
-	listener = gp_ic_listen(service);
-	if (listener != PGINVALID_SOCKET || is_absolute_path(gp_host_address()))
-		return listener;
+	if (is_absolute_path(gp_host_address()))
+	{
+		snprintf(service, sizeof(service), "%d", *port);
+		return gp_ic_listen(service);
+	}
 
 	listener = gp_ic_listen("0");
 	if (listener != PGINVALID_SOCKET)
@@ -1174,18 +1164,6 @@ gp_ic_send_query(pgsocket fd, const char *token, const char *db,
 		gp_ic_write_i32(fd, requester) &&
 		gp_ic_write_i32(fd, strlen(sql)) &&
 		gp_ic_write(fd, sql, strlen(sql));
-}
-
-/*
- * The port of the broker of a segment: the one it reported, or the usual
- * choice of the port of the segment plus the offset while it has not
- * reported yet
- */
-int
-gp_interconnect_port(int port, int interconnect_port)
-{
-	return interconnect_port != 0 ? interconnect_port :
-		port + GP_IC_PORT_OFFSET;
 }
 
 /*
