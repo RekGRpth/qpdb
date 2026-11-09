@@ -141,6 +141,7 @@ is(run('SELECT b, count(*) FROM parent_t GROUP BY b ORDER BY b'),
 
 # An autonomous motion cannot see the writes of this transaction
 my $session = $coordinator->background_psql('postgres', on_error_stop => 1);
+$session->query_safe('PREPARE own_slice AS SELECT a, count(*) FROM t WHERE a = 11 GROUP BY a');
 $session->query_safe('BEGIN');
 $session->query_safe("INSERT INTO t VALUES (11, 'new', 1)");
 $session->query_safe("INSERT INTO l VALUES (11, 'new', 1)");
@@ -149,8 +150,23 @@ unlike($session->query_safe('EXPLAIN (COSTS OFF) SELECT b, count(*) FROM t GROUP
 is($session->query_safe("SELECT b, count(*) FROM t WHERE b = 'new' GROUP BY b"),
 	$session->query_safe("SELECT b, count(*) FROM l WHERE b = 'new' GROUP BY b"),
 	'an aggregate after a write sees the new row');
+is($session->query_safe('EXECUTE own_slice'),
+	'11|1', 'a prepared slice falls back and sees the new row');
 $session->query_safe('ROLLBACK');
+$session->query_safe('DEALLOCATE own_slice');
 $session->quit;
+
+# A stable expression must see the session settings, not those of a fresh
+# autonomous worker.  This slice stays on the synchronized connections.
+run('CREATE TABLE ts (a int, t timestamptz)');
+run("SELECT gp.distribute('ts', ARRAY['a'])");
+run("INSERT INTO ts VALUES (1, '2024-01-01 02:00+00'), (2, '2024-01-01 12:00+00')");
+run('CREATE TABLE ts_l AS SELECT * FROM ts');
+my $tz_query = q{SET TIME ZONE 'America/New_York'; SELECT a, date_trunc('day', min(t)) FROM %s GROUP BY a ORDER BY a};
+like(plan_for("SELECT a, date_trunc('day', min(t)) FROM ts GROUP BY a ORDER BY a"),
+	qr/GpSlice/, 'a stable expression keeps its slice plan');
+is(run(sprintf($tz_query, 'ts')), run(sprintf($tz_query, 'ts_l')),
+	'a stable expression uses the TimeZone of the session');
 
 # A dropped column cannot be returned by the record of a motion
 run('ALTER TABLE t ADD COLUMN junk int');

@@ -34,8 +34,10 @@
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "executor/executor.h"
@@ -64,6 +66,7 @@ typedef struct GpSliceState
 	char	   *sql;
 	bool		replicated;
 	bool		motion;
+	bool		autonomous;
 	Tuplestorestate *store;		/* all rows, once read */
 } GpSliceState;
 
@@ -80,11 +83,83 @@ static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion);
 
 /*
+ * The request worker does not inherit the settings of the session.  Only an
+ * immutable fragment can run there without changing the answer.  The motion
+ * function itself is the exception: its serialized argument was planned by
+ * the coordinator, and the function is just the transport of that fragment.
+ */
+static bool
+gp_slice_mutable_checker(Oid func_id, void *context)
+{
+	Oid			peer_query_oid = *((Oid *) context);
+
+	return func_id != peer_query_oid &&
+		func_volatile(func_id) != PROVOLATILE_IMMUTABLE;
+}
+
+static bool
+gp_slice_mutable_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (check_functions_in_node(node, gp_slice_mutable_checker, context))
+		return true;
+
+	/* These nodes need the rules of contain_mutable_functions() too.  Be
+	 * conservative rather than duplicate its detailed JSON and XML rules. */
+	if (IsA(node, SQLValueFunction) || IsA(node, NextValueExpr) ||
+		IsA(node, JsonConstructorExpr) || IsA(node, JsonExpr) ||
+		IsA(node, XmlExpr))
+		return true;
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_mutable_walker,
+							 context, 0);
+	return expression_tree_walker(node, gp_slice_mutable_walker, context);
+}
+
+/* Whether an autonomous request preserves the semantics of this session */
+static bool
+gp_slice_autonomous(Query *query)
+{
+	Oid			peer_query_oid;
+
+	if (GetUserId() != GetSessionUserId())
+		return false;
+
+	foreach_node(RangeTblEntry, rte, query->rtable)
+	{
+		HeapTuple	tuple;
+		Form_pg_class rel;
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+		/* Children can have their own RLS policies; keep this case on libpq */
+		if (rte->inh)
+			return false;
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for relation %u", rte->relid);
+		rel = (Form_pg_class) GETSTRUCT(tuple);
+		if (rel->relrowsecurity || rel->relforcerowsecurity)
+		{
+			ReleaseSysCache(tuple);
+			return false;
+		}
+		ReleaseSysCache(tuple);
+	}
+
+	peer_query_oid = DatumGetObjectId(DirectFunctionCall1(regprocedurein,
+								  CStringGetDatum("gp.peer_query(text)")));
+	return !gp_slice_mutable_walker((Node *) query, &peer_query_oid);
+}
+
+/*
  * Read all rows of the aggregate from the segments into the tuplestore.
  * The columns of the result are those of the target list of the node.
  */
 static void
-gp_slice_load(GpSliceState *state)
+gp_slice_load_libpq(GpSliceState *state)
 {
 	ScanState  *ss = &state->css.ss;
 	TupleDesc	tupdesc = ss->ss_ScanTupleSlot->tts_tupleDescriptor;
@@ -173,6 +248,61 @@ gp_slice_load(GpSliceState *state)
 	MemoryContextDelete(rowcxt);
 }
 
+/* Run a clean immutable fragment in autonomous interconnect workers */
+static bool
+gp_slice_load_interconnect(GpSliceState *state)
+{
+	ScanState  *ss = &state->css.ss;
+	TupleDesc	tupdesc = ss->ss_ScanTupleSlot->tts_tupleDescriptor;
+	GpSegment  *segments;
+	char	   *plan;
+	char	   *db;
+	const char *user;
+	int			nsegments;
+	int			only = 0;
+
+	if (!state->autonomous || GetUserId() != GetSessionUserId())
+		return false;
+
+	plan = gp_interconnect_plan(state->sql);
+	db = get_database_name(MyDatabaseId);
+	user = GetUserNameFromId(GetUserId(), false);
+	state->store = tuplestore_begin_heap(true, false, work_mem);
+	nsegments = gp_segments_get(&segments);
+	if (state->replicated)
+	{
+		if (nsegments == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("the cluster has no segments"));
+		only = segments[MyProcPid % nsegments].segment_id;
+	}
+
+	for (int i = 0; i < nsegments; i++)
+	{
+		if (only != 0 && segments[i].segment_id != only)
+			continue;
+		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
+								   segments[i].host, segments[i].port, 0))
+		{
+			/* Earlier workers may have returned rows already */
+			tuplestore_end(state->store);
+			state->store = NULL;
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+gp_slice_load(GpSliceState *state)
+{
+	if (XactIsoLevel == XACT_READ_COMMITTED && !gp_dispatch_in_xact() &&
+		gp_slice_load_interconnect(state))
+		return;
+	gp_slice_load_libpq(state);
+}
+
 static void
 gp_slice_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -182,6 +312,7 @@ gp_slice_begin(CustomScanState *node, EState *estate, int eflags)
 	state->sql = strVal(linitial(cscan->custom_private));
 	state->replicated = boolVal(lsecond(cscan->custom_private));
 	state->motion = boolVal(lthird(cscan->custom_private));
+	state->autonomous = boolVal(lfourth(cscan->custom_private));
 }
 
 static TupleTableSlot *
@@ -458,9 +589,10 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	cscan->scan.plan.plan_rows = src->plan_rows;
 	cscan->scan.plan.plan_width = src->plan_width;
 	cscan->custom_scan_tlist = copyObject(origtlist);
-	cscan->custom_private = list_make3(makeString(pg_get_querydef(remote, false)),
+	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
 									   makeBoolean(replicated),
-									   makeBoolean(motion));
+									   makeBoolean(motion),
+									   makeBoolean(gp_slice_autonomous(remote)));
 	cscan->methods = &gp_slice_plan_methods;
 	return cscan;
 }
@@ -2046,9 +2178,10 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	cscan->scan.plan.plan_rows = agg->plan.lefttree->plan_rows;
 	cscan->scan.plan.plan_width = agg->plan.lefttree->plan_width;
 	cscan->custom_scan_tlist = copyObject(remote->targetList);
-	cscan->custom_private = list_make3(makeString(pg_get_querydef(remote, false)),
+	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
 									   makeBoolean(false),
-									   makeBoolean(false));
+									   makeBoolean(false),
+									   makeBoolean(gp_slice_autonomous(remote)));
 	cscan->methods = &gp_slice_plan_methods;
 
 	/* The final aggregate over the columns of the answer */
