@@ -380,9 +380,10 @@ the relcache entry of the table, and a change of an extension drops it.
 
 ### Interconnect (`interconnect.c`, `motion.c`)
 
-`gp.peer_query()` and a clean `GpGather` receive a serialized `PlannedStmt`,
-not SQL text.  While the coordinator builds that fragment, `GpGather` is
-disabled so that the fragment contains an ordinary scan.  A `gp interconnect`
+`gp.peer_query()`, a clean `GpGather` and a clean immutable `GpSlice` receive
+a serialized `PlannedStmt`, not SQL text.  While the coordinator builds that
+fragment, `GpGather` is disabled so that the fragment contains an ordinary
+scan.  A `gp interconnect`
 broker on each segment listens on `PostPortNumber + 10000` only to assign the
 request a dynamic background worker.  The worker creates its own ephemeral TCP
 listener, or a per-slot Unix-domain socket, and the broker returns its port.
@@ -397,13 +398,20 @@ gets another worker instead of waiting for a busy single listener.
 
 Closing a connection cancels the query.  The receiver materializes the rows,
 so a writer never waits for a reader of another motion while blocked on this
-one.  A direct Gather shares the distributed commit-exclusion lock with the
-other remote scans of its statement.  The executor starts only after a
+one.  A direct Gather or Slice shares the distributed commit-exclusion lock
+with the other remote scans of its statement.  The executor starts only after a
 READY/GO handshake.  A transport failure before that confirmation is retried,
 including a connection reset left by an old listener's backlog.  A failure
 after GO is an error, never a retry that could repeat a volatile function of
 the fragment.  Error and retry responses finish with a bounded graceful close,
 so Windows cannot turn them into an undelivered connection reset.
+
+A Slice with a mutable expression, RLS, inheritance or a changed session
+identity stays on the synchronized dispatched connections, as does any Slice
+outside READ COMMITTED or after a write in its transaction.  A connection
+failure before GO discards any rows already received from other segments and
+uses that same fallback.  Nested Motion can connect to its own segment because
+the broker assigns every such request a separate worker.
 
 At the first registration the coordinator generates a 32-byte token and
 returns it as hex.  The coordinator and the registering segment each store it
@@ -620,7 +628,7 @@ start their own clusters:
 | `022_unique_key.pl` | Unique indexes of a distributed table must include the whole key of the distribution; equal keys stay on one segment, and its index tells them apart |
 | `023_update_delete.pl` | `UPDATE` and `DELETE` run on the segments: distributed and replicated tables, rollbacks, a second writer waiting out the first, what is refused |
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
-| `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write and dropped-column fallbacks |
+| `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write, session-setting and dropped-column fallbacks |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
 | `029_redistributed_join.pl` | Inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
@@ -662,9 +670,9 @@ by the patch and `contrib/gp`.
    the locus model for the rest.
 6. **Interconnect** — in progress: joins move tables by redistribution or
    broadcast over a serialized-plan transport with binary tuples; clean
-   gathers use the same transport, while a transaction's writes stay on its
-   dispatched connections; next are a `CustomScan Motion` and multiple slices
-   per segment.
+   gathers and immutable slices use the same transport, while mutable plans,
+   special session semantics and a transaction's writes stay on its dispatched
+   connections; next are a `CustomScan Motion` and multiple slices per segment.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
 8. **More kinds of distribution** — replicated with the coordinator, on the
