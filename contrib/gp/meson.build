@@ -85,6 +85,7 @@ tests += {
       't/027_subquery_pushdown.pl',
       't/028_partial_agg.pl',
       't/029_redistributed_join.pl',
+      't/030_interconnect_port.pl',
     ],
   },
 }

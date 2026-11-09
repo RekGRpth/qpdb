@@ -48,6 +48,7 @@ typedef struct GpSegment
 {
 	int			segment_id;
 	int			port;
+	int			interconnect_port;		/* its broker, 0 until reported */
 	char		host[GP_HOST_LEN];
 } GpSegment;
 
