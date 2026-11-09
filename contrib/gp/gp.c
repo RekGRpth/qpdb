@@ -264,6 +264,7 @@ _PG_init(void)
 		gp_slice_init();
 	}
 
+	gp_motion_init();
 	gp_oids_init();
 
 	if (gp_role == GP_ROLE_SEGMENT)
