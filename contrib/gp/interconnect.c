@@ -785,10 +785,26 @@ gp_ic_reap_slots(void)
 }
 
 /*
- * Stop the worker of a request whose client went away.  The generation
- * tells a worker of an earlier request from the worker of this one, and
- * the worker dies on the signal, from the middle of a long fragment too,
- * not only between two rows.
+ * The worker of a slot of this generation, if one is there: the
+ * generation tells a worker of an earlier request from the worker of
+ * this one.
+ */
+static pid_t
+gp_ic_slot_worker(GpIcSlot *slot, uint64 generation)
+{
+	pid_t		pid = 0;
+
+	SpinLockAcquire(&slot->lock);
+	if (slot->generation == generation && slot->pid != 0)
+		pid = slot->pid;
+	SpinLockRelease(&slot->lock);
+	return pid;
+}
+
+/*
+ * Stop the worker of a request whose client went away.  The worker dies
+ * on the signal, from the middle of a long fragment too, not only
+ * between two rows.
  */
 static void
 gp_ic_cancel_slot(pgsocket fd)
@@ -797,7 +813,7 @@ gp_ic_cancel_slot(pgsocket fd)
 	uint32		gen_hi;
 	uint32		gen_lo;
 	uint64		generation;
-	pid_t		pid = 0;
+	pid_t		pid;
 
 	if (!gp_ic_read_i32(fd, &slot_id) ||
 		!gp_ic_read(fd, &gen_hi, sizeof(gen_hi)) ||
@@ -807,13 +823,17 @@ gp_ic_cancel_slot(pgsocket fd)
 	if (slot_id < 0 || slot_id >= GP_IC_SLOTS)
 		return;
 
-	SpinLockAcquire(&gp_ic_slots[slot_id].lock);
-	if (gp_ic_slots[slot_id].generation == generation &&
-		gp_ic_slots[slot_id].pid != 0)
-		pid = gp_ic_slots[slot_id].pid;
-	SpinLockRelease(&gp_ic_slots[slot_id].lock);
-	if (pid != 0)
-		(void) kill(pid, SIGINT);
+	pid = gp_ic_slot_worker(&gp_ic_slots[slot_id], generation);
+	if (pid == 0)
+		ereport(LOG,
+				errmsg("no interconnect worker to stop in slot %d", slot_id));
+	else if (kill(pid, SIGINT) != 0)
+		ereport(LOG,
+				errmsg("could not stop the interconnect worker of slot %d: %m",
+					   slot_id));
+	else
+		ereport(LOG,
+				errmsg("stopped the interconnect worker of slot %d", slot_id));
 }
 
 /* Assign one request a dynamic worker and its own ephemeral listener */
@@ -955,6 +975,19 @@ gp_ic_assign(pgsocket fd, const char *token)
 		(void) gp_ic_write_message(fd, GP_IC_RETRY, NULL, 0);
 	if (!assigned)
 		gp_ic_shutdown_write(fd);
+
+	/*
+	 * A client that went away while its worker was starting left no one
+	 * to connect to it and no one to name it in a cancel: the worker
+	 * would wait out its whole minute before it goes by itself
+	 */
+	if (!assigned && slot != NULL)
+	{
+		pid_t		pid = gp_ic_slot_worker(slot, generation);
+
+		if (pid != 0)
+			(void) kill(pid, SIGINT);
+	}
 	return assigned;
 }
 
@@ -1353,23 +1386,6 @@ gp_ic_connect(const char *host, int port)
 	return fd;
 }
 
-/* Send the full request; no executor runs until the later READY/GO */
-static bool
-gp_ic_send_query(pgsocket fd, const char *token, const char *db,
-				 const char *user, int requester, const char *sql)
-{
-	return gp_ic_write(fd, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
-		gp_ic_write_i32(fd, strlen(token)) &&
-		gp_ic_write(fd, token, strlen(token)) &&
-		gp_ic_write_i32(fd, strlen(db)) &&
-		gp_ic_write(fd, db, strlen(db)) &&
-		gp_ic_write_i32(fd, strlen(user)) &&
-		gp_ic_write(fd, user, strlen(user)) &&
-		gp_ic_write_i32(fd, requester) &&
-		gp_ic_write_i32(fd, strlen(sql)) &&
-		gp_ic_write(fd, sql, strlen(sql));
-}
-
 /*
  * Ask the broker to stop the worker of this request.  The client sends
  * this when it dies or gives up, so that a fragment long between two
@@ -1407,14 +1423,19 @@ gp_ic_cancel_request(const char *host, int port, const char *token,
 	PG_TRY();
 	{
 		fd = gp_ic_connect(host, port);
+		if (fd == PGINVALID_SOCKET ||
+			!gp_ic_write(fd, message, sizeof(message)))
+			ereport(LOG,
+					errmsg("could not reach the interconnect broker of %s to stop slot %d",
+						   host, slot_id));
 		if (fd != PGINVALID_SOCKET)
-		{
-			(void) gp_ic_write(fd, message, sizeof(message));
 			closesocket(fd);
-		}
 	}
 	PG_CATCH();
 	{
+		ereport(LOG,
+				errmsg("could not ask %s to stop interconnect slot %d",
+					   host, slot_id));
 		FlushErrorState();
 	}
 	PG_END_TRY();
