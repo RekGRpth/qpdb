@@ -98,6 +98,11 @@ run('CREATE TABLE l2 AS SELECT * FROM t2');
 run('CREATE TABLE l3 AS SELECT * FROM t3');
 run('CREATE TABLE l4 AS SELECT * FROM t4');
 
+like(plan_for(q{SELECT * FROM gp.peer_query('fragment') AS moved(a int)}),
+	qr/Custom Scan \(GpMotion\)/, 'the peer-query marker becomes a motion node');
+like(plan_for(q{SELECT * FROM gp.peer_query(current_setting('gp.host')) AS moved(a int)}),
+	qr/Function Scan on peer_query/, 'a computed argument stays an ordinary function');
+
 like(plan_for('SELECT t1.a, t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'a join of two colocation groups moves one table');
 like(plan_for('SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a'),

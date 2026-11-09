@@ -110,6 +110,9 @@ extern void gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt);
 extern void gp_slice_partial_plan(Query *parse, PlannedStmt *stmt);
 extern bool gp_slice_insert_motion(Query *parse);
 
+/* motion.c */
+extern void gp_motion_init(void);
+
 /* interconnect.c */
 extern void gp_interconnect_init(void);
 extern char *gp_interconnect_plan(const char *sql);
