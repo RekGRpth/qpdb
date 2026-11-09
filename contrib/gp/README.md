@@ -411,7 +411,16 @@ slots pass through STARTING, READY, ASSIGNED and BUSY back to FREE, and the
 broker reaps stopped workers.  Nested Motion to the same segment therefore
 gets another worker instead of waiting for a busy single listener.
 
-Closing a connection cancels the query.  The receiver materializes the rows,
+A cancelled query takes its fragments with it.  A client reads and writes
+its socket over waits on its latch, for no signal handler of `pqsignal`
+interrupts a blocking `recv`, and neither does the timer of a statement
+timeout; while it waits, the lock of the distributed snapshot holds its
+interrupts back, so the wait lets them through for the moment.  A client
+that dies, or fails, or is cancelled then names the worker of its request
+— the broker answers an assignment with the port of the worker and its
+slot and generation — and the broker stops that worker with a signal, from
+the middle of a fragment long between two rows as well as between them.
+The receiver materializes the rows,
 so a writer never waits for a reader of another motion while blocked on this
 one.  A direct Gather or Slice shares the distributed commit-exclusion lock
 with the other remote scans of its statement.  The executor starts only after a
@@ -647,7 +656,8 @@ start their own clusters:
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
 | `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
-| `030_interconnect_port.pl` | A broker takes the port of its segment plus 10000 when free and any free port when another process holds it, reports the port it took, and clients connect to the reported port alone |
+| `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
+| `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
