@@ -132,14 +132,14 @@ cmd_start()
 		[ "$role" = segment ] || continue
 		i=0
 		while :; do
-			exists=$(psql -X -A -t -q -h localhost -p "$port" -d postgres \
+			exists=$("$PGBIN/psql" -X -A -t -q -h localhost -p "$port" -d postgres \
 				-c "SELECT count(*) FROM pg_extension WHERE extname = 'gp'" \
 				2>>"$dir/$name.log" || true)
 			[ "$exists" = 1 ] && break
 			i=$((i + 1))
 			[ "$i" -le 60 ] ||
 				die "extension gp did not appear on $name, see $dir/$name.log"
-			psql -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
+			"$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
 				-p "$port" -d postgres \
 				-c 'SET gp.allow_local_ddl = on' \
 				-c 'CREATE EXTENSION IF NOT EXISTS gp' \
