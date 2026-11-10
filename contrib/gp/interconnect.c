@@ -251,9 +251,17 @@ gp_ic_read_latched(pgsocket fd, void *buf, int len)
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
-			/* An interrupt is answered here, while nothing holds it back */
+			/*
+			 * An interrupt is answered here, while nothing holds it back;
+			 * an error jump leaves the hold behind, which the handler of
+			 * it resets.  On Windows the wait leaves the socket in
+			 * blocking mode, so put it back, or the next recv blocks in
+			 * the kernel and this loop never runs again
+			 */
 			CHECK_FOR_INTERRUPTS();
 			InterruptHoldoffCount = holdoff;
+			if (!pg_set_noblock(fd))
+				return false;
 			continue;
 		}
 		if (n <= 0)
@@ -303,9 +311,11 @@ gp_ic_write_latched(pgsocket fd, const void *buf, int len)
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
-			/* An interrupt is answered here, while nothing holds it back */
+			/* As in the read: answer, restore the hold, unblock the socket */
 			CHECK_FOR_INTERRUPTS();
 			InterruptHoldoffCount = holdoff;
+			if (!pg_set_noblock(fd))
+				return false;
 			continue;
 		}
 		if (n <= 0)
