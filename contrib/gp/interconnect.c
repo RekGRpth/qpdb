@@ -201,38 +201,43 @@ gp_ic_client_event(void)
 	return event;
 }
 
-/* Whether the last socket call found a nonblocking socket busy */
-static bool
-gp_ic_wouldblock(void)
-{
-#ifdef WIN32
-	return WSAGetLastError() == WSAEWOULDBLOCK;
-#else
-	return errno == EAGAIN || errno == EWOULDBLOCK;
-#endif
-}
-
 /*
- * Read from a nonblocking socket, waiting on the latch between attempts.
- * A client that waits this way is reached by a cancel of its own query:
- * no signal handler of pqsignal interrupts a blocking recv, and neither
- * does the timer of a statement timeout.
+ * Read from the socket, waiting on the latch between attempts.  The
+ * socket is touched only after a wait reports it ready: on Windows a
+ * wait leaves the socket in blocking mode, so a recv without a
+ * readiness report would sit in the kernel forever, and setting the
+ * mode back may itself fail.  A client that waits this way is reached
+ * by a cancel of its own query: no signal handler of pqsignal
+ * interrupts a blocking recv, and neither does the timer of a
+ * statement timeout.
  */
 static bool
 gp_ic_read_latched(pgsocket fd, void *buf, int len)
 {
 	char	   *p = buf;
+	bool		ready = true;	/* the socket is nonblocking until a wait */
 
 	while (len > 0)
 	{
-		ssize_t		n = recv(fd, p, len, 0);
+		ssize_t		n = -1;
 
-		if (n < 0 && errno == EINTR)
+		if (ready)
 		{
-			CHECK_FOR_INTERRUPTS();
-			continue;
+			n = recv(fd, p, len, 0);
+			if (n < 0 && errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			if (n == 0)
+				return false;
+			if (n > 0)
+			{
+				p += n;
+				len -= n;
+				continue;
+			}
 		}
-		if (n < 0 && gp_ic_wouldblock())
 		{
 			int			wake;
 			int			holdoff = InterruptHoldoffCount;
@@ -241,8 +246,8 @@ gp_ic_read_latched(pgsocket fd, void *buf, int len)
 			 * A statement that reads the interconnect holds the lock of
 			 * the distributed snapshot, which holds its interrupts back:
 			 * a wait must let them through, or a timeout of the query
-			 * never reaches it.  The wait is bounded, so a Windows
-			 * backend checks a queued cancel even if its event is missed
+			 * never reaches it.  The wait is bounded, so the interrupt
+			 * is answered even when nothing else wakes the wait
 			 */
 			InterruptHoldoffCount = 0;
 			wake = WaitLatchOrSocket(MyLatch,
@@ -251,23 +256,12 @@ gp_ic_read_latched(pgsocket fd, void *buf, int len)
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
-			/*
-			 * An interrupt is answered here, while nothing holds it back;
-			 * an error jump leaves the hold behind, which the handler of
-			 * it resets.  On Windows the wait leaves the socket in
-			 * blocking mode, so put it back, or the next recv blocks in
-			 * the kernel and this loop never runs again
-			 */
+			/* An interrupt is answered here, while nothing holds it back */
 			CHECK_FOR_INTERRUPTS();
 			InterruptHoldoffCount = holdoff;
-			if (!pg_set_noblock(fd))
-				return false;
+			ready = (wake & WL_SOCKET_READABLE) != 0;
 			continue;
 		}
-		if (n <= 0)
-			return false;
-		p += n;
-		len -= n;
 	}
 	return true;
 }
@@ -283,27 +277,40 @@ gp_ic_read_i32_latched(pgsocket fd, int32 *value)
 	return true;
 }
 
-/* Write to a nonblocking socket, waiting on the latch between attempts */
+/* Write to the socket, waiting on the latch between attempts; the
+ * socket is touched only after a wait reports it ready, as in the read */
 static bool
 gp_ic_write_latched(pgsocket fd, const void *buf, int len)
 {
 	const char *p = buf;
+	bool		ready = true;	/* the socket is nonblocking until a wait */
 
 	while (len > 0)
 	{
-		ssize_t		n = send(fd, p, len, 0);
+		ssize_t		n = -1;
 
-		if (n < 0 && errno == EINTR)
+		if (ready)
 		{
-			CHECK_FOR_INTERRUPTS();
-			continue;
+			n = send(fd, p, len, 0);
+			if (n < 0 && errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			if (n == 0)
+				return false;
+			if (n > 0)
+			{
+				p += n;
+				len -= n;
+				continue;
+			}
 		}
-		if (n < 0 && gp_ic_wouldblock())
 		{
 			int			wake;
 			int			holdoff = InterruptHoldoffCount;
 
-			/* As in the read: a wait must let the interrupts through */
+			/* As in the read: let the interrupts through, answer them */
 			InterruptHoldoffCount = 0;
 			wake = WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
@@ -311,17 +318,11 @@ gp_ic_write_latched(pgsocket fd, const void *buf, int len)
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
-			/* As in the read: answer, restore the hold, unblock the socket */
 			CHECK_FOR_INTERRUPTS();
 			InterruptHoldoffCount = holdoff;
-			if (!pg_set_noblock(fd))
-				return false;
+			ready = (wake & WL_SOCKET_WRITEABLE) != 0;
 			continue;
 		}
-		if (n <= 0)
-			return false;
-		p += n;
-		len -= n;
 	}
 	return true;
 }
