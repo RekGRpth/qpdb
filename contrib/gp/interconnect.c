@@ -983,10 +983,10 @@ gp_ic_assign(pgsocket fd, const char *token)
 	 */
 	if (!assigned && slot != NULL)
 	{
-		pid_t		pid = gp_ic_slot_worker(slot, generation);
+		pid_t		orphan = gp_ic_slot_worker(slot, generation);
 
-		if (pid != 0)
-			(void) kill(pid, SIGINT);
+		if (orphan != 0)
+			(void) kill(orphan, SIGINT);
 	}
 	return assigned;
 }
