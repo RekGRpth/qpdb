@@ -124,15 +124,28 @@ cmd_start()
 		-c 'CREATE EXTENSION IF NOT EXISTS gp' ||
 		die "could not create extension gp on the coordinator"
 
-	# The motion of a segment calls the functions of the extension there
+	# The motion of a segment calls the functions of the extension there.
+	# Its registration worker normally creates it already, so the manual
+	# creation below only retries until it is there: a concurrent CREATE
+	# EXTENSION may fail once when the worker gets there first.
 	list | while read -r name port role; do
 		[ "$role" = segment ] || continue
-		psql -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
-			-p "$port" -d postgres \
-			-c 'SET gp.allow_local_ddl = on' \
-			-c 'CREATE EXTENSION IF NOT EXISTS gp' \
-			>>"$dir/$name.log" 2>&1 ||
-			echo "warning: could not create extension gp on $name"
+		i=0
+		while :; do
+			exists=$(psql -X -A -t -q -h localhost -p "$port" -d postgres \
+				-c "SELECT count(*) FROM pg_extension WHERE extname = 'gp'" \
+				2>>"$dir/$name.log" || true)
+			[ "$exists" = 1 ] && break
+			i=$((i + 1))
+			[ "$i" -le 60 ] ||
+				die "extension gp did not appear on $name, see $dir/$name.log"
+			psql -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
+				-p "$port" -d postgres \
+				-c 'SET gp.allow_local_ddl = on' \
+				-c 'CREATE EXTENSION IF NOT EXISTS gp' \
+				>>"$dir/$name.log" 2>&1 || true
+			sleep 1
+		done
 	done
 
 	# Segments retry every few seconds, so the first ones may have failed
