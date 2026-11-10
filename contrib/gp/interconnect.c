@@ -1419,6 +1419,10 @@ gp_ic_cancel_request(const char *host, int port, const char *token,
 	p += sizeof(gen_hi);
 	memcpy(p, &gen_lo, sizeof(gen_lo));
 
+	/* The attempt itself tells whether this side did its part */
+	ereport(LOG,
+			errmsg("stopping interconnect slot %d on %s", slot_id, host));
+
 	/* The cancel must not fail the failure it answers */
 	PG_TRY();
 	{
