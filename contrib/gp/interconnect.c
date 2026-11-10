@@ -281,7 +281,9 @@ gp_ic_read_latched(pgsocket fd, WaitEventSet *wes, void *buf, int len)
 		ssize_t		n = recv(fd, p, len, 0);
 
 #ifdef WIN32
-		elog(LOG, "gp interconnect recv %d", (int) n);
+		/* elog itself may replace the error of the socket call */
+		elog(LOG, "gp interconnect recv %d error %d", (int) n,
+			 n < 0 ? WSAGetLastError() : 0);
 #endif
 		if (n < 0 && errno == EINTR)
 		{
