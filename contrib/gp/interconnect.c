@@ -241,13 +241,14 @@ gp_ic_read_latched(pgsocket fd, void *buf, int len)
 			 * A statement that reads the interconnect holds the lock of
 			 * the distributed snapshot, which holds its interrupts back:
 			 * a wait must let them through, or a timeout of the query
-			 * never reaches it
+			 * never reaches it.  The wait is bounded, so a Windows
+			 * backend checks a queued cancel even if its event is missed
 			 */
 			InterruptHoldoffCount = 0;
 			wake = WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
 									 WL_SOCKET_READABLE,
-									 fd, -1L, gp_ic_client_event());
+									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
 			/* An interrupt is answered here, while nothing holds it back */
@@ -299,7 +300,7 @@ gp_ic_write_latched(pgsocket fd, const void *buf, int len)
 			wake = WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
 									 WL_SOCKET_WRITEABLE,
-									 fd, -1L, gp_ic_client_event());
+									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
 			/* An interrupt is answered here, while nothing holds it back */
