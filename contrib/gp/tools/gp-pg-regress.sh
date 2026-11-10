@@ -57,6 +57,12 @@ mkdir -p "$OUTDIR"
 	-c "SELECT count(*) FROM gp.cluster_segments()" >/dev/null ||
 	die "the cluster is not running, start it with gp-cluster.sh start"
 
+# The answers of our own must be those of the PostgreSQL of this tree: a
+# merge that changed a base answer leaves them stale, which shows here
+# before the tests turn red with diffs no one asked for
+"$(dirname "$0")"/gp-gp-manifest.sh check ||
+	die "the answers of our own are stale; refresh them and run tools/gp-gp-manifest.sh update"
+
 # test_setup makes a tablespace, which outlives the database that pg_regress
 # drops and remakes; without this a second run on the same cluster fails there
 "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \

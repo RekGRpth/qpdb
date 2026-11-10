@@ -578,6 +578,14 @@ expressions, `CREATE TABLE AS EXECUTE`, the artifacts of a failed
 `CREATE INDEX CONCURRENTLY` and a command on a temporary table together
 with others have answers of their own this way.
 
+The manifest `pgtests/MANIFEST` keeps the SHA-256 of the base answer of
+PostgreSQL as it was when each answer of our own was written.  Before the
+tests run, and after the daily merge of upstream, `tools/gp-gp-manifest.sh
+check` compares the hashes: a base answer that changed upstream leaves the
+answer of our own stale, and an answer that grew equal to its base again
+is asked for removal.  After refreshing the answers, `update` rewrites the
+manifest.
+
 CI runs the tests of `tools/gp-pg-regress.tests` this way on every push,
 weekly and on demand (`gp-pg-regress.yml`); a failing test fails the job,
 which keeps the diffs as an artifact.
@@ -658,6 +666,7 @@ start their own clusters:
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
 | `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
 | `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
+| `032_gp_manifest.pl` | The manifest of the answers of our own: a base answer changed upstream is caught before the tests turn red, and an answer that equals its base again is asked for removal |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched

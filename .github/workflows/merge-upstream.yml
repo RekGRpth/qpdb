@@ -13,3 +13,5 @@ jobs:
       - env:
           INPUTS_REPOSITORY: postgres/postgres
         uses: rekgrpth/git-fetch-upstream-merge-push-shell-action@v1
+      - name: Check the answers of our own
+        run: contrib/gp/tools/gp-gp-manifest.sh check
