@@ -247,7 +247,7 @@ gp_ic_read_latched(pgsocket fd, void *buf, int len)
 			InterruptHoldoffCount = 0;
 			wake = WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
-									 WL_SOCKET_READABLE,
+									 WL_SOCKET_READABLE | WL_TIMEOUT,
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);
@@ -299,7 +299,7 @@ gp_ic_write_latched(pgsocket fd, const void *buf, int len)
 			InterruptHoldoffCount = 0;
 			wake = WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
-									 WL_SOCKET_WRITEABLE,
+									 WL_SOCKET_WRITEABLE | WL_TIMEOUT,
 									 fd, 100L, gp_ic_client_event());
 			if (wake & WL_LATCH_SET)
 				ResetLatch(MyLatch);

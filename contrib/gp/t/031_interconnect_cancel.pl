@@ -81,7 +81,12 @@ $segments[0]->poll_query_until('postgres',
 my ($pid) = $coordinator->safe_psql('postgres',
 	"SELECT pid FROM pg_stat_activity WHERE application_name = 'gp_cancel_target'")
   =~ /(\d+)/;
-$coordinator->safe_psql('postgres', "SELECT pg_cancel_backend($pid)");
+my $wait = $coordinator->safe_psql('postgres',
+	"SELECT wait_event_type || ':' || wait_event FROM pg_stat_activity WHERE pid = $pid");
+my $cancelled = $coordinator->safe_psql('postgres',
+	"SELECT pg_cancel_backend($pid)");
+is($cancelled, 't', "the cancel was sent (wait was $wait)")
+  or BAIL_OUT("pg_cancel_backend($pid) failed while the target waited $wait");
 $session->pump
   until $stderr =~ qr/canceling statement due to user request/
   || $timer->is_expired;
