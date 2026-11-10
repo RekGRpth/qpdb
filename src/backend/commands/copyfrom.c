@@ -488,6 +488,9 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 																	 NULL,
 																	 &inserted);
 
+			/* XXX See the comment in ExecBatchInsert() */
+			inserted = Min(inserted, size);
+
 			sent += size;
 
 			/* No need to do anything if there are no inserted rows */
@@ -515,7 +518,7 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 					slot->tts_tableOid = relid;
 
 					ExecARInsertTriggers(estate, resultRelInfo,
-										 slot, NIL,
+										 slot, NULL, NIL,
 										 cstate->transition_capture);
 				}
 			}
@@ -577,7 +580,7 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 										  estate, 0, buffer->slots[i],
 										  NIL, NULL);
 				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], recheckIndexes,
+									 slots[i], NULL, recheckIndexes,
 									 cstate->transition_capture);
 				list_free(recheckIndexes);
 			}
@@ -592,7 +595,7 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 			{
 				cstate->cur_lineno = buffer->linenos[i];
 				ExecARInsertTriggers(estate, resultRelInfo,
-									 slots[i], NIL,
+									 slots[i], NULL, NIL,
 									 cstate->transition_capture);
 			}
 
@@ -1114,6 +1117,7 @@ CopyFrom(CopyFromState cstate)
 	for (;;)
 	{
 		TupleTableSlot *myslot;
+		TupleTableSlot *original_insert_tuple = NULL;
 		bool		skip_tuple;
 
 		CHECK_FOR_INTERRUPTS();
@@ -1268,9 +1272,8 @@ CopyFrom(CopyFromState cstate)
 			 * we can just remember the original unconverted tuple to avoid a
 			 * needless round trip conversion.
 			 */
-			if (cstate->transition_capture != NULL)
-				cstate->transition_capture->tcs_original_insert_tuple =
-					!has_before_insert_row_trig ? myslot : NULL;
+			if (!has_before_insert_row_trig)
+				original_insert_tuple = myslot;
 
 			/*
 			 * We might need to convert from the root rowtype to the partition
@@ -1437,7 +1440,8 @@ CopyFrom(CopyFromState cstate)
 					}
 
 					/* AFTER ROW INSERT Triggers */
-					ExecARInsertTriggers(estate, resultRelInfo, myslot,
+					ExecARInsertTriggers(estate, resultRelInfo,
+										 myslot, original_insert_tuple,
 										 recheckIndexes, cstate->transition_capture);
 
 					list_free(recheckIndexes);
