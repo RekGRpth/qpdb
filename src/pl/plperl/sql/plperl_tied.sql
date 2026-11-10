@@ -21,6 +21,11 @@ DO $$
 	sub TIESCALAR { my $s; bless \$s, $_[0] }
 	sub STORE     { ${$_[0]} = $_[1] }
 	sub FETCH     { ${$_[0]} }
+
+	package PLPerlTiedReturnNext;
+	sub TIESCALAR { my $n = 0; bless \$n, $_[0] }
+	sub FETCH     { main::return_next({f1 => 2, f2 => 'inner'})
+	                  unless ${$_[0]}++; 'outer' }
 }
 $$ LANGUAGE plperl;
 
@@ -87,6 +92,18 @@ $$ LANGUAGE plperl;
 
 SELECT tied_scalar_int_array();
 
+-- Artificial: tied scalar whose FETCH recursively calls return_next
+-- while the outer return_next is still converting the row containing it.
+CREATE FUNCTION tied_reentrant_setof() RETURNS SETOF tiedrowperl AS $$
+	my %h;
+	$h{f1} = 1;
+	tie $h{f2}, 'PLPerlTiedReturnNext';
+	return_next(\%h);
+	return undef;
+$$ LANGUAGE plperl;
+
+SELECT * FROM tied_reentrant_setof();
+
 -- Artificial: $_TD->{new} and the trigger return value are tied scalars.
 CREATE TABLE tied_trigger_test (i int, v text);
 
@@ -111,3 +128,34 @@ FOR EACH ROW EXECUTE PROCEDURE tied_modify();
 INSERT INTO tied_trigger_test (i, v) VALUES (1, 'orig');
 
 SELECT i, v FROM tied_trigger_test;
+
+-- Verify that we can cope with errors thrown within get magic.
+DO $$
+{
+	package PLPerlTiedHash;
+	sub TIEHASH  { bless {}, $_[0] }
+	sub STORE    { $_[0]{$_[1]} = $_[2] }
+	sub FETCH    { die("tied hash fetch failure"); $_[0]{$_[1]} }
+	sub FIRSTKEY { my $a = keys %{$_[0]}; each %{$_[0]} }
+	sub NEXTKEY  { each %{$_[0]} }
+
+	package PLPerlTiedArray;
+	sub TIEARRAY  { bless [], $_[0] }
+	sub STORE     { $_[0][$_[1]] = $_[2] }
+	sub FETCH     { die("tied array fetch failure"); $_[0][$_[1]] }
+	sub FETCHSIZE { scalar @{$_[0]} }
+
+	package PLPerlTiedScalar;
+	sub TIESCALAR { my $s; bless \$s, $_[0] }
+	sub STORE     { ${$_[0]} = $_[1] }
+	sub FETCH     { die("tied scalar fetch failure"); ${$_[0]} }
+}
+$$ LANGUAGE plperl;
+
+SELECT * FROM tied_setof();
+SELECT tied_scalar();
+SELECT tied_composite();
+SELECT tied_int_array();
+SELECT * FROM tied_scalar_setof();
+SELECT tied_scalar_int_array();
+INSERT INTO tied_trigger_test (i, v) VALUES (2, 'orig');

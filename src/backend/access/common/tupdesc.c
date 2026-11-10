@@ -165,6 +165,7 @@ TupleDesc
 CreateTemplateTupleDesc(int natts)
 {
 	TupleDesc	desc;
+	size_t		sz;
 
 	/*
 	 * sanity checks
@@ -184,9 +185,11 @@ CreateTemplateTupleDesc(int natts)
 	 * although with the current definition of pg_attribute there probably
 	 * isn't any padding.
 	 */
-	desc = (TupleDesc) palloc(offsetof(struct TupleDescData, compact_attrs) +
-							  natts * sizeof(CompactAttribute) +
-							  natts * sizeof(FormData_pg_attribute));
+	sz = offsetof(struct TupleDescData, compact_attrs) +
+		natts * sizeof(CompactAttribute) +
+		natts * sizeof(FormData_pg_attribute);
+
+	desc = (TupleDesc) palloc(sz);
 
 	/*
 	 * Initialize other fields of the tupdesc.
@@ -196,6 +199,13 @@ CreateTemplateTupleDesc(int natts)
 	desc->tdtypeid = RECORDOID;
 	desc->tdtypmod = -1;
 	desc->tdrefcount = -1;		/* assume not reference-counted */
+
+	/*
+	 * Zero-initialize the aggregate version. RECORD descriptors aren't
+	 * versioned, and we don't know if this is going to be used for something
+	 * else, so we have to zero it here.
+	 */
+	TupleDescSetVersion(desc, InvalidXLogRecPtr);
 
 	/* This will be set to the correct value by TupleDescFinalize() */
 	desc->firstNonCachedOffsetAttr = -1;
@@ -416,26 +426,42 @@ CreateTupleDescCopyConstr(TupleDesc tupdesc)
 }
 
 /*
- * TupleDescCopy
- *		Copy a tuple descriptor into caller-supplied memory.
+ * TupleDescCopySize
+ *		Return the number of bytes TupleDescCopySized() needs to copy src.
+ */
+Size
+TupleDescCopySize(TupleDesc src)
+{
+	return offsetof(struct TupleDescData, compact_attrs) +
+		src->natts * sizeof(CompactAttribute) +
+		src->natts * sizeof(FormData_pg_attribute);
+}
+
+/*
+ * TupleDescCopySized
+ *		Copy a tuple descriptor into caller-supplied memory of dstsize bytes.
  *		The memory may be shared memory mapped at any address, and must
- *		be sufficient to hold TupleDescSize(src) bytes.
+ *		be sufficient to hold TupleDescCopySize(src) bytes.
  *
  * !!! Constraints and defaults are not copied !!!
  */
 void
-TupleDescCopy(TupleDesc dst, TupleDesc src)
+TupleDescCopySized(TupleDesc dst, Size dstsize, TupleDesc src)
 {
-	int			i;
+	Size		sz = TupleDescCopySize(src);
+
+	if (dstsize < sz)
+		elog(ERROR, "insufficient space to copy tuple descriptor: %zu bytes, need %zu",
+			 dstsize, sz);
 
 	/* Flat-copy the header and attribute arrays */
-	memcpy(dst, src, TupleDescSize(src));
+	memcpy(dst, src, sz);
 
 	/*
 	 * Since we're not copying constraints and defaults, clear fields
 	 * associated with them.
 	 */
-	for (i = 0; i < dst->natts; i++)
+	for (int i = 0; i < dst->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(dst, i);
 
@@ -560,6 +586,13 @@ TupleDescFinalize(TupleDesc tupdesc)
 
 	tupdesc->firstNonCachedOffsetAttr = firstNonCachedOffsetAttr;
 	tupdesc->firstNonGuaranteedAttr = firstNonGuaranteedAttr;
+
+	/* set the aggregate version of the tupledesc, as appropriate */
+	if (tupdesc->natts == 0 || tupdesc->tdtypeid == RECORDOID)
+		TupleDescSetVersion(tupdesc, InvalidXLogRecPtr);
+	else
+		TupleDescSetVersion(tupdesc,
+							TupleDescGetAttrVersion(tupdesc, tupdesc->natts));
 }
 
 /*
@@ -650,6 +683,38 @@ DecrTupleDescRefCount(TupleDesc tupdesc)
 		FreeTupleDesc(tupdesc);
 }
 
+XLogRecPtr
+TupleDescGetVersion(TupleDesc tupdesc)
+{
+	/*
+	 * RECORDOID descriptors are often created by copying the descriptor of a
+	 * named composite type and relabeling the copy. The versions of the named
+	 * type remain in the copy, but don't apply to it.
+	 */
+	if (tupdesc->tdtypeid == RECORDOID)
+		return InvalidXLogRecPtr;
+	return tupdesc->tdversion;
+}
+
+void
+TupleDescSetVersion(TupleDesc tupdesc, XLogRecPtr version)
+{
+	Assert(tupdesc->tdtypeid != RECORDOID ||
+		   version == InvalidXLogRecPtr);
+
+	tupdesc->tdversion = version;
+}
+
+XLogRecPtr
+TupleDescGetAttrVersion(TupleDesc tupdesc, AttrNumber attnum)
+{
+	Assert(attnum >= 1 && attnum <= tupdesc->natts);
+	/* see TupleDescGetVersion() */
+	if (tupdesc->tdtypeid == RECORDOID)
+		return InvalidXLogRecPtr;
+	return TupleDescAttr(tupdesc, attnum - 1)->attversion;
+}
+
 /*
  * Compare two TupleDesc structures for logical equality
  */
@@ -662,6 +727,14 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 	if (tupdesc1->natts != tupdesc2->natts)
 		return false;
 	if (tupdesc1->tdtypeid != tupdesc2->tdtypeid)
+		return false;
+
+	/*
+	 * Need to take the version into account, otherwise
+	 * RelationRebuildRelation() will consider two tupledescs that differ just
+	 * by version equal and not swap them.
+	 */
+	if (TupleDescGetVersion(tupdesc1) != TupleDescGetVersion(tupdesc2))
 		return false;
 
 	/* tdtypmod and tdrefcount are not checked */
@@ -688,6 +761,8 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
 		if (attr1->atttypid != attr2->atttypid)
 			return false;
 		if (attr1->attlen != attr2->attlen)
+			return false;
+		if (attr1->attversion != attr2->attversion)
 			return false;
 		if (attr1->attndims != attr2->attndims)
 			return false;
@@ -829,6 +904,10 @@ equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
  * - same composite type ID (but could both be zero)
  * - corresponding attributes (in order) have same the name, type, typmod,
  *   collation
+ * - corresponding dropped attributes have the same width and alignment
+ *   (needed because no other test reliably detects pairs of dropped
+ *   attributes whose types would otherwise make tuple deformation unsafe)
+ * - the versions of the descriptors
  *
  * This is used to check whether two record types are compatible, whether
  * function return row types are the same, and other similar situations.
@@ -848,6 +927,25 @@ equalRowTypes(TupleDesc tupdesc1, TupleDesc tupdesc2)
 	if (tupdesc1->tdtypeid != tupdesc2->tdtypeid)
 		return false;
 
+	/*
+	 * For !RECORDOID style descriptors, check that the versions match. That's
+	 * important, as several callers assume that they can continue to use the
+	 * old descriptor if this function returns true - which in turn can
+	 * trigger errors about version mismatches. Note that this does not make
+	 * this function much more aggressive, even without this check we'd return
+	 * false for descriptors of two tables with equivalent schemas, due to the
+	 * tdtypeid check above.
+	 *
+	 * We explicitly do *not* perform this check in the RECORDOID case (see
+	 * also function comment): For one, the version is not normally set for
+	 * RECORDOID descriptors, for another, these are transient types, so it's
+	 * normal to transfer data between semantically equivalent, but separately
+	 * instantiated descriptors.
+	 */
+	if (tupdesc1->tdtypeid != RECORDOID &&
+		TupleDescGetVersion(tupdesc1) != TupleDescGetVersion(tupdesc2))
+		return false;
+
 	for (int i = 0; i < tupdesc1->natts; i++)
 	{
 		Form_pg_attribute attr1 = TupleDescAttr(tupdesc1, i);
@@ -865,6 +963,18 @@ equalRowTypes(TupleDesc tupdesc1, TupleDesc tupdesc2)
 		/* Record types derived from tables could have dropped fields. */
 		if (attr1->attisdropped != attr2->attisdropped)
 			return false;
+
+		/*
+		 * Dropped fields could have incompatible lengths/alignments (can't
+		 * rely on atttypid for this)
+		 */
+		if (attr1->attisdropped)
+		{
+			if (attr1->attlen != attr2->attlen)
+				return false;
+			if (attr1->attalign != attr2->attalign)
+				return false;
+		}
 	}
 
 	return true;
@@ -956,6 +1066,7 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attisdropped = false;
 	att->attislocal = true;
 	att->attinhcount = 0;
+	att->attversion = InvalidXLogRecPtr;
 	/* variable-length fields are not present in tupledescs */
 
 	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oidtypeid));
@@ -1019,6 +1130,7 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 	att->attisdropped = false;
 	att->attislocal = true;
 	att->attinhcount = 0;
+	att->attversion = InvalidXLogRecPtr;
 	/* variable-length fields are not present in tupledescs */
 
 	att->atttypid = oidtypeid;

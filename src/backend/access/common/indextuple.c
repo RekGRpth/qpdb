@@ -154,10 +154,10 @@ index_form_tuple_context(TupleDesc tupleDescriptor,
 	hoff = IndexInfoFindDataOffset(infomask);
 #ifdef TOAST_INDEX_HACK
 	data_size = heap_compute_data_size(tupleDescriptor,
-									   untoasted_values, isnull);
+									   untoasted_values, isnull, false);
 #else
 	data_size = heap_compute_data_size(tupleDescriptor,
-									   values, isnull);
+									   values, isnull, false);
 #endif
 	size = hoff + data_size;
 	size = MAXALIGN(size);		/* be conservative */
@@ -529,8 +529,9 @@ index_truncate_tuple(TupleDesc sourceDescriptor, IndexTuple source,
 	Assert(IndexTupleSize(truncated) <= IndexTupleSize(source));
 
 	/*
-	 * Cannot leak memory here, TupleDescCopy() doesn't allocate any inner
-	 * structure, so, plain pfree() should clean all allocated memory
+	 * Cannot leak memory here, CreateTupleDescTruncatedCopy() doesn't
+	 * allocate any inner structure, so, plain pfree() should clean all
+	 * allocated memory
 	 */
 	pfree(truncdesc);
 
