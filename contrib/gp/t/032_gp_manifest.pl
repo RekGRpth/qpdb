@@ -96,14 +96,16 @@ sub run_ok
 {
 	my ($dir, $command, $name) = @_;
 
-	system(qq{cd "$dir" && contrib/gp/tools/gp-gp-manifest.sh $command}) == 0
+	# The script is a POSIX shell one: name the shell, for Windows does
+	# not run it by association
+	system(qq{cd "$dir" && sh contrib/gp/tools/gp-gp-manifest.sh $command}) == 0
 		or die "$name: $!";
 }
 
 sub run_fail
 {
 	my ($dir, $command) = @_;
-	my $output = `cd "$dir" && contrib/gp/tools/gp-gp-manifest.sh $command 2>&1`;
+	my $output = `cd "$dir" && sh contrib/gp/tools/gp-gp-manifest.sh $command 2>&1`;
 
 	isnt($? >> 8, 0, "the command $command fails");
 	return $output;
