@@ -1690,12 +1690,12 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				len < 0 || len > GP_IC_MAX_STRING)
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not read the interconnect answer of %s", host));
+						errmsg("could not read the interconnect answer of %s: %m", host));
 			data = palloc(len);
 			if (!gp_ic_read_latched(fd, wes, data, len))
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
-						errmsg("could not read the interconnect answer of %s", host));
+						errmsg("could not read the interconnect answer of %s: %m", host));
 			if (type == GP_IC_RETRY)
 				ereport(ERROR,
 						errcode(ERRCODE_DATA_CORRUPTED),
