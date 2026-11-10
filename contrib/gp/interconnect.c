@@ -201,128 +201,131 @@ gp_ic_client_event(void)
 	return event;
 }
 
-/*
- * Read from the socket, waiting on the latch between attempts.  The
- * socket is touched only after a wait reports it ready: on Windows a
- * wait leaves the socket in blocking mode, so a recv without a
- * readiness report would sit in the kernel forever, and setting the
- * mode back may itself fail.  A client that waits this way is reached
- * by a cancel of its own query: no signal handler of pqsignal
- * interrupts a blocking recv, and neither does the timer of a
- * statement timeout.
- */
+/* Whether the last socket call found a nonblocking socket busy */
 static bool
-gp_ic_read_latched(pgsocket fd, void *buf, int len)
+gp_ic_wouldblock(void)
+{
+#ifdef WIN32
+	return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+	return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+/*
+ * The waits of one connection, one long-lived set: the socket event,
+ * whose direction turns between the reads and the writes, the latch
+ * and the death of the postmaster.  A set that lives as long as the
+ * connection keeps the socket in nonblocking mode on Windows, where
+ * tearing a set down after every wait puts it back into blocking mode,
+ * so a recv of the next row could sit in the kernel forever.  A client
+ * that reads this way is reached by a cancel of its own query: no
+ * signal handler of pqsignal interrupts a blocking recv, and neither
+ * does the timer of a statement timeout.
+ */
+#define GP_IC_WES_SOCKET 0
+
+static WaitEventSet *
+gp_ic_wes(pgsocket fd)
+{
+	/* Session lifetime: the set is freed explicitly with the connection */
+	WaitEventSet *wes = CreateWaitEventSet(NULL, 3);
+
+	AddWaitEventToSet(wes, WL_SOCKET_READABLE, fd, NULL, NULL);
+	AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	return wes;
+}
+
+/*
+ * One bounded wait of a connection, with its interrupts let through:
+ * a statement that reads the interconnect holds the lock of the
+ * distributed snapshot, which holds its interrupts back, so the wait
+ * must let them through for a moment and answer them before taking the
+ * hold back.  The wait is bounded, so the interrupt is answered even
+ * when nothing else wakes the wait.  Returns the events that occurred.
+ */
+static int
+gp_ic_wait(WaitEventSet *wes, uint32 socket_events)
+{
+	WaitEvent	event;
+	int			wake;
+	int			holdoff = InterruptHoldoffCount;
+
+	ModifyWaitEvent(wes, GP_IC_WES_SOCKET, socket_events, NULL);
+	InterruptHoldoffCount = 0;
+	wake = WaitEventSetWait(wes, 100L, &event, 1, gp_ic_client_event());
+	if (wake > 0 && (event.events & WL_LATCH_SET))
+		ResetLatch(MyLatch);
+	/* An interrupt is answered here, while nothing holds it back */
+	CHECK_FOR_INTERRUPTS();
+	InterruptHoldoffCount = holdoff;
+	return wake > 0 ? event.events : 0;
+}
+
+/* Read from the socket, waiting on the set of its connection */
+static bool
+gp_ic_read_latched(pgsocket fd, WaitEventSet *wes, void *buf, int len)
 {
 	char	   *p = buf;
-	bool		ready = true;	/* the socket is nonblocking until a wait */
 
 	while (len > 0)
 	{
-		ssize_t		n = -1;
+		ssize_t		n = recv(fd, p, len, 0);
 
-		if (ready)
+		if (n < 0 && errno == EINTR)
 		{
-			n = recv(fd, p, len, 0);
-			if (n < 0 && errno == EINTR)
-			{
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			if (n == 0)
-				return false;
-			if (n > 0)
-			{
-				p += n;
-				len -= n;
-				continue;
-			}
-		}
-		{
-			int			wake;
-			int			holdoff = InterruptHoldoffCount;
-
-			/*
-			 * A statement that reads the interconnect holds the lock of
-			 * the distributed snapshot, which holds its interrupts back:
-			 * a wait must let them through, or a timeout of the query
-			 * never reaches it.  The wait is bounded, so the interrupt
-			 * is answered even when nothing else wakes the wait
-			 */
-			InterruptHoldoffCount = 0;
-			wake = WaitLatchOrSocket(MyLatch,
-									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
-									 WL_SOCKET_READABLE | WL_TIMEOUT,
-									 fd, 100L, gp_ic_client_event());
-			if (wake & WL_LATCH_SET)
-				ResetLatch(MyLatch);
-			/* An interrupt is answered here, while nothing holds it back */
 			CHECK_FOR_INTERRUPTS();
-			InterruptHoldoffCount = holdoff;
-			ready = (wake & WL_SOCKET_READABLE) != 0;
 			continue;
 		}
+		if (n < 0 && gp_ic_wouldblock())
+		{
+			gp_ic_wait(wes, WL_SOCKET_READABLE);
+			continue;
+		}
+		if (n <= 0)
+			return false;
+		p += n;
+		len -= n;
 	}
 	return true;
 }
 
 static bool
-gp_ic_read_i32_latched(pgsocket fd, int32 *value)
+gp_ic_read_i32_latched(pgsocket fd, WaitEventSet *wes, int32 *value)
 {
 	uint32		net;
 
-	if (!gp_ic_read_latched(fd, &net, sizeof(net)))
+	if (!gp_ic_read_latched(fd, wes, &net, sizeof(net)))
 		return false;
 	*value = (int32) ntohl(net);
 	return true;
 }
 
-/* Write to the socket, waiting on the latch between attempts; the
- * socket is touched only after a wait reports it ready, as in the read */
+/* Write to the socket, waiting on the set of its connection */
 static bool
-gp_ic_write_latched(pgsocket fd, const void *buf, int len)
+gp_ic_write_latched(pgsocket fd, WaitEventSet *wes, const void *buf, int len)
 {
 	const char *p = buf;
-	bool		ready = true;	/* the socket is nonblocking until a wait */
 
 	while (len > 0)
 	{
-		ssize_t		n = -1;
+		ssize_t		n = send(fd, p, len, 0);
 
-		if (ready)
+		if (n < 0 && errno == EINTR)
 		{
-			n = send(fd, p, len, 0);
-			if (n < 0 && errno == EINTR)
-			{
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			if (n == 0)
-				return false;
-			if (n > 0)
-			{
-				p += n;
-				len -= n;
-				continue;
-			}
-		}
-		{
-			int			wake;
-			int			holdoff = InterruptHoldoffCount;
-
-			/* As in the read: let the interrupts through, answer them */
-			InterruptHoldoffCount = 0;
-			wake = WaitLatchOrSocket(MyLatch,
-									 WL_LATCH_SET | WL_EXIT_ON_PM_DEATH |
-									 WL_SOCKET_WRITEABLE | WL_TIMEOUT,
-									 fd, 100L, gp_ic_client_event());
-			if (wake & WL_LATCH_SET)
-				ResetLatch(MyLatch);
 			CHECK_FOR_INTERRUPTS();
-			InterruptHoldoffCount = holdoff;
-			ready = (wake & WL_SOCKET_WRITEABLE) != 0;
 			continue;
 		}
+		if (n < 0 && gp_ic_wouldblock())
+		{
+			gp_ic_wait(wes, WL_SOCKET_WRITEABLE);
+			continue;
+		}
+		if (n <= 0)
+			return false;
+		p += n;
+		len -= n;
 	}
 	return true;
 }
@@ -1458,29 +1461,29 @@ gp_ic_cancel_request(const char *host, int port, const char *token,
 }
 
 static bool
-gp_ic_write_i32_latched(pgsocket fd, int32 value)
+gp_ic_write_i32_latched(pgsocket fd, WaitEventSet *wes, int32 value)
 {
 	uint32		net = htonl((uint32) value);
 
-	return gp_ic_write_latched(fd, &net, sizeof(net));
+	return gp_ic_write_latched(fd, wes, &net, sizeof(net));
 }
 
-/* Send the full request over a nonblocking socket */
+/* Send the full request over the socket of its connection */
 static bool
-gp_ic_send_query_latched(pgsocket fd, const char *token,
+gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
 						 const char *db, const char *user, int requester,
 						 const char *sql)
 {
-	return gp_ic_write_latched(fd, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
-		gp_ic_write_i32_latched(fd, strlen(token)) &&
-		gp_ic_write_latched(fd, token, strlen(token)) &&
-		gp_ic_write_i32_latched(fd, strlen(db)) &&
-		gp_ic_write_latched(fd, db, strlen(db)) &&
-		gp_ic_write_i32_latched(fd, strlen(user)) &&
-		gp_ic_write_latched(fd, user, strlen(user)) &&
-		gp_ic_write_i32_latched(fd, requester) &&
-		gp_ic_write_i32_latched(fd, strlen(sql)) &&
-		gp_ic_write_latched(fd, sql, strlen(sql));
+	return gp_ic_write_latched(fd, wes, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
+		gp_ic_write_i32_latched(fd, wes, strlen(token)) &&
+		gp_ic_write_latched(fd, wes, token, strlen(token)) &&
+		gp_ic_write_i32_latched(fd, wes, strlen(db)) &&
+		gp_ic_write_latched(fd, wes, db, strlen(db)) &&
+		gp_ic_write_i32_latched(fd, wes, strlen(user)) &&
+		gp_ic_write_latched(fd, wes, user, strlen(user)) &&
+		gp_ic_write_i32_latched(fd, wes, requester) &&
+		gp_ic_write_i32_latched(fd, wes, strlen(sql)) &&
+		gp_ic_write_latched(fd, wes, sql, strlen(sql));
 }
 
 /*
@@ -1499,6 +1502,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	 * the catch read the target as empty and quietly cancelled nothing
 	 */
 	pgsocket	volatile fd = PGINVALID_SOCKET;
+	WaitEventSet *wes = NULL;
 	bool		volatile have_target = false;
 	int32		volatile slot_id = 0;
 	uint64		volatile generation = 0;
@@ -1522,6 +1526,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 		closesocket(fd);
 		return false;
 	}
+	wes = gp_ic_wes(fd);
 
 	recv = palloc0_array(FmgrInfo, tupdesc->natts);
 	ioparam = palloc_array(Oid, tupdesc->natts);
@@ -1540,7 +1545,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 
 	PG_TRY();
 	{
-		if (!gp_ic_send_query_latched(fd, token, db, user, requester,
+		if (!gp_ic_send_query_latched(fd, wes, token, db, user, requester,
 									  sql))
 			retry = true;
 
@@ -1552,8 +1557,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			char		answer[16];
 			int			worker_port = 0;
 
-			if (!gp_ic_read_latched(fd, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, &len) ||
+			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
+				!gp_ic_read_i32_latched(fd, wes, &len) ||
 				len < 0 || len > GP_IC_MAX_STRING)
 				retry = true;
 			else if (type == GP_IC_ASSIGN && len == sizeof(answer))
@@ -1563,7 +1568,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				uint32		gen_lo;
 				int32		assigned_slot;
 
-				if (!gp_ic_read_latched(fd, answer, sizeof(answer)))
+				if (!gp_ic_read_latched(fd, wes, answer, sizeof(answer)))
 					retry = true;
 				else
 				{
@@ -1583,7 +1588,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			{
 				char	   *data = palloc(len);
 
-				if (!gp_ic_read_latched(fd, data, len))
+				if (!gp_ic_read_latched(fd, wes, data, len))
 					retry = true;
 				else
 					ereport(ERROR,
@@ -1596,6 +1601,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 						errmsg("an unknown assignment of the interconnect"));
 			closesocket(fd);
 			fd = PGINVALID_SOCKET;
+			FreeWaitEventSet(wes);
+			wes = NULL;
 			if (!retry)
 			{
 				fd = gp_ic_connect(host, worker_port);
@@ -1609,7 +1616,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				}
 				else
 				{
-					if (!gp_ic_send_query_latched(fd, token, db, user,
+					wes = gp_ic_wes(fd);
+					if (!gp_ic_send_query_latched(fd, wes, token, db, user,
 												  requester, sql))
 						retry = true;
 				}
@@ -1624,20 +1632,20 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			char	   *data;
 			char		go = GP_IC_GO;
 
-			if (!gp_ic_read_latched(fd, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, &len) ||
+			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
+				!gp_ic_read_i32_latched(fd, wes, &len) ||
 				len < 0 || len > GP_IC_MAX_STRING)
 				retry = true;
 			else
 			{
 				data = palloc(len);
-				if (!gp_ic_read_latched(fd, data, len))
+				if (!gp_ic_read_latched(fd, wes, data, len))
 					retry = true;
 				else if (type == GP_IC_RETRY && len == 0)
 					retry = true;
 				else if (type == GP_IC_READY && len == 0)
 				{
-					if (!gp_ic_write_latched(fd, &go, 1))
+					if (!gp_ic_write_latched(fd, wes, &go, 1))
 						ereport(ERROR,
 								errcode(ERRCODE_CONNECTION_FAILURE),
 								errmsg("could not start the motion query on %s", host));
@@ -1661,14 +1669,14 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			char	   *data;
 
 			CHECK_FOR_INTERRUPTS();
-			if (!gp_ic_read_latched(fd, &type, 1) ||
-				!gp_ic_read_i32_latched(fd, &len) ||
+			if (!gp_ic_read_latched(fd, wes, &type, 1) ||
+				!gp_ic_read_i32_latched(fd, wes, &len) ||
 				len < 0 || len > GP_IC_MAX_STRING)
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
 						errmsg("could not read the interconnect answer of %s", host));
 			data = palloc(len);
-			if (!gp_ic_read_latched(fd, data, len))
+			if (!gp_ic_read_latched(fd, wes, data, len))
 				ereport(ERROR,
 						errcode(ERRCODE_CONNECTION_FAILURE),
 						errmsg("could not read the interconnect answer of %s", host));
@@ -1702,6 +1710,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			pfree(data);
 		}
 		closesocket(fd);
+		FreeWaitEventSet(wes);
+		wes = NULL;
 
 		/* A request that never ran to its end does not run on */
 		if (retry && have_target)
@@ -1712,6 +1722,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 		if (have_target)
 			gp_ic_cancel_request(host, port, token, slot_id, generation);
 		closesocket(fd);
+		if (wes != NULL)
+			FreeWaitEventSet(wes);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
