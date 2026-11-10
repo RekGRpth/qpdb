@@ -471,7 +471,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 	char	   *user = NULL;
 	char	   *sql = NULL;
 	int32		requester;
-	bool		restart = false;
+	bool		volatile restart = false;
 	static char *connected_db = NULL;
 	static char *connected_user = NULL;
 
@@ -1480,15 +1480,21 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
 					  const char *host, int port, int requester)
 {
-	pgsocket	fd = PGINVALID_SOCKET;
+	/*
+	 * The socket, the worker it goes to and the fact of it are written
+	 * in the try block and read in the catch, after the error jump:
+	 * without the volatile the values there are undefined, and on i386
+	 * the catch read the target as empty and quietly cancelled nothing
+	 */
+	pgsocket	volatile fd = PGINVALID_SOCKET;
+	bool		volatile have_target = false;
+	int32		volatile slot_id = 0;
+	uint64		volatile generation = 0;
 	FmgrInfo   *recv;
 	Oid		   *ioparam;
 	MemoryContext rowcxt;
 	char	   *token;
 	bool		retry = false;
-	bool		have_target = false;
-	int32		slot_id = 0;
-	uint64		generation = 0;
 
 	token = gp_interconnect_token();
 	if (token == NULL)
@@ -1543,17 +1549,18 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				uint32		net_port;
 				uint32		gen_hi;
 				uint32		gen_lo;
+				int32		assigned_slot;
 
 				if (!gp_ic_read_latched(fd, answer, sizeof(answer)))
 					retry = true;
 				else
 				{
 					memcpy(&net_port, answer + 0, sizeof(net_port));
-					memcpy(&slot_id, answer + 4, sizeof(slot_id));
+					memcpy(&assigned_slot, answer + 4, sizeof(assigned_slot));
 					memcpy(&gen_hi, answer + 8, sizeof(gen_hi));
 					memcpy(&gen_lo, answer + 12, sizeof(gen_lo));
 					worker_port = (int) ntohl(net_port);
-					slot_id = ntohl(slot_id);
+					slot_id = ntohl(assigned_slot);
 					generation = ((uint64) ntohl(gen_hi) << 32) | ntohl(gen_lo);
 					have_target = true;
 				}
