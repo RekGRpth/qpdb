@@ -254,14 +254,7 @@ gp_ic_wait(WaitEventSet *wes, uint32 socket_events)
 
 	ModifyWaitEvent(wes, GP_IC_WES_SOCKET, socket_events, NULL);
 	InterruptHoldoffCount = 0;
-#ifdef WIN32
-	elog(LOG, "gp interconnect wait %u holdoff %d", socket_events, holdoff);
-#endif
 	wake = WaitEventSetWait(wes, 100L, &event, 1, gp_ic_client_event());
-#ifdef WIN32
-	elog(LOG, "gp interconnect wake %d cancel %d holdoff %d", wake,
-		 QueryCancelPending, InterruptHoldoffCount);
-#endif
 	if (wake > 0 && (event.events & WL_LATCH_SET))
 		ResetLatch(MyLatch);
 	/* An interrupt is answered here, while nothing holds it back */
@@ -280,14 +273,20 @@ gp_ic_read_latched(pgsocket fd, WaitEventSet *wes, void *buf, int len)
 	{
 		ssize_t		n = recv(fd, p, len, 0);
 
-#ifdef WIN32
-		/* elog itself may replace the error of the socket call */
-		elog(LOG, "gp interconnect recv %d error %d", (int) n,
-			 n < 0 ? WSAGetLastError() : 0);
-#endif
 		if (n < 0 && errno == EINTR)
 		{
+			/*
+			 * On Windows every signal turns into this: the wrapper of
+			 * recv dispatches it and reports EINTR.  The interrupt is
+			 * answered here with nothing holding it back, for the lock
+			 * of the distributed snapshot holds it otherwise, and the
+			 * cancel of the query would never reach this loop
+			 */
+			int			holdoff = InterruptHoldoffCount;
+
+			InterruptHoldoffCount = 0;
 			CHECK_FOR_INTERRUPTS();
+			InterruptHoldoffCount = holdoff;
 			continue;
 		}
 		if (n < 0 && gp_ic_wouldblock())
@@ -324,9 +323,14 @@ gp_ic_write_latched(pgsocket fd, WaitEventSet *wes, const void *buf, int len)
 	{
 		ssize_t		n = send(fd, p, len, 0);
 
+		/* As in the read: a signal is answered with nothing holding it back */
 		if (n < 0 && errno == EINTR)
 		{
+			int			holdoff = InterruptHoldoffCount;
+
+			InterruptHoldoffCount = 0;
 			CHECK_FOR_INTERRUPTS();
+			InterruptHoldoffCount = holdoff;
 			continue;
 		}
 		if (n < 0 && gp_ic_wouldblock())
@@ -1732,10 +1736,6 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	}
 	PG_CATCH();
 	{
-#ifdef WIN32
-		elog(LOG, "gp interconnect catch target %d slot %d cancel %d holdoff %d",
-			 have_target, slot_id, QueryCancelPending, InterruptHoldoffCount);
-#endif
 		if (have_target)
 			gp_ic_cancel_request(host, port, token, slot_id, generation);
 		closesocket(fd);
