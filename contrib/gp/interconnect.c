@@ -254,7 +254,14 @@ gp_ic_wait(WaitEventSet *wes, uint32 socket_events)
 
 	ModifyWaitEvent(wes, GP_IC_WES_SOCKET, socket_events, NULL);
 	InterruptHoldoffCount = 0;
+#ifdef WIN32
+	elog(LOG, "gp interconnect wait %u holdoff %d", socket_events, holdoff);
+#endif
 	wake = WaitEventSetWait(wes, 100L, &event, 1, gp_ic_client_event());
+#ifdef WIN32
+	elog(LOG, "gp interconnect wake %d cancel %d holdoff %d", wake,
+		 QueryCancelPending, InterruptHoldoffCount);
+#endif
 	if (wake > 0 && (event.events & WL_LATCH_SET))
 		ResetLatch(MyLatch);
 	/* An interrupt is answered here, while nothing holds it back */
@@ -273,6 +280,9 @@ gp_ic_read_latched(pgsocket fd, WaitEventSet *wes, void *buf, int len)
 	{
 		ssize_t		n = recv(fd, p, len, 0);
 
+#ifdef WIN32
+		elog(LOG, "gp interconnect recv %d", (int) n);
+#endif
 		if (n < 0 && errno == EINTR)
 		{
 			CHECK_FOR_INTERRUPTS();
@@ -1710,7 +1720,8 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 			pfree(data);
 		}
 		closesocket(fd);
-		FreeWaitEventSet(wes);
+		if (wes != NULL)
+			FreeWaitEventSet(wes);
 		wes = NULL;
 
 		/* A request that never ran to its end does not run on */
@@ -1719,6 +1730,10 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	}
 	PG_CATCH();
 	{
+#ifdef WIN32
+		elog(LOG, "gp interconnect catch target %d slot %d cancel %d holdoff %d",
+			 have_target, slot_id, QueryCancelPending, InterruptHoldoffCount);
+#endif
 		if (have_target)
 			gp_ic_cancel_request(host, port, token, slot_id, generation);
 		closesocket(fd);
