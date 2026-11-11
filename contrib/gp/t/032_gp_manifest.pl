@@ -11,6 +11,7 @@ use warnings FATAL => 'all';
 use File::Copy qw(copy);
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
+use IPC::Cmd qw(can_run);
 use IPC::Run qw(run);
 use Test::More;
 
@@ -20,35 +21,46 @@ $script =~ s{[/\\]t[/\\]\d+[^/\\]*\.pl$}{};
 $script .= '/tools/gp-gp-manifest.sh';
 plan skip_all => "$script not found" unless -f $script;
 
-# The shell of the script: named in full, for the command line of
-# Windows does not find sh by the paths of its environment
+# The shell of the script: named in full, for the perl of Windows runs
+# commands of the shell only through the command line of cmd otherwise.
+# The shell of the PATH comes first, for it is the one the environment
+# itself runs; the places it is known to live in come last
 my $sh = 'sh';
 if ($^O eq 'MSWin32')
 {
-	for my $candidate (qw(C:/msys64/usr/bin/sh.exe
-		C:/Program Files/Git/usr/bin/sh.exe))
+	for my $candidate ((split /;/, $ENV{PATH}), 'C:/msys64/usr/bin',
+		'C:/Program Files/Git/usr/bin')
 	{
+		$candidate =~ s/(^"|"$)//g;
+		$candidate .= '/sh.exe' unless $candidate =~ m{sh\.exe$};
 		if (-f $candidate)
 		{
 			$sh = $candidate;
 			last;
 		}
 	}
-	plan skip_all => 'no sh for the manifest script'
-		if $sh eq 'sh' && !run([$sh, '-c', 'exit']);
 }
 
-# A git repository of its own: the script walks to the tree root by git.
-# Every shell command runs as IPC::Run with the named shell, which needs
-# neither the command line of Windows nor its paths; and the shell of msys
-# does not keep the directory of the Windows command line, so the change of
-# the directory happens inside the shell itself
+# The shell must run from this perl at all: a shell that answers nothing
+# would turn every run into a silent success
+{
+	my $probe;
+
+	plan skip_all => "no working sh for the manifest script ($sh)"
+		if !run([$sh, '-c', 'echo works'], '>', \$probe)
+		|| $probe ne "works\n";
+}
+
+# A git repository of its own: the script walks to the tree root by git
+# from the absolute path of the script, so no command of the test needs a
+# directory change, which the shells of Windows handle each their own way
+my $git = can_run('git') or plan skip_all => 'no git';
 my $repo = tempdir(CLEANUP => 1);
 $repo =~ s{\\}{/}g if $^O eq 'MSWin32';
 make_path("$repo/contrib/gp/pgtests/expected",
 		  "$repo/contrib/gp/tools", "$repo/src/test/regress/expected");
-copy($script, "$repo/contrib/gp/tools/gp-gp-manifest.sh")
-	or die "copy $script: $!";
+my $copy = "$repo/contrib/gp/tools/gp-gp-manifest.sh";
+copy($script, $copy) or die "copy $script: $!";
 
 # The base answers of upstream and an answer of our own made from them
 write_file("$repo/src/test/regress/expected/foo.out", "the base answer\n");
@@ -112,25 +124,24 @@ sub read_file
 	return $content;
 }
 
-# Run git in the repository through the named shell
+# Run git in the repository: git is native everywhere, no shell involved
 sub run_git
 {
 	my ($command) = @_;
 	my ($out, $err);
 
-	run([$sh, '-c', "cd '$repo' && git $command"], '>', \$out, '2>', \$err)
+	run([$git, '-C', $repo, $command], '>', \$out, '2>', \$err)
 		or die "git $command: $?\n$out$err";
 }
 
-# Run the script in the repository and return its output with the errors;
-# the command is expected to succeed when a test asks for an empty answer
+# Run the script by its absolute path, as a file of the shell, and return
+# its output with the errors; the command is expected to succeed when a
+# test asks for an empty answer
 sub sh_out
 {
 	my ($command) = @_;
-	my $out;
+	my ($out, $err);
 
-	run([$sh, '-c',
-		"cd '$repo' && sh contrib/gp/tools/gp-gp-manifest.sh $command 2>&1"],
-		'>', \$out);
-	return $out;
+	run([$sh, $copy, $command], '>', \$out, '2>', \$err);
+	return (defined $out ? $out : '') . (defined $err ? $err : '');
 }
