@@ -1,0 +1,21 @@
+# Copyright (c) 2026, Georgy Shelkovy
+# Licensed under the PostgreSQL License, see LICENSE
+#
+# The base answer each answer of our own was made from, by test name:
+# the SHA-256 of the expected/foo.out of PostgreSQL at the moment the
+# answer was written.  When upstream changes that file, check reports
+# the answer as stale; when an answer grows equal to its base again,
+# check asks for it to be removed.  Regenerate the hashes with
+# tools/gp-gp-manifest.sh update after refreshing the answers.
+alter_table 46e3430ad44dc3922cbe5c4b476c78d03f6120d4c33b74cbcf42dce5f8289815
+create_index 696720860e718dbc4b84a432c062eda41d1adc352e7fedd5bd4382a8d39421a9
+create_table 55b16608690e0aa43daff851814e92524d3ddb27298b0f628d425b76c67e6a9e
+create_view bb31b194c798e75ef827eed736bbd3718e89e537fdb2b9bbe988f30dddbdf4fa
+foreign_data bfc79c0fa5fc6f12b69351ca62e228b7da3061b6c92418095313e29c11550a6a
+foreign_key 2ec0a17f3513b34f0c21ddd01bfa2e718be82590816b204f9c51bb2f7ddc6953
+generated_stored ccff89782f37000ddff46b5f22bf7070dcc08ea1f0f2af6f774788b3fa715403
+generated_virtual 7ce4de54358bb8610aae7abc93ccc143fdd9b212284cb4534ded6bf864ce9fd9
+identity 9e6a854cac0130b5c4424964145b3599d5d2a27489e5e45a3d036cf175d4e07a
+indexing 7702ba6fde6bb4c9daeebecf000ab109ed494ccb1eaf13f44f57a6cc18aeee19
+select_into ed6061197f9aa62a5e8b06eb69b27b21a77a96277ad77edc5b192ce1eb66d9bd
+without_overlaps fe03f824f4c227eb82a786c842005e5374b72005265ea506804e5e50bc54a623

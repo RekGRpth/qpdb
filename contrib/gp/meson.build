@@ -87,6 +87,7 @@ tests += {
       't/029_redistributed_join.pl',
       't/030_interconnect_port.pl',
       't/031_interconnect_cancel.pl',
+      't/032_gp_manifest.pl',
     ],
   },
 }
