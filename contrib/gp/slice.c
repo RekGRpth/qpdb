@@ -77,6 +77,24 @@ static const CustomScanMethods gp_slice_plan_methods = {
 	.CreateCustomScanState = gp_slice_create_state,
 };
 
+/* Where the rows of a plan subtree are computed */
+typedef enum GpLocus
+{
+	GP_LOCUS_COORDINATOR,		/* no distributed locus */
+	GP_LOCUS_SEGMENTS,			/* a part of the answer on every segment */
+	GP_LOCUS_ONE_SEGMENT,		/* the whole answer on one segment */
+} GpLocus;
+
+/* A unary node that only projects, filters, sorts or limits keeps the locus */
+static GpLocus
+gp_locus_unary(Plan *plan, GpLocus child)
+{
+	if (IsA(plan, Result) || IsA(plan, SubqueryScan) ||
+		IsA(plan, Sort) || IsA(plan, Limit))
+		return child;
+	return GP_LOCUS_COORDINATOR;
+}
+
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
@@ -1745,8 +1763,8 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 }
 
 /*
- * Whether the query is a plain select over one subquery, with nothing of
- * its own but a projection, a sort and a limit: whatever the planner put
+ * Whether the query is a select over one subquery, with nothing of its own
+ * but a projection, a condition, a sort and a limit: whatever the planner put
  * below the sort and the limit is the plan of the subquery alone — an
  * aggregate, a join, or a SubqueryScan the planner chose to keep
  */
@@ -1756,16 +1774,18 @@ gp_slice_subquery_outer(Query *parse, RangeTblEntry **rte_out)
 	RangeTblRef *ref;
 	RangeTblEntry *rte;
 
+	/* A condition pushed into the subquery may leave hasAggs set here.  A real
+	 * aggregate of the outer query is not a unary node and never reaches this
+	 * predicate through the walker's unary chain */
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
-		parse->hasAggs || parse->hasWindowFuncs || parse->hasSubLinks ||
+		parse->hasWindowFuncs || parse->hasSubLinks ||
 		parse->setOperations != NULL || parse->cteList != NIL ||
 		parse->groupClause != NIL || parse->groupingSets != NIL ||
 		parse->distinctClause != NIL || parse->rowMarks != NIL)
 		return false;
 	if (!IsA(parse->jointree, FromExpr) ||
 		list_length(parse->jointree->fromlist) != 1 ||
-		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
-		parse->jointree->quals != NULL)
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
 		return false;
 	ref = linitial_node(RangeTblRef, parse->jointree->fromlist);
 	rte = rt_fetch(ref->rtindex, parse->rtable);
@@ -1787,7 +1807,7 @@ gp_slice_subquery_outer(Query *parse, RangeTblEntry **rte_out)
  * answers the ORDER BY by its own order, with no sort on top, is left
  * alone: the replacement would not answer it
  */
-static void
+static GpLocus
 gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 {
 	Plan	   *plan = *planp;
@@ -1800,34 +1820,75 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	CustomScan *cscan;
 
 	if (plan == NULL)
-		return;
+		return GP_LOCUS_COORDINATOR;
 
-	/* The sort, the limit and the projection of the outer query */
-	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
+	/* A condition or projection above the subquery changes rows, not their locus */
+	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result) ||
+		IsA(plan, SubqueryScan))
 	{
-		gp_slice_subquery_walk(parse, &plan->lefttree,
+		Plan	  **childp = IsA(plan, SubqueryScan) ?
+			&((SubqueryScan *) plan)->subplan : &plan->lefttree;
+		GpLocus	child = gp_slice_subquery_walk(parse, childp,
 							   sort_above || IsA(plan, Sort));
-		return;
+		return gp_locus_unary(plan, child);
 	}
 
 	if (parse->sortClause != NIL && !sort_above)
-		return;
+		return GP_LOCUS_COORDINATOR;
 	if (!gp_slice_subquery_outer(parse, &rte))
-		return;
+		return GP_LOCUS_COORDINATOR;
 	subquery = rte->subquery;
 	if (subquery->limitCount != NULL || subquery->limitOffset != NULL)
-		return;
+		return GP_LOCUS_COORDINATOR;
 
 	candidate = gp_slice_agg_query(subquery);
 	is_agg = candidate != NULL;
 	if (candidate == NULL)
 		candidate = gp_slice_join_query(subquery);
 	if (candidate == NULL)
-		return;
+		return GP_LOCUS_COORDINATOR;
 
-	/* The columns the segments return are the outputs of the subquery */
-	if (list_length(plan->targetlist) != list_length(subquery->targetList))
-		return;
+	/* The columns the segments return are the non-junk outputs of the subquery */
+	if (parse->sortClause != NIL)
+	{
+		if (list_length(plan->targetlist) != list_length(subquery->targetList))
+			return GP_LOCUS_COORDINATOR;
+	}
+	else
+	{
+		int			planned = 0;
+		int			needed = 0;
+		ListCell   *lc;
+
+		/* The planner may prune a subquery output the outer query never reads */
+		foreach(lc, candidate->targetList)
+		{
+			TargetEntry *subtle = lfirst_node(TargetEntry, lc);
+			ListCell   *plc;
+			bool		returned = false;
+
+			foreach(plc, plan->targetlist)
+			{
+				TargetEntry *ptle = lfirst_node(TargetEntry, plc);
+
+				if (ptle->resno == subtle->resno && !ptle->resjunk)
+				{
+					returned = true;
+					break;
+				}
+			}
+			if (!returned)
+				subtle->resjunk = true;
+		}
+		foreach(lc, plan->targetlist)
+			if (!lfirst_node(TargetEntry, lc)->resjunk)
+				planned++;
+		foreach(lc, candidate->targetList)
+			if (!lfirst_node(TargetEntry, lc)->resjunk)
+				needed++;
+		if (planned != needed)
+			return GP_LOCUS_COORDINATOR;
+	}
 
 	if (is_agg)
 	{
@@ -1837,18 +1898,18 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		while (agg != NULL && !IsA(agg, Agg))
 		{
 			if (agg->righttree != NULL)
-				return;
+				return GP_LOCUS_COORDINATOR;
 			agg = agg->lefttree;
 		}
 		if (agg == NULL)
-			return;
+			return GP_LOCUS_COORDINATOR;
 		below = agg->lefttree;
 		while (below != NULL && IsA(below, Sort))
 			below = below->lefttree;
 		if (below == NULL || !gp_is_gather(below) ||
 			!gp_slice_agg_locus(candidate, (Agg *) agg, below,
 								&replicated, &motion))
-			return;
+			return GP_LOCUS_COORDINATOR;
 	}
 	else
 	{
@@ -1861,13 +1922,13 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 
 		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
 								   &tables, &conds))
-			return;
+			return GP_LOCUS_COORDINATOR;
 		conds = lappend(conds, candidate->jointree->quals);
 		if (!gp_slice_join_colocated(candidate, tables, conds))
 		{
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
-				return;
+				return GP_LOCUS_COORDINATOR;
 			motion = true;
 		}
 		replicated = replicated || single_segment;
@@ -1878,22 +1939,27 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 			while (agg != NULL && !IsA(agg, Agg))
 			{
 				if (agg->righttree != NULL)
-					return;
+					return GP_LOCUS_COORDINATOR;
 				agg = agg->lefttree;
 			}
 			if (agg == NULL ||
 				!gp_slice_join_agg_keys((Agg *) agg, tables, subquery, agg_stay))
-				return;
+				return GP_LOCUS_COORDINATOR;
 		}
 	}
+	if (is_agg)
+		/* The planner puts both the original HAVING and a pushed outer condition
+		 * in the aggregate's qual, not necessarily in the subquery's havingQual */
+		candidate->havingQual = (Node *) copyObject((Node *) plan->qual);
 	cscan = gp_slice_make(plan, candidate, replicated, motion, parse->sortClause);
 	*planp = &cscan->scan.plan;
+	return replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS;
 }
 
 void
 gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt)
 {
-	gp_slice_subquery_walk(parse, &stmt->planTree, false);
+	(void) gp_slice_subquery_walk(parse, &stmt->planTree, false);
 }
 
 /* An aggregate of the query, answered by the segments as a column */
