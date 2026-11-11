@@ -1950,7 +1950,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	if (is_agg)
 		/* The planner puts both the original HAVING and a pushed outer condition
 		 * in the aggregate's qual, not necessarily in the subquery's havingQual */
-		candidate->havingQual = copyObject(plan->qual);
+		candidate->havingQual = (Node *) copyObject((Node *) plan->qual);
 	cscan = gp_slice_make(plan, candidate, replicated, motion, parse->sortClause);
 	*planp = &cscan->scan.plan;
 	return replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS;
