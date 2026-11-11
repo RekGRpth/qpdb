@@ -19,8 +19,25 @@ $script =~ s{/t/\d+[^/]*\.pl$}{};
 $script .= '/tools/gp-gp-manifest.sh';
 plan skip_all => "$script not found" unless -f $script;
 
-# A git repository of its own: the script walks to the tree root by git
+# A git repository of its own: the script walks to the tree root by git.
+# The shell of the script: named in full, for the command line of
+# Windows does not find sh by the paths of its environment
 my $repo = tempdir(CLEANUP => 1);
+my $sh = 'sh';
+if ($^O eq 'MSWin32')
+{
+	for my $candidate (qw(C:/msys64/usr/bin/sh.exe
+		C:/Program Files/Git/usr/bin/sh.exe))
+	{
+		if (-f $candidate)
+		{
+			$sh = $candidate;
+			last;
+		}
+	}
+	plan skip_all => 'no sh for the manifest script'
+		if $sh eq 'sh' && system(qq{$sh -c exit}) != 0;
+}
 make_path("$repo/contrib/gp/pgtests/expected");
 make_path("$repo/contrib/gp/tools");
 copy($script, "$repo/contrib/gp/tools/gp-gp-manifest.sh")
@@ -34,7 +51,7 @@ write_file("$src/foo.out", "the base answer\n");
 write_file("$repo/contrib/gp/pgtests/expected/foo.gp.out",
 	"the base answer\nthe part of the cluster\n");
 
-system(qq{cd "$repo" && git init -q && git add -A && git -c user.name=t -c user.email=t\@t commit -qm t}) == 0
+system(qq{cd "$repo" && "$sh" -c 'git init -q && git add -A && git -c user.name=t -c user.email=t\@t commit -qm t'}) == 0
 	or BAIL_OUT('git init failed');
 
 # update writes the manifest of every answer of our own
@@ -96,16 +113,14 @@ sub run_ok
 {
 	my ($dir, $command, $name) = @_;
 
-	# The script is a POSIX shell one: name the shell, for Windows does
-	# not run it by association
-	system(qq{cd "$dir" && sh contrib/gp/tools/gp-gp-manifest.sh $command}) == 0
+	system(qq{cd "$dir" && "$sh" contrib/gp/tools/gp-gp-manifest.sh $command}) == 0
 		or die "$name: $!";
 }
 
 sub run_fail
 {
 	my ($dir, $command) = @_;
-	my $output = `cd "$dir" && sh contrib/gp/tools/gp-gp-manifest.sh $command 2>&1`;
+	my $output = `cd "$dir" && "$sh" contrib/gp/tools/gp-gp-manifest.sh $command 2>&1`;
 
 	isnt($? >> 8, 0, "the command $command fails");
 	return $output;
