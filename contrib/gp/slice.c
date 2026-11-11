@@ -77,28 +77,158 @@ static const CustomScanMethods gp_slice_plan_methods = {
 	.CreateCustomScanState = gp_slice_create_state,
 };
 
-/* Where the rows of a plan subtree are computed */
-typedef enum GpLocus
+/* Where the rows of a plan subtree are computed, and by which columns they hash */
+typedef enum GpLocusKind
 {
 	GP_LOCUS_COORDINATOR,		/* no distributed locus */
 	GP_LOCUS_SEGMENTS,			/* a part of the answer on every segment */
 	GP_LOCUS_ONE_SEGMENT,		/* the whole answer on one segment */
+} GpLocusKind;
+
+typedef struct GpLocus
+{
+	GpLocusKind kind;
+	int			colocation_id;
+	int			nkeys;
+	AttrNumber *keys;			/* positions in the output of the subtree */
+	Oid		   *keytypes;
+	Oid		   *keycollations;
 } GpLocus;
 
-/* A unary node that only projects, filters, sorts or limits keeps the locus */
+static GpLocus
+gp_locus_make(GpLocusKind kind)
+{
+	GpLocus	locus = {kind, 0, 0, NULL};
+
+	return locus;
+}
+
+static GpLocus
+gp_locus_policy(const GpPolicy *policy)
+{
+	GpLocus	locus;
+
+	if (policy->replicated)
+		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+	locus = gp_locus_make(GP_LOCUS_SEGMENTS);
+	locus.colocation_id = policy->colocation_id;
+	locus.nkeys = policy->nkeys;
+	locus.keys = palloc_array(AttrNumber, policy->nkeys);
+	memcpy(locus.keys, policy->keys, policy->nkeys * sizeof(AttrNumber));
+	return locus;
+}
+
+/* Unknown hashing, but the rows are still split over the segments */
+static GpLocus
+gp_locus_unhash(GpLocus locus)
+{
+	locus.colocation_id = 0;
+	locus.nkeys = 0;
+	locus.keys = NULL;
+	locus.keytypes = NULL;
+	locus.keycollations = NULL;
+	return locus;
+}
+
+/*
+ * Map all the hash keys through a projection.  Losing one key of a compound
+ * key, or computing an expression over it, makes the hashing unknown: hashing
+ * by the remaining columns would not prove colocation.
+ */
+static GpLocus
+gp_locus_project(Plan *plan, GpLocus child)
+{
+	AttrNumber *keys;
+	Oid		   *types;
+	Oid		   *collations;
+
+	if (child.kind != GP_LOCUS_SEGMENTS || child.nkeys == 0)
+		return child;
+	keys = palloc_array(AttrNumber, child.nkeys);
+	types = palloc_array(Oid, child.nkeys);
+	collations = palloc_array(Oid, child.nkeys);
+	for (int k = 0; k < child.nkeys; k++)
+	{
+		bool		found = false;
+		ListCell   *lc;
+
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Var		   *var;
+
+			if (!IsA(tle->expr, Var))
+				continue;
+			var = (Var *) tle->expr;
+			if (var->varattno == child.keys[k])
+			{
+				keys[k] = tle->resno;
+				types[k] = var->vartype;
+				collations[k] = var->varcollid;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			pfree(keys);
+			pfree(types);
+			pfree(collations);
+			return gp_locus_unhash(child);
+		}
+	}
+	child.keys = keys;
+	child.keytypes = types;
+	child.keycollations = collations;
+	return child;
+}
+
+/* Sort and limit keep the output; Result and SubqueryScan may project it */
 static GpLocus
 gp_locus_unary(Plan *plan, GpLocus child)
 {
-	if (IsA(plan, Result) || IsA(plan, SubqueryScan) ||
-		IsA(plan, Sort) || IsA(plan, Limit))
+	if (IsA(plan, Sort) || IsA(plan, Limit))
 		return child;
-	return GP_LOCUS_COORDINATOR;
+	if (IsA(plan, Result) || IsA(plan, SubqueryScan))
+		return gp_locus_project(plan, child);
+	return gp_locus_make(GP_LOCUS_COORDINATOR);
+}
+
+/* Whether every hash key is a grouping column of the aggregate */
+static bool
+gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
+{
+	if (locus.kind != GP_LOCUS_SEGMENTS || locus.nkeys == 0)
+		return false;
+	for (int k = 0; k < locus.nkeys; k++)
+	{
+		bool		grouped = false;
+
+		for (int i = 0; i < agg->numCols; i++)
+		{
+			TargetEntry *tle = list_nth(below->targetlist,
+										agg->grpColIdx[i] - 1);
+			Var		   *var;
+
+			if (!IsA(tle->expr, Var))
+				return false;
+			var = (Var *) tle->expr;
+			if (var->varattno == locus.keys[k])
+			{
+				grouped = true;
+				break;
+			}
+		}
+		if (!grouped)
+			return false;
+	}
+	return true;
 }
 
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
-							   bool *replicated, bool *motion);
+							   bool *replicated, bool *motion, GpLocus *locus);
 
 /*
  * The request worker does not inherit the settings of the session.  Only an
@@ -490,6 +620,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	CustomScan *cscan;
 	bool		replicated = false;
 	bool		motion = false;
+	GpLocus	locus;
 
 	/* Find the aggregate, below whatever sorts and limits sit on top */
 	while (plan != NULL && !IsA(plan, Agg))
@@ -520,7 +651,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	if (below == NULL || !gp_is_gather(below))
 		return false;
 
-	if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion))
+	if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion, &locus))
 		return false;
 
 	/* The columns the segments return are the target list of the aggregate */
@@ -1145,14 +1276,14 @@ gp_slice_hashable(Oid typid)
  */
 static bool
 gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
-				   bool *replicated, bool *motion)
+				   bool *replicated, bool *motion, GpLocus *locus)
 {
 	RangeTblRef *ref;
 	RangeTblEntry *rte;
 	GpJoinTable *table;
 	AttrNumber *keyatts;
-	bool		colocated = true;
 
+	*locus = gp_locus_make(GP_LOCUS_COORDINATOR);
 	*replicated = false;
 	*motion = false;
 	if (!IsA(original->jointree, FromExpr) ||
@@ -1168,36 +1299,18 @@ gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 	table->rti = ref->rtindex;
 	if (!gp_policy_get(rte->relid, &table->policy))
 		return false;
+	*locus = gp_locus_policy(&table->policy);
 	if (table->policy.replicated)
 	{
 		*replicated = true;
 		return true;
 	}
 
-	/* Does the grouping cover the whole distribution key? */
-	for (int k = 0; k < table->policy.nkeys && colocated; k++)
+	if (gp_locus_grouped(*locus, agg, below))
 	{
-		bool		grouped = false;
-
-		for (int i = 0; i < agg->numCols; i++)
-		{
-			TargetEntry *tle = list_nth(below->targetlist,
-										agg->grpColIdx[i] - 1);
-			Var		   *var;
-
-			if (!IsA(tle->expr, Var))
-				return false;
-			var = (Var *) tle->expr;
-			if (var->varattno == table->policy.keys[k])
-			{
-				grouped = true;
-				break;
-			}
-		}
-		colocated = grouped;
-	}
-	if (colocated)
+		*locus = gp_locus_project(&agg->plan, *locus);
 		return true;
+	}
 	if (agg->numCols == 0 || gp_dispatch_in_xact())
 		return false;
 
@@ -1218,6 +1331,10 @@ gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 	if (!gp_slice_redistribute_rte_keys(original, table, table, false,
 										agg->numCols, keyatts, NULL, false))
 		return false;
+	locus->colocation_id = table->policy.colocation_id;
+	locus->nkeys = agg->numCols;
+	locus->keys = keyatts;
+	*locus = gp_locus_project(&agg->plan, *locus);
 	*motion = true;
 	return true;
 }
@@ -1818,9 +1935,10 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	bool		replicated;
 	bool		motion = false;
 	CustomScan *cscan;
+	GpLocus	locus = gp_locus_make(GP_LOCUS_COORDINATOR);
 
 	if (plan == NULL)
-		return GP_LOCUS_COORDINATOR;
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
 
 	/* A condition or projection above the subquery changes rows, not their locus */
 	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result) ||
@@ -1834,25 +1952,25 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	}
 
 	if (parse->sortClause != NIL && !sort_above)
-		return GP_LOCUS_COORDINATOR;
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
 	if (!gp_slice_subquery_outer(parse, &rte))
-		return GP_LOCUS_COORDINATOR;
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
 	subquery = rte->subquery;
 	if (subquery->limitCount != NULL || subquery->limitOffset != NULL)
-		return GP_LOCUS_COORDINATOR;
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
 
 	candidate = gp_slice_agg_query(subquery);
 	is_agg = candidate != NULL;
 	if (candidate == NULL)
 		candidate = gp_slice_join_query(subquery);
 	if (candidate == NULL)
-		return GP_LOCUS_COORDINATOR;
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
 
 	/* The columns the segments return are the non-junk outputs of the subquery */
 	if (parse->sortClause != NIL)
 	{
 		if (list_length(plan->targetlist) != list_length(subquery->targetList))
-			return GP_LOCUS_COORDINATOR;
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
 	}
 	else
 	{
@@ -1887,7 +2005,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 			if (!lfirst_node(TargetEntry, lc)->resjunk)
 				needed++;
 		if (planned != needed)
-			return GP_LOCUS_COORDINATOR;
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
 	}
 
 	if (is_agg)
@@ -1898,18 +2016,18 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		while (agg != NULL && !IsA(agg, Agg))
 		{
 			if (agg->righttree != NULL)
-				return GP_LOCUS_COORDINATOR;
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			agg = agg->lefttree;
 		}
 		if (agg == NULL)
-			return GP_LOCUS_COORDINATOR;
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		below = agg->lefttree;
 		while (below != NULL && IsA(below, Sort))
 			below = below->lefttree;
 		if (below == NULL || !gp_is_gather(below) ||
 			!gp_slice_agg_locus(candidate, (Agg *) agg, below,
-								&replicated, &motion))
-			return GP_LOCUS_COORDINATOR;
+								&replicated, &motion, &locus))
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
 	}
 	else
 	{
@@ -1922,13 +2040,13 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 
 		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
 								   &tables, &conds))
-			return GP_LOCUS_COORDINATOR;
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		conds = lappend(conds, candidate->jointree->quals);
 		if (!gp_slice_join_colocated(candidate, tables, conds))
 		{
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
-				return GP_LOCUS_COORDINATOR;
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
 			motion = true;
 		}
 		replicated = replicated || single_segment;
@@ -1939,12 +2057,12 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 			while (agg != NULL && !IsA(agg, Agg))
 			{
 				if (agg->righttree != NULL)
-					return GP_LOCUS_COORDINATOR;
+					return gp_locus_make(GP_LOCUS_COORDINATOR);
 				agg = agg->lefttree;
 			}
 			if (agg == NULL ||
 				!gp_slice_join_agg_keys((Agg *) agg, tables, subquery, agg_stay))
-				return GP_LOCUS_COORDINATOR;
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
 		}
 	}
 	if (is_agg)
@@ -1953,7 +2071,9 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		candidate->havingQual = (Node *) copyObject((Node *) plan->qual);
 	cscan = gp_slice_make(plan, candidate, replicated, motion, parse->sortClause);
 	*planp = &cscan->scan.plan;
-	return replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS;
+	if (is_agg)
+		return locus;
+	return gp_locus_make(replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS);
 }
 
 void

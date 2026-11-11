@@ -51,6 +51,10 @@ run("INSERT INTO u SELECT g, 'd' || g FROM generate_series(41, 120) g");
 # The same rows in tables of the coordinator, to compare the answers with
 run('CREATE TABLE l AS SELECT * FROM t');
 run('CREATE TABLE lu AS SELECT * FROM u');
+run('CREATE TABLE m (a int, b int, v numeric)');
+run("SELECT gp.distribute('m', ARRAY['a', 'b'])");
+run("INSERT INTO m SELECT g % 5, g % 7, g * 1.25 FROM generate_series(1, 350) g");
+run('CREATE TABLE lmm AS SELECT * FROM m');
 
 like(plan_for('SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ORDER BY s.a LIMIT 5'),
 	qr/GpSlice/, 'an aggregate subquery runs on the segments');
@@ -58,6 +62,10 @@ like(plan_for('SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY
 	qr/GpSlice/, 'an aggregate subquery without a sort of the outer query is pushed');
 like(plan_for('SELECT s.a, s.cnt FROM (SELECT t.a, count(*) AS cnt FROM t JOIN u ON t.a = u.a GROUP BY t.a) s LIMIT 5'),
 	qr/GpSlice/, 'a colocated join inside a subquery is pushed');
+like(plan_for('SELECT a, b, sum(v) FROM m GROUP BY a, b'),
+	qr/GpSlice/, 'the whole compound distribution key stays hashed');
+like(plan_for('SELECT a, sum(v) FROM m GROUP BY a'),
+	qr/GpSlice/, 'a prefix of a compound key redistributes by the grouping columns');
 unlike(plan_for('SELECT * FROM (SELECT a, count(*) FROM t GROUP BY a LIMIT 3) s'),
 	qr/GpSlice/, 'a limit inside the subquery stops the pushdown');
 my $condition_plan = plan_for('SELECT s.a FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt > 900');
@@ -75,6 +83,10 @@ my @queries = (
 	'SELECT s.cnt + 1 FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ORDER BY 1 LIMIT 3',
 	'SELECT s.a FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt = 100 ORDER BY s.a LIMIT 4',
 	'SELECT s.a FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt > 900',
+	'SELECT a, b, v FROM (SELECT a, b, sum(v) AS v FROM m GROUP BY a, b) s ORDER BY a, b LIMIT 6',
+	'SELECT a FROM (SELECT a, b, sum(v) AS v FROM m GROUP BY a, b) s WHERE b = 3 ORDER BY a LIMIT 4',
+	'SELECT a + b, v FROM (SELECT a, b, sum(v) AS v FROM m GROUP BY a, b) s ORDER BY 1, 2 LIMIT 4',
+	'SELECT a, v FROM (SELECT a, sum(v) AS v FROM m GROUP BY a) s ORDER BY a, v',
 	'SELECT s.cnt + 1 FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt = 100 AND s.a > 2 ORDER BY 1 LIMIT 3',
 );
 foreach my $query (@queries)
@@ -82,6 +94,7 @@ foreach my $query (@queries)
 	my $local = $query;
 	$local =~ s/\bt\b/l/g;
 	$local =~ s/\bu\b/lu/g;
+	$local =~ s/\bm\b/lmm/g;
 	is(run($query), run($local), "the same answer as on the coordinator: $query");
 }
 
