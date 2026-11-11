@@ -534,9 +534,11 @@ a join with redistribution or broadcast, runs on the segments even inside
 a subquery of a query that is not colocated itself.  The planner
 often inlines the plan of a simple subquery with no `SubqueryScan` node,
 so the plan below the sort and the limit of the outer query is replaced,
-whatever node it is; a plan that answers the `ORDER BY` by its own order
-is left alone, and so is a subquery with a limit of its own, a condition
-of the outer query on its results, and a subquery joined to a table.
+whatever node it is.  A projection, a condition, a sort and a limit of the
+outer query keep the locus of the subquery and stay above it, including a
+condition the planner pushed into the aggregate's `HAVING` and outputs it
+pruned.  A plan that answers the `ORDER BY` by its own order is left alone,
+and so is a subquery with a limit of its own and a subquery joined to a table.
 
 An aggregate grouped by expressions, and a global aggregate that does
 not move all rows to one segment, can be answered in two steps instead:
@@ -677,7 +679,7 @@ start their own clusters:
 | `024_recovery.pl` | The recovery worker of the coordinator: a segment lost during `COMMIT PREPARED` has its transaction committed, a coordinator lost between the prepare and its commit has it rolled back on the segments |
 | `025_agg_pushdown.pl` | Aggregates on the segments: grouping by the key of the distribution, redistribution by other hashable columns, replicated tables, subqueries, inheritance boundaries, unhashable-type, own-write, session-setting and dropped-column fallbacks |
 | `026_join_pushdown.pl` | Joins and aggregates over them on the segments: one colocation group joined by the key, replicated tables, outer joins, joins of three and more tables, what is not pushed, the same answers as on the coordinator |
-| `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; a limit inside, a condition or a join of the outer query do not |
+| `027_subquery_pushdown.pl` | Aggregates and colocated joins inside a subquery of a non-colocated query run on the segments; projections, conditions, sorts and limits of the outer query keep that locus, including pushed `HAVING` and pruned outputs; a limit inside or a join of the outer query stops the pushdown |
 | `029_redistributed_join.pl` | `GpMotion` replaces the peer-query marker; inner joins of two and more colocation groups redistribute by the whole key; without one, a two-table join broadcasts the second table under any condition, outer joins broadcast the null-supplying side, and full joins broadcast both sides to one segment; expressions, cross joins, aggregates, subqueries, writes and dropped columns are checked |
 | `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
 | `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
@@ -717,8 +719,9 @@ by the patch and `contrib/gp`.
    are on the same segment run on the segments, with aggregates over
    colocated joins of any number of tables, junk columns of the target
    list allowed, the same computation inside a subquery in FROM, and
-   aggregates by other columns answered partly on the segments; next is
-   the locus model for the rest.
+   aggregates by other columns answered partly on the segments; the first
+   locus propagation keeps projections, conditions, sorts and limits above
+   a distributed subquery; next is the locus model for the rest.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
