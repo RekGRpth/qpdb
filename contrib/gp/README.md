@@ -411,6 +411,21 @@ slots pass through STARTING, READY, ASSIGNED and BUSY back to FREE, and the
 broker reaps stopped workers.  Nested Motion to the same segment therefore
 gets another worker instead of waiting for a busy single listener.
 
+All autonomous readers of one statement share one snapshot per segment.
+Before the first of them starts, and under the statement's distributed
+commit-exclusion lock, the coordinator opens a separate READ ONLY REPEATABLE
+READ connection to every segment and exports a snapshot there.  The request
+carries the whole segment-to-export mapping, for a root worker must pass it to
+its nested motions.  Each worker makes its transaction READ ONLY, imports the
+export of its own segment before its first snapshot, and forwards the mapping
+to its children.  No MVCC snapshot crosses a server boundary: transaction IDs
+of different servers have no meaning for one another.  The holder connections
+do not join the dispatched transaction or change its write state, and close at
+the end of the statement, its abort and its cancellation.  Thus a root and all
+its sibling and self-motion readers on one segment see exactly the same rows;
+the existing lock keeps distributed commits from appearing between the exports
+of different segments.
+
 A cancelled query takes its fragments with it.  A client reads and writes
 its socket over waits on its latch, for no signal handler of `pqsignal`
 interrupts a blocking `recv`, and neither does the timer of a statement
@@ -667,6 +682,7 @@ start their own clusters:
 | `030_interconnect_port.pl` | A broker takes any free TCP port and reports it, and clients connect to the reported port alone; a server sits on the port a rule would compute, and nothing of the cluster ever goes there |
 | `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
 | `032_gp_manifest.pl` | The manifest of the answers of our own: a base answer changed upstream is caught before the tests turn red, and an answer that equals its base again is asked for removal |
+| `033_multiple_slices.pl` | A root and its self-motion reader are separate READ ONLY transactions with one exported snapshot per segment; a segment-local commit between their starts changes nothing, nested cancellation and statement end close every snapshot holder, and a later write still sees itself |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
@@ -709,8 +725,9 @@ by the patch and `contrib/gp`.
    gathers and immutable slices use the same transport, while mutable plans,
    special session semantics and a transaction's writes stay on its dispatched
    connections; the broker of a segment reports its port to the coordinator,
-   so no client computes the address by a rule; next are multiple slices per
-   segment and full cancellation.
+   so no client computes the address by a rule; multiple slices of one statement
+   on a segment are READ ONLY readers of one exported snapshot, and cancellation
+   follows the whole reader tree.
 7. **Statistics** — `ANALYZE` on the segments, statistics on the
    coordinator.
 8. **More kinds of distribution** — replicated with the coordinator, on the

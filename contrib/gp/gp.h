@@ -25,6 +25,20 @@
 
 typedef struct EState EState;
 
+/* One exported snapshot per segment, shared by all readers of a statement */
+typedef struct GpSnapshotEntry
+{
+	int			segment_id;
+	char	   *name;
+	PGconn	   *holder;			/* coordinator only: keeps the export alive */
+} GpSnapshotEntry;
+
+typedef struct GpSnapshots
+{
+	int			count;
+	GpSnapshotEntry *entries;
+} GpSnapshots;
+
 /* Role of the server in the cluster */
 enum
 {
@@ -117,12 +131,15 @@ extern void gp_motion_init(void);
 /* interconnect.c */
 extern void gp_interconnect_init(void);
 extern char *gp_interconnect_plan(const char *sql);
+extern GpSnapshots *gp_interconnect_snapshots(void);
 extern void gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int requester);
+								  const char *host, int port, int requester,
+								  GpSnapshots *snapshots);
 extern bool gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 								  const char *db, const char *user, const char *sql,
-								  const char *host, int port, int requester);
+								  const char *host, int port, int requester,
+								  GpSnapshots *snapshots);
 
 /* recovery.c */
 extern void gp_recovery_init(void);
@@ -135,6 +152,8 @@ extern void gp_dtx_unlock(void);
 extern void gp_dtx_read_lock(void);
 extern void gp_dtx_read_unlock(void);
 extern void gp_dtx_statement_start(EState *estate);
+extern GpSnapshots *gp_dtx_statement_snapshots(EState *estate);
+extern void gp_snapshots_free(GpSnapshots *snapshots);
 extern void gp_dtx_xact_snapshot(void);
 extern PGconn *gp_connection_get(const GpSegment *segment);
 extern void gp_dispatch_xact(const char *sql);

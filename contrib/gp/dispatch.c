@@ -114,6 +114,11 @@ static bool dtx_held = false;
 static bool dtx_xact_held = false;
 
 /* Estates whose remote scans share one distributed commit-exclusion lock */
+typedef struct GpDtxStatement
+{
+	EState	   *estate;
+	GpSnapshots *snapshots;
+} GpDtxStatement;
 static List *dtx_statements = NIL;
 static ExecutorEnd_hook_type prev_executor_end = NULL;
 
@@ -399,28 +404,171 @@ gp_dtx_read_unlock(void)
 	LWLockRelease(&dtx_shared->lock);
 }
 
+static GpDtxStatement *
+gp_dtx_statement_find(EState *estate)
+{
+	foreach_ptr(GpDtxStatement, statement, dtx_statements)
+		if (statement->estate == estate)
+			return statement;
+	return NULL;
+}
+
+/* Close the holders after their readers, or when their statement goes away */
+void
+gp_snapshots_free(GpSnapshots *snapshots)
+{
+	if (snapshots == NULL)
+		return;
+	for (int i = 0; i < snapshots->count; i++)
+	{
+		if (snapshots->entries[i].holder != NULL)
+			libpqsrv_disconnect(snapshots->entries[i].holder);
+		if (snapshots->entries[i].name != NULL)
+			pfree(snapshots->entries[i].name);
+	}
+	if (snapshots->entries != NULL)
+		pfree(snapshots->entries);
+	pfree(snapshots);
+}
+
+/*
+ * Export one snapshot on every segment before any reader starts.  A dedicated
+ * READ ONLY holder keeps each export alive without joining the transaction of
+ * the dispatched connections.  The commit-exclusion lock is already held by
+ * the caller, so no distributed commit can appear between these exports.
+ */
+static GpSnapshots *
+gp_snapshots_open(void)
+{
+	const char *keywords[] = {"host", "port", "dbname", "user",
+	"application_name", "client_encoding", NULL};
+	const char *values[7];
+	GpSegment  *segments;
+	GpSnapshots *snapshots;
+	int			nsegments;
+	MemoryContext oldcontext;
+
+	nsegments = gp_segments_get(&segments);
+	if (nsegments == 0)
+		return NULL;
+	if (wait_event_connect == 0)
+	{
+		wait_event_connect = WaitEventExtensionNew("GpConnect");
+		wait_event_result = WaitEventExtensionNew("GpResult");
+	}
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	snapshots = palloc0(sizeof(*snapshots));
+	snapshots->count = nsegments;
+	snapshots->entries = palloc0_array(GpSnapshotEntry, nsegments);
+	for (int i = 0; i < nsegments; i++)
+	{
+		GpSnapshotEntry *entry = &snapshots->entries[i];
+		char		port[12];
+		PGresult   *res;
+
+		snprintf(port, sizeof(port), "%d", segments[i].port);
+		values[0] = segments[i].host;
+		values[1] = port;
+		values[2] = get_database_name(MyDatabaseId);
+		values[3] = GetConfigOptionResetString("session_authorization");
+		values[4] = "gp snapshot";
+		values[5] = GetDatabaseEncodingName();
+		values[6] = NULL;
+		entry->segment_id = segments[i].segment_id;
+		entry->holder = libpqsrv_connect_params(keywords, values, true,
+										 wait_event_connect);
+		if (entry->holder == NULL || PQstatus(entry->holder) != CONNECTION_OK)
+			goto fail;
+		res = libpqsrv_exec_params(entry->holder,
+								   "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+								   0, NULL, NULL, NULL, NULL, 0,
+								   wait_event_result);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			PQclear(res);
+			goto fail;
+		}
+		PQclear(res);
+		res = libpqsrv_exec_params(entry->holder,
+								   "SELECT pg_export_snapshot()",
+								   0, NULL, NULL, NULL, NULL, 0,
+								   wait_event_result);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) != 1)
+		{
+			PQclear(res);
+			goto fail;
+		}
+		entry->name = pstrdup(PQgetvalue(res, 0, 0));
+		PQclear(res);
+	}
+	MemoryContextSwitchTo(oldcontext);
+	return snapshots;
+
+fail:
+	MemoryContextSwitchTo(oldcontext);
+	gp_snapshots_free(snapshots);
+	return NULL;
+}
+
 /* All remote scans of one statement exclude distributed commits together */
 void
 gp_dtx_statement_start(EState *estate)
 {
+	GpDtxStatement *statement;
 	MemoryContext oldcontext;
 
-	if (list_member_ptr(dtx_statements, estate))
+	if (gp_dtx_statement_find(estate) != NULL)
 		return;
 	gp_dtx_read_lock();
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	dtx_statements = lappend(dtx_statements, estate);
+	statement = palloc0(sizeof(*statement));
+	statement->estate = estate;
+	dtx_statements = lappend(dtx_statements, statement);
 	MemoryContextSwitchTo(oldcontext);
+}
+
+/* The snapshots of all autonomous readers of this statement, if they can open */
+GpSnapshots *
+gp_dtx_statement_snapshots(EState *estate)
+{
+	GpDtxStatement *statement = gp_dtx_statement_find(estate);
+
+	if (statement == NULL)
+		return NULL;
+	if (statement->snapshots == NULL)
+		statement->snapshots = gp_snapshots_open();
+	return statement->snapshots;
 }
 
 static void
 gp_dtx_statement_end(EState *estate)
 {
-	if (!list_member_ptr(dtx_statements, estate))
+	GpDtxStatement *statement = gp_dtx_statement_find(estate);
+
+	if (statement == NULL)
 		return;
-	dtx_statements = list_delete_ptr(dtx_statements, estate);
+	gp_snapshots_free(statement->snapshots);
+	dtx_statements = list_delete_ptr(dtx_statements, statement);
+	pfree(statement);
 	if (LWLockHeldByMe(&dtx_shared->lock))
 		gp_dtx_read_unlock();
+}
+
+static void
+gp_dtx_statements_clear(void)
+{
+	GpDtxStatement *statement;
+
+	while (dtx_statements != NIL)
+	{
+		statement = linitial(dtx_statements);
+		gp_snapshots_free(statement->snapshots);
+		dtx_statements = list_delete_ptr(dtx_statements, statement);
+		pfree(statement);
+	}
+	list_free(dtx_statements);
+	dtx_statements = NIL;
 }
 
 /* A transaction snapshot needs commit exclusion from its explicit BEGIN */
@@ -542,7 +690,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT ||
 		event == XACT_EVENT_PREPARE)
 	{
-		/* TopTransactionContext is gone with the list */
+		/* Holders live in TopMemoryContext until this explicit cleanup */
 		ndispatched = 0;
 		subxact_marks = NIL;
 		diverged = false;
@@ -550,8 +698,7 @@ gp_connections_xact_callback(XactEvent event, void *arg)
 		one_phase_any = false;
 		copy_segments = NULL;
 		copy_nsegments = 0;
-		list_free(dtx_statements);
-		dtx_statements = NIL;
+		gp_dtx_statements_clear();
 		dtx_xact_held = false;
 	}
 }
@@ -585,8 +732,7 @@ gp_connections_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			if (dtx_xact_held)
 				gp_dtx_read_lock();
 			/* Surviving scans register again on their next call */
-			list_free(dtx_statements);
-			dtx_statements = NIL;
+			gp_dtx_statements_clear();
 			break;
 		default:
 			break;

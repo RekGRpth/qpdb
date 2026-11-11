@@ -90,8 +90,8 @@ static const CustomScanMethods gp_gather_plan_methods = {
 /*
  * Read a clean query over the interconnect.  Dropped columns are explicit
  * typed nulls in the fragment, so its answer has the table's full tupledesc.
- * The statement's commit lock covers every remote scan, including autonomous
- * listeners that take their own snapshots.
+ * The statement's commit lock covers every remote scan, and every worker
+ * imports the snapshot exported for this statement on its own segment.
  */
 static bool
 gp_gather_load_interconnect(GpGatherState *state)
@@ -104,6 +104,7 @@ gp_gather_load_interconnect(GpGatherState *state)
 	GpSegment  *segments;
 	char	   *plan;
 	char	   *db;
+	GpSnapshots *snapshots;
 	const char *user;
 	int			nsegments;
 	int			only = 0;
@@ -152,6 +153,9 @@ gp_gather_load_interconnect(GpGatherState *state)
 			return false;
 	}
 
+	snapshots = gp_dtx_statement_snapshots(ss->ps.state);
+	if (snapshots == NULL)
+		return false;
 	state->store = tuplestore_begin_heap(true, false, work_mem);
 	for (int i = 0; i < nsegments; i++)
 	{
@@ -159,7 +163,8 @@ gp_gather_load_interconnect(GpGatherState *state)
 			continue;
 		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
 								   segments[i].host,
-								   segments[i].interconnect_port, 0))
+								   segments[i].interconnect_port, 0,
+								   snapshots))
 		{
 			tuplestore_end(state->store);
 			state->store = NULL;
