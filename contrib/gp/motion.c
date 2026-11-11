@@ -30,10 +30,10 @@
  * coordinator at every call, so a cluster that changed stays correct.  The
  * segment the rows are for is told to the others by a setting of the
  * connection, for the query itself is one for all of them.  Every segment
- * answers as the user that runs the query, in the transaction of its
- * connection: the lock of the distributed snapshot, held by the
- * coordinator from before its question to after the last row, keeps the
- * answers of all the segments on one state of the cluster.
+ * answers as the user that runs the query, in a READ ONLY transaction that
+ * imports the snapshot exported for this statement on that segment.  The lock
+ * of the distributed snapshot, held by the coordinator from before the exports
+ * to after the last row, keeps all segments on one state of the cluster.
  *
  * Copyright (c) 2026, Georgy Shelkovy
  * Licensed under the PostgreSQL License, see LICENSE
@@ -63,6 +63,7 @@
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_func.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/tuplestore.h"
@@ -114,6 +115,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 	NULL};
 	const char *coord_values[3];
 	char	   *db;
+	GpSnapshots *snapshots = gp_interconnect_snapshots();
 	PGconn	   *conn;
 	PGresult   *segments;
 
@@ -171,6 +173,10 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 		pg_usleep(100000);
 	}
 
+	/* Tests stop a parent before its children share the statement snapshots */
+	if (snapshots != NULL)
+		INJECTION_POINT("gp-interconnect-parent", NULL);
+
 	for (int i = 0; i < PQntuples(segments); i++)
 	{
 		const char *host = PQgetvalue(segments, i, 1);
@@ -186,7 +192,7 @@ gp_motion_fetch(Tuplestorestate *store, TupleDesc tupdesc,
 						   segment_id));
 		gp_interconnect_query(store, tupdesc, db,
 							  GetUserNameFromId(GetUserId(), false), serialized,
-							  host, broker, requester);
+							  host, broker, requester, snapshots);
 	}
 
 	PQclear(segments);

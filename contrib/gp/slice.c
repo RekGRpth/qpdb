@@ -257,6 +257,7 @@ gp_slice_load_interconnect(GpSliceState *state)
 	GpSegment  *segments;
 	char	   *plan;
 	char	   *db;
+	GpSnapshots *snapshots;
 	const char *user;
 	int			nsegments;
 	int			only = 0;
@@ -286,6 +287,9 @@ gp_slice_load_interconnect(GpSliceState *state)
 			return false;
 	}
 
+	snapshots = gp_dtx_statement_snapshots(ss->ps.state);
+	if (snapshots == NULL)
+		return false;
 	state->store = tuplestore_begin_heap(true, false, work_mem);
 	for (int i = 0; i < nsegments; i++)
 	{
@@ -293,7 +297,8 @@ gp_slice_load_interconnect(GpSliceState *state)
 			continue;
 		if (!gp_interconnect_query_try(state->store, tupdesc, db, user, plan,
 								   segments[i].host,
-								   segments[i].interconnect_port, 0))
+								   segments[i].interconnect_port, 0,
+								   snapshots))
 		{
 			/* Earlier workers may have returned rows already */
 			tuplestore_end(state->store);

@@ -296,7 +296,7 @@ else
 ok($socket, 'the interconnect accepts a TCP connection');
 if ($socket)
 {
-	print {$socket} 'GPIC0001', pack('N', 1), '0';
+	print {$socket} 'GPIC0002', pack('N', 1), '0';
 	my $answer = '';
 	$socket->read($answer, 5);
 	is($answer, 'X' . pack('N', 26), 'an invalid token is refused');

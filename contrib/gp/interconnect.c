@@ -3,8 +3,10 @@
  * interconnect.c
  *		Pull rows between segments over a small TCP protocol
  *
- * A request has a database, a user, the segment the rows are for and SQL.
- * The segment executes it as that user and streams rows in the binary format
+ * A request has a database, a user, the segment the rows are for, the exported
+ * snapshots of its statement and SQL.  The segment executes it as that user in
+ * a READ ONLY transaction that imports the snapshot of its own segment, and
+ * streams rows in the binary format
  * of their types, followed by EOS.  An error goes back as text.  The receiver
  * materializes the answer, so the writer never waits for a reader of another
  * motion while the reader is blocked on this one.  Closing the connection
@@ -63,7 +65,7 @@
 
 #include "gp.h"
 
-#define GP_IC_MAGIC "GPIC0001"
+#define GP_IC_MAGIC "GPIC0002"
 #define GP_IC_MAGIC_LEN 8
 #define GP_IC_MAX_STRING (16 * 1024 * 1024)
 #define GP_IC_MAX_FIELD (1024 * 1024 * 1024)
@@ -80,6 +82,16 @@
 #define GP_IC_CANCEL 'C'
 
 #define GP_IC_SLOTS 64
+#define GP_IC_MAX_SNAPSHOTS 1024
+
+/* Snapshot exports received by this worker, forwarded by its nested motions */
+static GpSnapshots *gp_ic_current_snapshots = NULL;
+
+GpSnapshots *
+gp_interconnect_snapshots(void)
+{
+	return gp_ic_current_snapshots;
+}
 
 typedef enum GpIcSlotState
 {
@@ -370,6 +382,35 @@ gp_ic_read_string(pgsocket fd)
 }
 
 static bool
+gp_ic_read_snapshots(pgsocket fd, GpSnapshots **result)
+{
+	GpSnapshots *snapshots;
+	int32		count;
+
+	*result = NULL;
+	if (!gp_ic_read_i32(fd, &count) || count < 0 ||
+		count > GP_IC_MAX_SNAPSHOTS)
+		return false;
+	snapshots = palloc0(sizeof(*snapshots));
+	snapshots->count = count;
+	snapshots->entries = palloc0_array(GpSnapshotEntry, count);
+	for (int i = 0; i < count; i++)
+	{
+		if (!gp_ic_read_i32(fd, &snapshots->entries[i].segment_id))
+			goto fail;
+		snapshots->entries[i].name = gp_ic_read_string(fd);
+		if (snapshots->entries[i].name == NULL)
+			goto fail;
+	}
+	*result = snapshots;
+	return true;
+
+fail:
+	gp_snapshots_free(snapshots);
+	return false;
+}
+
+static bool
 gp_ic_write_message(pgsocket fd, char type, const void *buf, int32 len)
 {
 	return gp_ic_write(fd, &type, 1) && gp_ic_write_i32(fd, len) &&
@@ -501,6 +542,7 @@ gp_ic_serve(pgsocket fd, const char *token)
 	char	   *db = NULL;
 	char	   *user = NULL;
 	char	   *sql = NULL;
+	GpSnapshots *snapshots = NULL;
 	int32		requester;
 	bool		volatile restart = false;
 	static char *connected_db = NULL;
@@ -520,7 +562,8 @@ gp_ic_serve(pgsocket fd, const char *token)
 	db = gp_ic_read_string(fd);
 	user = gp_ic_read_string(fd);
 	if (db == NULL || user == NULL ||
-		!gp_ic_read_i32(fd, &requester))
+		!gp_ic_read_i32(fd, &requester) ||
+		!gp_ic_read_snapshots(fd, &snapshots))
 		return false;
 	sql = gp_ic_read_string(fd);
 	if (sql == NULL)
@@ -556,13 +599,34 @@ gp_ic_serve(pgsocket fd, const char *token)
 			INJECTION_POINT("gp-interconnect-fragment", NULL);
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
+			XactReadOnly = true;
+			if (snapshots->count > 0)
+			{
+				const char *snapshot = NULL;
+
+				for (int i = 0; i < snapshots->count; i++)
+					if (snapshots->entries[i].segment_id == gp_segment_id)
+						snapshot = snapshots->entries[i].name;
+				if (snapshot == NULL)
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("no snapshot for segment %d in the interconnect request",
+								   gp_segment_id));
+				XactIsoLevel = XACT_REPEATABLE_READ;
+				ImportSnapshot(snapshot);
+			}
 			SPI_connect();
 			PushActiveSnapshot(GetTransactionSnapshot());
 			if (SPI_execute(set, false, 0) != SPI_OK_UTILITY)
 				ereport(ERROR,
 						errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("could not set the receiving segment"));
+			gp_ic_current_snapshots = snapshots;
+			/* Tests park a self-motion reader beside its living parent */
+			if (requester == gp_segment_id && snapshots->count > 0)
+				INJECTION_POINT("gp-interconnect-reader", NULL);
 			gp_ic_execute(fd, sql);
+			gp_ic_current_snapshots = NULL;
 
 			if (!gp_ic_write_message(fd, GP_IC_EOS, NULL, 0))
 				ereport(ERROR,
@@ -594,6 +658,8 @@ gp_ic_serve(pgsocket fd, const char *token)
 		MemoryContextDelete(worker_context);
 	}
 	PG_END_TRY();
+	gp_ic_current_snapshots = NULL;
+	gp_snapshots_free(snapshots);
 	return restart;
 }
 
@@ -879,6 +945,7 @@ gp_ic_assign(pgsocket fd, const char *token)
 	char	   *db = NULL;
 	char	   *user = NULL;
 	char	   *sql = NULL;
+	GpSnapshots *snapshots = NULL;
 	int32		requester;
 	int32		len;
 	int			slot_id = -1;
@@ -921,13 +988,18 @@ gp_ic_assign(pgsocket fd, const char *token)
 	db[len] = '\0';
 	user = gp_ic_read_string(fd);
 	if (user == NULL ||
-		!gp_ic_read_i32(fd, &requester))
+		!gp_ic_read_i32(fd, &requester) ||
+		!gp_ic_read_snapshots(fd, &snapshots))
 		return false;
 	sql = gp_ic_read_string(fd);
 	if (sql == NULL)
+	{
+		gp_snapshots_free(snapshots);
 		return false;
-	/* The plan is sent again to the assigned worker, not kept in shmem */
+	}
+	/* The plan and snapshots are sent again to the assigned worker, not kept in shmem */
 	pfree(sql);
+	gp_snapshots_free(snapshots);
 
 	gp_ic_reap_slots();
 	for (int i = 0; i < GP_IC_SLOTS; i++)
@@ -1484,11 +1556,33 @@ gp_ic_write_i32_latched(pgsocket fd, WaitEventSet *wes, int32 value)
 	return gp_ic_write_latched(fd, wes, &net, sizeof(net));
 }
 
+static bool
+gp_ic_write_snapshots_latched(pgsocket fd, WaitEventSet *wes,
+							  const GpSnapshots *snapshots)
+{
+	int			count = snapshots != NULL ? snapshots->count : 0;
+
+	if (!gp_ic_write_i32_latched(fd, wes, count))
+		return false;
+	for (int i = 0; i < count; i++)
+	{
+		const char *name = snapshots->entries[i].name;
+		int			len = strlen(name);
+
+		if (!gp_ic_write_i32_latched(fd, wes,
+									 snapshots->entries[i].segment_id) ||
+			!gp_ic_write_i32_latched(fd, wes, len) ||
+			!gp_ic_write_latched(fd, wes, name, len))
+			return false;
+	}
+	return true;
+}
+
 /* Send the full request over the socket of its connection */
 static bool
 gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
 						 const char *db, const char *user, int requester,
-						 const char *sql)
+						 const char *sql, const GpSnapshots *snapshots)
 {
 	return gp_ic_write_latched(fd, wes, GP_IC_MAGIC, GP_IC_MAGIC_LEN) &&
 		gp_ic_write_i32_latched(fd, wes, strlen(token)) &&
@@ -1498,6 +1592,7 @@ gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
 		gp_ic_write_i32_latched(fd, wes, strlen(user)) &&
 		gp_ic_write_latched(fd, wes, user, strlen(user)) &&
 		gp_ic_write_i32_latched(fd, wes, requester) &&
+		gp_ic_write_snapshots_latched(fd, wes, snapshots) &&
 		gp_ic_write_i32_latched(fd, wes, strlen(sql)) &&
 		gp_ic_write_latched(fd, wes, sql, strlen(sql));
 }
@@ -1509,7 +1604,8 @@ gp_ic_send_query_latched(pgsocket fd, WaitEventSet *wes, const char *token,
 bool
 gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int requester)
+					  const char *host, int port, int requester,
+					  GpSnapshots *snapshots)
 {
 	/*
 	 * The socket, the worker it goes to and the fact of it are written
@@ -1562,7 +1658,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 	PG_TRY();
 	{
 		if (!gp_ic_send_query_latched(fd, wes, token, db, user, requester,
-									  sql))
+									  sql, snapshots))
 			retry = true;
 
 		/* The broker answers with the worker of the request */
@@ -1634,7 +1730,7 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 				{
 					wes = gp_ic_wes(fd);
 					if (!gp_ic_send_query_latched(fd, wes, token, db, user,
-												  requester, sql))
+												  requester, sql, snapshots))
 						retry = true;
 				}
 			}
@@ -1751,12 +1847,13 @@ gp_interconnect_query_try(Tuplestorestate *store, TupleDesc tupdesc,
 void
 gp_interconnect_query(Tuplestorestate *store, TupleDesc tupdesc,
 					  const char *db, const char *user, const char *sql,
-					  const char *host, int port, int requester)
+					  const char *host, int port, int requester,
+					  GpSnapshots *snapshots)
 {
 	for (int i = 0; i < 60; i++)
 	{
 		if (gp_interconnect_query_try(store, tupdesc, db, user, sql,
-									  host, port, requester))
+									  host, port, requester, snapshots))
 			return;
 		CHECK_FOR_INTERRUPTS();
 		pg_usleep(100000);

@@ -88,6 +88,7 @@ tests += {
       't/030_interconnect_port.pl',
       't/031_interconnect_cancel.pl',
       't/032_gp_manifest.pl',
+      't/033_multiple_slices.pl',
     ],
   },
 }
