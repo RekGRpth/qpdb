@@ -3176,10 +3176,9 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 	 *
 	 * If it is a full outer-join qualification, we add it to
 	 * root->full_join_clauses.  (Ideally we'd discard cases that aren't
-	 * leftvar = rightvar, as we do for left/right joins, but this routine
-	 * doesn't have the info needed to do that; and the current usage of the
-	 * full_join_clauses list doesn't require that, so it's not currently
-	 * worth complicating this routine's API to make it possible.)
+	 * leftvar = rightvar, as we do for left/right joins, but we leave that to
+	 * reconsider_full_join_clause(), which has to work out which side of the
+	 * join each operand comes from anyway.)
 	 *
 	 * If none of the above hold, pass it off to
 	 * distribute_restrictinfo_to_rels().
@@ -4040,12 +4039,25 @@ check_hashjoinable(RestrictInfo *restrictinfo)
  *	  If the restrictinfo's clause is suitable to be used for a Memoize node,
  *	  set the left_hasheqoperator and right_hasheqoperator to the hash equality
  *	  operator that will be needed during caching.
+ *
+ * When the clause is hashjoinable, the cache must use the same notion of
+ * equality as the join operator, as the type's default equality operator
+ * could consider values equal that the join operator does not.  If both
+ * inputs are of the same type, we can just use the join operator itself;
+ * otherwise we look up the same-type equality operators in the join
+ * operator's hash opfamily, and if there are none, Memoize won't be used.
+ * When the clause is not hashjoinable, we use the type's default equality
+ * operator and Memoize uses binary mode.
+ *
+ * Note: check_hashjoinable() must be called on the given RestrictInfo before
+ * calling this function.
  */
 static void
 check_memoizable(RestrictInfo *restrictinfo)
 {
 	TypeCacheEntry *typentry;
 	Expr	   *clause = restrictinfo->clause;
+	Oid			hashop = restrictinfo->hashjoinoperator;
 	Oid			lefttype;
 	Oid			righttype;
 
@@ -4057,23 +4069,37 @@ check_memoizable(RestrictInfo *restrictinfo)
 		return;
 
 	lefttype = exprType(linitial(((OpExpr *) clause)->args));
-
-	typentry = lookup_type_cache(lefttype, TYPECACHE_HASH_PROC |
-								 TYPECACHE_EQ_OPR);
-
-	if (OidIsValid(typentry->hash_proc) && OidIsValid(typentry->eq_opr))
-		restrictinfo->left_hasheqoperator = typentry->eq_opr;
-
 	righttype = exprType(lsecond(((OpExpr *) clause)->args));
 
-	/*
-	 * Lookup the right type, unless it's the same as the left type, in which
-	 * case typentry is already pointing to the required TypeCacheEntry.
-	 */
-	if (lefttype != righttype)
-		typentry = lookup_type_cache(righttype, TYPECACHE_HASH_PROC |
+	if (OidIsValid(hashop))
+	{
+		if (lefttype == righttype)
+			restrictinfo->left_hasheqoperator =
+				restrictinfo->right_hasheqoperator = hashop;
+		else
+			(void) get_compatible_hash_operators(restrictinfo->hashjoinoperator,
+												 &restrictinfo->left_hasheqoperator,
+												 &restrictinfo->right_hasheqoperator);
+	}
+	else
+	{
+		/* No hashjoinoperator.  Memoize will use binary mode. */
+		typentry = lookup_type_cache(lefttype, TYPECACHE_HASH_PROC |
 									 TYPECACHE_EQ_OPR);
 
-	if (OidIsValid(typentry->hash_proc) && OidIsValid(typentry->eq_opr))
-		restrictinfo->right_hasheqoperator = typentry->eq_opr;
+		if (OidIsValid(typentry->hash_proc) && OidIsValid(typentry->eq_opr))
+			restrictinfo->left_hasheqoperator = typentry->eq_opr;
+
+		/*
+		 * Lookup the right type, unless it's the same as the left type, in
+		 * which case typentry is already pointing to the required
+		 * TypeCacheEntry.
+		 */
+		if (lefttype != righttype)
+			typentry = lookup_type_cache(righttype, TYPECACHE_HASH_PROC |
+										 TYPECACHE_EQ_OPR);
+
+		if (OidIsValid(typentry->hash_proc) && OidIsValid(typentry->eq_opr))
+			restrictinfo->right_hasheqoperator = typentry->eq_opr;
+	}
 }

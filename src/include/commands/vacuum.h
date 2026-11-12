@@ -422,11 +422,11 @@ extern TidStore *parallel_vacuum_get_dead_items(ParallelVacuumState *pvs,
 												VacDeadItemsInfo **dead_items_info_p);
 extern void parallel_vacuum_reset_dead_items(ParallelVacuumState *pvs);
 extern void parallel_vacuum_bulkdel_all_indexes(ParallelVacuumState *pvs,
-												long num_table_tuples,
+												double num_table_tuples,
 												int num_index_scans,
 												PVWorkerStats *wstats);
 extern void parallel_vacuum_cleanup_all_indexes(ParallelVacuumState *pvs,
-												long num_table_tuples,
+												double num_table_tuples,
 												int num_index_scans,
 												bool estimated_count,
 												PVWorkerStats *wstats);
@@ -441,6 +441,10 @@ extern void analyze_rel(Oid relid, RangeVar *relation,
 						BufferAccessStrategy bstrategy);
 extern bool attribute_is_analyzable(Relation onerel, int attnum, Form_pg_attribute attr,
 									int *p_attstattarget);
+extern HeapTuple build_statistic_tuple(Oid relid, int attnum, bool inh,
+									   VacAttrStats *stats,
+									   TupleDesc tupdesc,
+									   HeapTuple oldtup);
 extern bool std_typanalyze(VacAttrStats *stats);
 
 /* in utils/misc/sampling.c --- duplicate of declarations in utils/sampling.h */
