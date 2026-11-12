@@ -555,8 +555,9 @@ one colocation group and every distribution-key pair meets by equality.  A full
 join can always bring both inputs to one segment.  If this analysis proves no
 locus, the existing colocation and Motion rules decide the plan as before.  The
 same analysis drives top-level `GpSlice` plans; the construction of a Motion
-loads the distribution policies it needs independently of that decision.  A
-flattened query whose pulled-up subquery has already been dropped is not
+loads the distribution policies it needs independently of that decision.  An
+aggregate is checked against the target list below any `Sort`, whose output
+positions are not the attribute numbers of the base table.  A flattened query whose pulled-up subquery has already been dropped is not
 deparsed into a remote query; it keeps the coordinator's plan.
 
 An aggregate grouped by expressions, and a global aggregate that does
@@ -742,8 +743,8 @@ by the patch and `contrib/gp`.
    locus propagation keeps projections, conditions, sorts and limits above
    a distributed subquery and carries the types, collations and positions of
    hash keys through direct projections; binary joins prove colocation from
-   both hashed inputs and drive top-level `GpSlice` plans; next is the locus
-   model for the rest.
+   both hashed inputs and drive top-level `GpSlice` join and aggregate plans;
+   next is the locus model for the rest.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean

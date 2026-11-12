@@ -373,10 +373,13 @@ gp_locus_plan(Plan *plan, Query *query)
 	if (IsA(plan, Agg))
 	{
 		Agg		   *agg = (Agg *) plan;
+		Plan	   *below = agg->plan.lefttree;
 
+		while (below != NULL && IsA(below, Sort))
+			below = below->lefttree;
 		child = gp_locus_plan(agg->plan.lefttree, query);
 		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
-			gp_locus_grouped(child, agg, agg->plan.lefttree))
+			gp_locus_grouped(child, agg, below))
 			return gp_locus_project(&agg->plan, child);
 		return gp_locus_make(GP_LOCUS_COORDINATOR);
 	}
@@ -833,8 +836,15 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	if (below == NULL || !gp_is_gather(below))
 		return false;
 
-	if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion, &locus))
-		return false;
+	locus = gp_locus_plan(&agg->plan, original);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+	{
+		/* A grouping that is not colocated can still move by its columns */
+		if (!gp_slice_agg_locus(original, agg, below, &replicated, &motion, &locus))
+			return false;
+	}
+	else
+		replicated = locus.kind == GP_LOCUS_ONE_SEGMENT;
 
 	/* The columns the segments return are the target list of the aggregate */
 	if (list_length(agg->plan.targetlist) !=
