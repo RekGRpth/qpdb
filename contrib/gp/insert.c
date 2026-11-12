@@ -38,6 +38,8 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -322,6 +324,7 @@ gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 	CustomScan *cscan;
 	List	   *buckets = NIL;
 	int			segment;
+	bool		motion;
 
 	if (!gp_policy_get(rte->relid, &policy))
 		return;
@@ -340,7 +343,7 @@ gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 				errmsg("row-level security and WITH CHECK OPTION are not supported on a distributed table"));
 
 	source = outerPlan(mt);
-	if (gp_slice_insert_motion(original))
+	if (gp_slice_insert_motion(original, &motion))
 	{
 		cscan = makeNode(CustomScan);
 		cscan->scan.plan.startup_cost = mt->plan.startup_cost;
@@ -350,7 +353,7 @@ gp_insert_plan(Query *parse, Query *original, PlannedStmt *stmt)
 		cscan->scan.scanrelid = 0;
 		cscan->custom_private = list_make3(makeString(pg_get_querydef(original, false)),
 										   makeBoolean(mt->canSetTag),
-										   makeBoolean(true));
+										   makeBoolean(motion));
 		cscan->methods = &gp_dml_plan_methods;
 		stmt->planTree = &cscan->scan.plan;
 		return;
@@ -448,11 +451,21 @@ gp_dml_end(CustomScanState *node)
 {
 }
 
+static void
+gp_dml_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	GpDmlState *state = (GpDmlState *) node;
+
+	ExplainPropertyText("Remote SQL", state->sql, es);
+	ExplainPropertyBool("Motion", state->motion, es);
+}
+
 static const CustomExecMethods gp_dml_exec_methods = {
 	.CustomName = "GpDml",
 	.BeginCustomScan = gp_dml_begin,
 	.ExecCustomScan = gp_dml_exec,
 	.EndCustomScan = gp_dml_end,
+	.ExplainCustomScan = gp_dml_explain,
 };
 
 /*
