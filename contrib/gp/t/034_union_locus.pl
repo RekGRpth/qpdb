@@ -14,7 +14,7 @@ use Test::More;
 my $coordinator = PostgreSQL::Test::Cluster->new('coordinator');
 $coordinator->init;
 $coordinator->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\nlog_min_messages = debug1\n");
+	"shared_preload_libraries = 'gp'\ngp.role = 'coordinator'\n");
 $coordinator->start;
 $coordinator->safe_psql('postgres', 'CREATE EXTENSION gp');
 
@@ -53,6 +53,20 @@ sub local_query
 	$query =~ s/\br1\b/lr1/g;
 	$query =~ s/\br2\b/lr2/g;
 	return $query;
+}
+
+# A parallel Gather must be removed above a distributed union, not duplicated
+sub parallel_query
+{
+	my ($query) = @_;
+
+	return $coordinator->safe_psql('postgres',
+		"SET debug_parallel_query = on;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+$query");
 }
 
 run('CREATE TABLE t1 (a int, b text)');
@@ -117,6 +131,10 @@ unlike(plan_for('SELECT a FROM t1 UNION SELECT a FROM t2'),
 	qr/GpSlice/, 'UNION DISTINCT is not a UNION ALL pushdown');
 like(plan_for("$union ORDER BY a LIMIT 3"),
 	qr/GpSlice/, 'a sort and a limit stay above the union');
+like(parallel_query("EXPLAIN (COSTS OFF) $union"),
+	qr/GpSlice/, 'a parallel Gather is removed above the union');
+is(parallel_query("$union ORDER BY a"), run(local_query("$union ORDER BY a")),
+	'a parallel plan does not duplicate the union');
 
 my @queries = (
 	$union . ' ORDER BY a',

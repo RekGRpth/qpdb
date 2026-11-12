@@ -398,6 +398,9 @@ gp_locus_plan(Plan *plan, List *rtable)
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		return gp_locus_policy(&policy);
 	}
+	if (IsA(plan, Gather))
+		/* GpSlice is distributed itself; its full answer must not multiply here */
+		return gp_locus_plan(plan->lefttree, rtable);
 	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
 	{
 		child = gp_locus_plan(plan->lefttree, rtable);
@@ -917,26 +920,15 @@ gp_slice_union_leaf(Query *query)
 		query->distinctClause != NIL || query->rowMarks != NIL ||
 		query->sortClause != NIL || query->limitCount != NULL ||
 		query->limitOffset != NULL)
-	{
-		ereport(DEBUG1, errmsg("union leaf flags rejected"));
 		return false;
-	}
 	if (!IsA(query->jointree, FromExpr) ||
 		list_length(query->jointree->fromlist) != 1 ||
 		!IsA(linitial(query->jointree->fromlist), RangeTblRef) ||
 		query->jointree->quals != NULL)
-	{
-		ereport(DEBUG1, errmsg("union leaf join rejected"));
 		return false;
-	}
 	rte = rt_fetch(linitial_node(RangeTblRef, query->jointree->fromlist)->rtindex,
 					 query->rtable);
-	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
-	{
-		ereport(DEBUG1, errmsg("union leaf policy rejected"));
-		return false;
-	}
-	return true;
+	return rte->rtekind == RTE_RELATION && gp_policy_get(rte->relid, &policy);
 }
 
 /* Every operation of the tree must be UNION ALL over such a leaf */
@@ -949,13 +941,8 @@ gp_slice_union_tree(Query *parse, Node *node)
 	if (IsA(node, RangeTblRef))
 	{
 		rte = rt_fetch(((RangeTblRef *) node)->rtindex, parse->rtable);
-		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
-		{
-			ereport(DEBUG1, errmsg("union tree leaf kind %d subquery %d",
-								   rte->rtekind, rte->subquery != NULL));
-			return false;
-		}
-		return gp_slice_union_leaf(rte->subquery);
+		return rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
+			gp_slice_union_leaf(rte->subquery);
 	}
 	if (!IsA(node, SetOperationStmt))
 		return false;
@@ -974,21 +961,10 @@ gp_slice_union_query(Query *parse)
 		parse->hasRowSecurity || parse->cteList != NIL ||
 		parse->groupClause != NIL || parse->groupingSets != NIL ||
 		parse->distinctClause != NIL || parse->rowMarks != NIL)
-	{
-		ereport(DEBUG1, errmsg("union outer flags rejected"));
 		return NULL;
-	}
 	if (!gp_slice_union_tree(parse, parse->setOperations))
-	{
-		ereport(DEBUG1, errmsg("union tree rejected"));
 		return NULL;
-	}
-	{
-		Query	   *copy = gp_slice_query_copy(parse);
-
-		ereport(DEBUG1, errmsg("union query copy %s", copy ? "ok" : "rejected"));
-		return copy;
-	}
+	return gp_slice_query_copy(parse);
 }
 
 /* Collect whether the tree mixes replicated and hashed leaves */
@@ -1033,24 +1009,20 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 	GpLocus	locus;
 	CustomScan *cscan;
 
-	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit) ||
+							IsA(plan, Result) || IsA(plan, Gather)))
 	{
 		if (IsA(plan, Sort))
 			sort_above = true;
-		parent = plan;
+		/* A parallel Gather is not kept above a distributed union */
+		if (!IsA(plan, Gather))
+			parent = plan;
 		plan = plan->lefttree;
 	}
 	if (plan == NULL || !IsA(plan, Append))
-	{
-		ereport(DEBUG1, errmsg("union plan is not Append: node %d",
-							   plan ? (int) nodeTag(plan) : -1));
 		return false;
-	}
 	if (original->sortClause != NIL && !sort_above)
-	{
-		ereport(DEBUG1, errmsg("union sort guard"));
 		return false;
-	}
 
 	locus = gp_locus_plan(plan, stmt->rtable);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
@@ -1065,12 +1037,7 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 			return false;
 	}
 	if (list_length(plan->targetlist) != list_length(original->targetList))
-	{
-		ereport(DEBUG1, errmsg("union target length %d != %d",
-							   list_length(plan->targetlist),
-							   list_length(original->targetList)));
 		return false;
-	}
 	cscan = gp_slice_make(plan, original,
 						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
 						  original->sortClause);
@@ -1078,7 +1045,8 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		stmt->planTree = &cscan->scan.plan;
 	else
 		parent->lefttree = &cscan->scan.plan;
-	ereport(DEBUG1, errmsg("union plan replaced"));
+	/* No PostgreSQL parallel workers remain above the distributed union */
+	stmt->parallelModeNeeded = false;
 	return true;
 }
 
