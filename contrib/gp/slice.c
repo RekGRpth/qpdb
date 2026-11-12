@@ -1041,9 +1041,15 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		plan = plan->lefttree;
 	}
 	if (plan == NULL || !IsA(plan, Append))
+	{
+		ereport(DEBUG1, errmsg("union plan is not Append"));
 		return false;
+	}
 	if (original->sortClause != NIL && !sort_above)
+	{
+		ereport(DEBUG1, errmsg("union sort guard"));
 		return false;
+	}
 
 	locus = gp_locus_plan(plan, stmt->rtable);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
@@ -1058,7 +1064,12 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 			return false;
 	}
 	if (list_length(plan->targetlist) != list_length(original->targetList))
+	{
+		ereport(DEBUG1, errmsg("union target length %d != %d",
+							   list_length(plan->targetlist),
+							   list_length(original->targetList)));
 		return false;
+	}
 	cscan = gp_slice_make(plan, original,
 						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
 						  original->sortClause);
@@ -1066,6 +1077,7 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		stmt->planTree = &cscan->scan.plan;
 	else
 		parent->lefttree = &cscan->scan.plan;
+	ereport(DEBUG1, errmsg("union plan replaced"));
 	return true;
 }
 
