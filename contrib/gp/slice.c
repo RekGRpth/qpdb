@@ -315,10 +315,18 @@ gp_locus_join(Join *join, GpLocus outer, GpLocus inner)
 
 	if (outer.kind == GP_LOCUS_COORDINATOR || inner.kind == GP_LOCUS_COORDINATOR)
 		return gp_locus_make(GP_LOCUS_COORDINATOR);
-	if (join->jointype == JOIN_FULL)
-		/* Both inputs can always meet on one chosen segment */
-		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
 	if (outer.kind == GP_LOCUS_ONE_SEGMENT && inner.kind == GP_LOCUS_ONE_SEGMENT)
+	{
+		result = gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+		result.replicated = outer.replicated && inner.replicated;
+		return result;
+	}
+	if (outer.kind == GP_LOCUS_SEGMENTS && inner.kind == GP_LOCUS_SEGMENTS &&
+		gp_locus_join_keys(join, outer, inner))
+		/* A colocated outer join keeps every partner on its own segment */
+		return gp_locus_project(&join->plan, outer);
+	if (join->jointype == JOIN_FULL)
+		/* Without colocation both inputs must meet on one chosen segment */
 		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
 	if (outer.kind == GP_LOCUS_ONE_SEGMENT)
 	{
@@ -332,10 +340,7 @@ gp_locus_join(Join *join, GpLocus outer, GpLocus inner)
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		return gp_locus_project(&join->plan, outer);
 	}
-	if (!gp_locus_join_keys(join, outer, inner))
-		return gp_locus_make(GP_LOCUS_COORDINATOR);
-	result = gp_locus_project(&join->plan, outer);
-	return result;
+	return gp_locus_make(GP_LOCUS_COORDINATOR);
 }
 
 /* Compute the locus bottom-up without changing the plan */
@@ -1031,6 +1036,24 @@ gp_slice_join_collect(Node *node, List **tables, List **conds)
 		gp_slice_join_collect(join->rarg, tables, conds);
 }
 
+/* Load the policies needed to build a motion, independently of its locus */
+static bool
+gp_slice_join_load_policies(Query *parse, List *tables)
+{
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+		RangeTblEntry *rte = rt_fetch(table->rti, parse->rtable);
+
+		if (rte->rtekind != RTE_RELATION ||
+			!gp_policy_get(rte->relid, &table->policy))
+			return false;
+	}
+	return true;
+}
+
 /*
  * Load the policies of the tables of a join and check that every row of
  * the join is on one segment: all hashed tables are of one colocation
@@ -1047,16 +1070,8 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 	List	   *connected = NIL;
 	List	   *pending = NIL;
 
-	/* Policies of every table, even when their colocation groups differ */
-	foreach(lc, tables)
-	{
-		GpJoinTable *table = lfirst(lc);
-		RangeTblEntry *rte = rt_fetch(table->rti, parse->rtable);
-
-		if (rte->rtekind != RTE_RELATION ||
-			!gp_policy_get(rte->relid, &table->policy))
-			return false;
-	}
+	if (!gp_slice_join_load_policies(parse, tables))
+		return false;
 
 	/* One colocation group for all hashed tables, if they are colocated */
 	foreach(lc, tables)
@@ -1697,6 +1712,8 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 
 	*single_segment = false;
 	*agg_stay = NULL;
+	if (!gp_slice_join_load_policies(original, tables))
+		return false;
 	redistributing = gp_slice_join_redistributable(original, tables, conds,
 												   &stay, &moves);
 	if (!redistributing && !gp_slice_join_broadcastable(tables))
@@ -1931,6 +1948,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	bool		single_segment = false;
 	bool		motion = false;
 	GpJoinTable *agg_stay = NULL;
+	GpLocus	locus;
 	List	   *tables = NIL;
 	List	   *conds = NIL;
 	ListCell   *lc;
@@ -1950,11 +1968,21 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return false;
 
+	locus = gp_locus_plan(plan, original);
 	if (!gp_slice_join_collect(linitial(original->jointree->fromlist),
 							   &tables, &conds))
 		return false;
 	conds = lappend(conds, original->jointree->quals);
-	if (!gp_slice_join_colocated(original, tables, conds))
+	if (locus.kind == GP_LOCUS_COORDINATOR &&
+		!gp_slice_join_colocated(original, tables, conds))
+	{
+		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
+								  &agg_stay))
+			return false;
+		motion = true;
+	}
+	else if (gp_slice_join_type_of(original) == JOIN_FULL &&
+			 locus.kind == GP_LOCUS_ONE_SEGMENT && !locus.replicated)
 	{
 		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
 								  &agg_stay))
@@ -2225,6 +2253,15 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		if (locus.kind == GP_LOCUS_COORDINATOR &&
 			!gp_slice_join_colocated(candidate, tables, conds))
 		{
+			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
+									  &agg_stay))
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
+			motion = true;
+		}
+		else if (gp_slice_join_type_of(candidate) == JOIN_FULL &&
+				 locus.kind == GP_LOCUS_ONE_SEGMENT && !locus.replicated)
+		{
+			/* A full join that is not colocated still broadcasts both sides */
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
 				return gp_locus_make(GP_LOCUS_COORDINATOR);
