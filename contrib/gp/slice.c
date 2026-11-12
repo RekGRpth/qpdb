@@ -88,6 +88,7 @@ typedef enum GpLocusKind
 typedef struct GpLocus
 {
 	GpLocusKind kind;
+	bool		replicated;		/* a copy is available on every segment */
 	int			colocation_id;
 	int			nkeys;
 	AttrNumber *keys;			/* positions in the output of the subtree */
@@ -98,7 +99,7 @@ typedef struct GpLocus
 static GpLocus
 gp_locus_make(GpLocusKind kind)
 {
-	GpLocus	locus = {kind, 0, 0, NULL};
+	GpLocus	locus = { .kind = kind };
 
 	return locus;
 }
@@ -109,7 +110,11 @@ gp_locus_policy(const GpPolicy *policy)
 	GpLocus	locus;
 
 	if (policy->replicated)
-		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+	{
+		locus = gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+		locus.replicated = true;
+		return locus;
+	}
 	locus = gp_locus_make(GP_LOCUS_SEGMENTS);
 	locus.colocation_id = policy->colocation_id;
 	locus.nkeys = policy->nkeys;
@@ -223,6 +228,162 @@ gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
 			return false;
 	}
 	return true;
+}
+
+static GpLocus gp_locus_plan(Plan *plan, Query *query);
+
+static bool
+gp_locus_join_var(Node *node, Index varno, AttrNumber attno)
+{
+	Var		   *var;
+
+	if (!IsA(node, Var))
+		return false;
+	var = (Var *) node;
+	return var->varno == varno && var->varattno == attno;
+}
+
+/* Whether a join clause equates this pair of distribution columns */
+static bool
+gp_locus_join_pair(Node *qual, AttrNumber outer, AttrNumber inner)
+{
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *right;
+
+	if (!IsA(qual, OpExpr))
+		return false;
+	op = (OpExpr *) qual;
+	if (list_length(op->args) != 2 || get_opname(op->opno) == NULL ||
+		strcmp(get_opname(op->opno), "=") != 0)
+		return false;
+	left = linitial(op->args);
+	right = lsecond(op->args);
+	return (gp_locus_join_var(left, OUTER_VAR, outer) &&
+			gp_locus_join_var(right, INNER_VAR, inner)) ||
+		(gp_locus_join_var(right, OUTER_VAR, outer) &&
+		 gp_locus_join_var(left, INNER_VAR, inner));
+}
+
+/* All key columns of two colocated inputs must meet by equality */
+static bool
+gp_locus_join_keys(Join *join, GpLocus outer, GpLocus inner)
+{
+	bool	   *used;
+
+	if (outer.kind != GP_LOCUS_SEGMENTS || inner.kind != GP_LOCUS_SEGMENTS ||
+		outer.nkeys == 0 || outer.nkeys != inner.nkeys ||
+		outer.colocation_id == 0 ||
+		outer.colocation_id != inner.colocation_id)
+		return false;
+	used = palloc0_array(bool, inner.nkeys);
+	for (int k = 0; k < outer.nkeys; k++)
+	{
+		bool		found = false;
+		ListCell   *lc;
+
+		foreach(lc, join->joinqual)
+		{
+			Node	   *qual = lfirst(lc);
+
+			for (int j = 0; j < inner.nkeys; j++)
+				if (!used[j] && gp_locus_join_pair(qual, outer.keys[k],
+												 inner.keys[j]))
+				{
+					used[j] = true;
+					found = true;
+					break;
+				}
+			if (found)
+				break;
+		}
+		if (!found)
+		{
+			pfree(used);
+			return false;
+		}
+	}
+	pfree(used);
+	return true;
+}
+
+/* The locus of a binary join of two already computed inputs */
+static GpLocus
+gp_locus_join(Join *join, GpLocus outer, GpLocus inner)
+{
+	GpLocus	result;
+
+	if (outer.kind == GP_LOCUS_COORDINATOR || inner.kind == GP_LOCUS_COORDINATOR)
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	if (join->jointype == JOIN_FULL)
+		/* Both inputs can always meet on one chosen segment */
+		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+	if (outer.kind == GP_LOCUS_ONE_SEGMENT && inner.kind == GP_LOCUS_ONE_SEGMENT)
+		return gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+	if (outer.kind == GP_LOCUS_ONE_SEGMENT)
+	{
+		if (!outer.replicated)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		return gp_locus_project(&join->plan, inner);
+	}
+	if (inner.kind == GP_LOCUS_ONE_SEGMENT)
+	{
+		if (!inner.replicated)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		return gp_locus_project(&join->plan, outer);
+	}
+	if (!gp_locus_join_keys(join, outer, inner))
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	result = gp_locus_project(&join->plan, outer);
+	return result;
+}
+
+/* Compute the locus bottom-up without changing the plan */
+static GpLocus
+gp_locus_plan(Plan *plan, Query *query)
+{
+	GpLocus	child;
+
+	if (plan == NULL)
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	if (gp_is_gather(plan))
+	{
+		RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid, query->rtable);
+		GpPolicy	policy;
+
+		if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		return gp_locus_policy(&policy);
+	}
+	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
+	{
+		child = gp_locus_plan(plan->lefttree, query);
+		return gp_locus_unary(plan, child);
+	}
+	if (IsA(plan, SubqueryScan))
+	{
+		child = gp_locus_plan(((SubqueryScan *) plan)->subplan, query);
+		return gp_locus_unary(plan, child);
+	}
+	if (IsA(plan, Agg))
+	{
+		Agg		   *agg = (Agg *) plan;
+
+		child = gp_locus_plan(agg->plan.lefttree, query);
+		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
+			gp_locus_grouped(child, agg, agg->plan.lefttree))
+			return gp_locus_project(&agg->plan, child);
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	}
+	if (IsA(plan, NestLoop) || IsA(plan, HashJoin) || IsA(plan, MergeJoin))
+	{
+		Join	   *join = (Join *) plan;
+		GpLocus	outer = gp_locus_plan(join->plan.lefttree, query);
+		GpLocus	inner = gp_locus_plan(join->plan.righttree, query);
+
+		return gp_locus_join(join, outer, inner);
+	}
+	return gp_locus_make(GP_LOCUS_COORDINATOR);
 }
 
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
@@ -1934,6 +2095,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	bool		is_agg;
 	bool		replicated;
 	bool		motion = false;
+	bool		copies = false;
 	CustomScan *cscan;
 	GpLocus	locus = gp_locus_make(GP_LOCUS_COORDINATOR);
 
@@ -2036,13 +2198,16 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		bool		single_segment = false;
 		GpJoinTable *agg_stay = NULL;
 
+		locus = gp_locus_plan(plan, candidate);
 		replicated = gp_slice_subquery_replicated(subquery, true);
+		copies = replicated;
 
 		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
 								   &tables, &conds))
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		conds = lappend(conds, candidate->jointree->quals);
-		if (!gp_slice_join_colocated(candidate, tables, conds))
+		if (locus.kind == GP_LOCUS_COORDINATOR &&
+			!gp_slice_join_colocated(candidate, tables, conds))
 		{
 			if (!gp_slice_join_motion(candidate, tables, conds, &single_segment,
 									  &agg_stay))
@@ -2073,7 +2238,11 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 	*planp = &cscan->scan.plan;
 	if (is_agg)
 		return locus;
-	return gp_locus_make(replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS);
+	if (locus.kind != GP_LOCUS_COORDINATOR)
+		return locus;
+	locus = gp_locus_make(replicated ? GP_LOCUS_ONE_SEGMENT : GP_LOCUS_SEGMENTS);
+	locus.replicated = copies;
+	return locus;
 }
 
 void
