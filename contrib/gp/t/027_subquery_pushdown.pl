@@ -55,6 +55,10 @@ run('CREATE TABLE m (a int, b int, v numeric)');
 run("SELECT gp.distribute('m', ARRAY['a', 'b'])");
 run("INSERT INTO m SELECT g % 5, g % 7, g * 1.25 FROM generate_series(1, 350) g");
 run('CREATE TABLE lmm AS SELECT * FROM m');
+run('CREATE TABLE r (a int, d text)');
+run("SELECT gp.distribute('r', NULL)");
+run("INSERT INTO r SELECT g, 'r' || g FROM generate_series(1, 20) g");
+run('CREATE TABLE lr AS SELECT * FROM r');
 
 like(plan_for('SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s ORDER BY s.a LIMIT 5'),
 	qr/GpSlice/, 'an aggregate subquery runs on the segments');
@@ -88,6 +92,8 @@ my @queries = (
 	'SELECT a FROM (SELECT a, b, sum(v) AS v FROM m GROUP BY a, b) s WHERE b = 3 ORDER BY a LIMIT 4',
 	'SELECT a + b, v FROM (SELECT a, b, sum(v) AS v FROM m GROUP BY a, b) s ORDER BY 1, 2 LIMIT 4',
 	'SELECT a, v FROM (SELECT a, sum(v) AS v FROM m GROUP BY a) s ORDER BY a, v',
+	'SELECT s.a, s.d FROM (SELECT t.a, u.d FROM t JOIN u ON t.a + 20 = u.a) s ORDER BY s.a, s.d LIMIT 4',
+	'SELECT s.a, s.d FROM (SELECT t.a, r.d FROM t JOIN r ON t.a = r.a) s ORDER BY s.a LIMIT 4',
 	'SELECT s.cnt + 1 FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s WHERE s.cnt = 100 AND s.a > 2 ORDER BY 1 LIMIT 3',
 );
 foreach my $query (@queries)
@@ -96,6 +102,7 @@ foreach my $query (@queries)
 	$local =~ s/\bt\b/l/g;
 	$local =~ s/\bu\b/lu/g;
 	$local =~ s/\bm\b/lmm/g;
+	$local =~ s/\br\b/lr/g;
 	is(run($query), run($local), "the same answer as on the coordinator: $query");
 }
 
