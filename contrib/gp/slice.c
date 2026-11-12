@@ -1042,7 +1042,8 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 	}
 	if (plan == NULL || !IsA(plan, Append))
 	{
-		ereport(DEBUG1, errmsg("union plan is not Append"));
+		ereport(DEBUG1, errmsg("union plan is not Append: node %d",
+							   plan ? (int) nodeTag(plan) : -1));
 		return false;
 	}
 	if (original->sortClause != NIL && !sort_above)
