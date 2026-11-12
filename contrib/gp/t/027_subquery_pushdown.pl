@@ -60,8 +60,9 @@ like(plan_for('SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY
 	qr/GpSlice/, 'an aggregate subquery runs on the segments');
 like(plan_for('SELECT s.a, s.cnt FROM (SELECT a, count(*) AS cnt FROM t GROUP BY a) s LIMIT 5'),
 	qr/GpSlice/, 'an aggregate subquery without a sort of the outer query is pushed');
-like(plan_for('SELECT s.a, s.cnt FROM (SELECT t.a, count(*) AS cnt FROM t JOIN u ON t.a = u.a GROUP BY t.a) s LIMIT 5'),
-	qr/GpSlice/, 'a colocated join inside a subquery is pushed');
+my $colocated_plan = plan_for('SELECT s.a, s.cnt FROM (SELECT t.a, count(*) AS cnt FROM t JOIN u ON t.a = u.a GROUP BY t.a) s LIMIT 5');
+like($colocated_plan, qr/GpSlice/, 'a colocated join inside a subquery is pushed');
+unlike($colocated_plan, qr/GpMotion/, 'two equal hash keys prove colocation without a motion');
 like(plan_for('SELECT a, b, sum(v) FROM m GROUP BY a, b'),
 	qr/GpSlice/, 'the whole compound distribution key stays hashed');
 like(plan_for('SELECT a, sum(v) FROM m GROUP BY a'),
