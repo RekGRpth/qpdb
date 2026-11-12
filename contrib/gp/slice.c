@@ -1549,7 +1549,7 @@ gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
  * current meaning, and peer connections cannot see earlier writes
  */
 bool
-gp_slice_insert_motion(Query *parse)
+gp_slice_insert_motion(Query *parse, bool *motion)
 {
 	RangeTblEntry *target;
 	RangeTblEntry *source;
@@ -1560,6 +1560,8 @@ gp_slice_insert_motion(Query *parse)
 	Index		outer_rti;
 	GpJoinTable stay = {0};
 	GpJoinTable move = {0};
+	GpLocus	source_locus;
+	GpLocus	target_locus;
 	AttrNumber *keyatts;
 	AttrNumber *sourceatts;
 	Bitmapset  *needed = NULL;
@@ -1616,6 +1618,8 @@ gp_slice_insert_motion(Query *parse)
 		!gp_policy_get(source->relid, &move.policy) || move.policy.replicated)
 		return false;
 	move.rti = ref->rtindex;
+	source_locus = gp_locus_policy(&move.policy);
+	target_locus = gp_locus_policy(&stay.policy);
 
 	target_rel = table_open(target->relid, AccessShareLock);
 	source_rel = table_open(source->relid, AccessShareLock);
@@ -1671,9 +1675,19 @@ gp_slice_insert_motion(Query *parse)
 			goto unsupported;
 		keyatts[i] = sourceatts[stay.policy.keys[i] - 1];
 	}
+	/* The source is already colocated with the target only by every key */
+	*motion = false;
+	if (source_locus.colocation_id != target_locus.colocation_id ||
+		source_locus.nkeys != target_locus.nkeys)
+		*motion = true;
+	for (int i = 0; i < stay.policy.nkeys && !*motion; i++)
+		if (sourceatts[stay.policy.keys[i] - 1] != source_locus.keys[i])
+			*motion = true;
 	table_close(target_rel, AccessShareLock);
 	table_close(source_rel, AccessShareLock);
 
+	if (!*motion)
+		return true;
 	return gp_slice_redistribute_rte_keys(motion_query, &stay, &move, false,
 										  stay.policy.nkeys, keyatts, needed, true);
 

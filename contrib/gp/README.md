@@ -303,14 +303,17 @@ source may read the segments on the very connections that the rows go on,
 
 When the source is one hashed table and the `SELECT` reads only its plain
 columns, and every target column is filled directly, `GpDml` runs the whole
-`INSERT ... SELECT` on the segments instead.  The source RTE becomes a
-`gp.peer_query` marker, planned as `GpMotion`, that hashes the rows by the
-distribution key of the target, using the default routing collation, so each
+`INSERT ... SELECT` on the segments instead.  If the source's actual key
+columns already hash by the target's distribution key in the same colocation
+group, the statement stays local and its `Motion` is false.  Otherwise the
+source RTE becomes a `gp.peer_query` marker, planned as `GpMotion`, that hashes
+the rows by the target key, using the default routing collation, so each
 segment inserts only its own rows.  The target list may reorder the source columns.  Only the needed
 source columns are read; an unused one is a `NULL` placeholder in the peer
 query, which preserves attribute numbers and column privileges.  Expressions,
 defaults, joins, aggregates, limits, replicated tables and a transaction that
 has already written stay on the `GpInsert` path, as do dropped columns.
+`EXPLAIN (VERBOSE)` shows the remote statement and whether it has a Motion.
 
 When the source is `VALUES` or a `SELECT` without a table, and the key
 columns of every row are constants (a default, a folded expression and a
@@ -688,7 +691,7 @@ start their own clusters:
 | `013_nonxact.pl` | `CREATE DATABASE`, `DROP DATABASE`, `VACUUM` and the `CONCURRENTLY` commands on the segments, and their failures |
 | `014_extension.pl` | Extensions on the segments with the same OIDs: create, update, cascade, move, drop, a failing segment; extension `gp` stays |
 | `015_copy.pl` | `COPY FROM` into distributed and replicated tables: placement by bucket, types, transactions, errors, privileges |
-| `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, redistribution of a plain distributed `SELECT`, safe fallbacks and privileges |
+| `016_insert.pl` | `INSERT` into distributed and replicated tables: `VALUES`, `SELECT`, defaults, types, transactions, prepared statements, redistribution of a plain distributed `SELECT`, colocated inserts without Motion, safe fallbacks and privileges |
 | `017_direct_dispatch.pl` | `INSERT` with constant keys goes to one segment alone: which segments are asked, folded constants, `NULL` keys, what is not direct |
 | `018_gather.pl` | `SELECT` from distributed tables against the same rows in ordinary tables: aggregates, joins, windows, rescans, replicated and partitioned tables, types, own writes, privileges, what is refused |
 | `019_default_distribution.pl` | `gp.default_distribution`: the key of a new table, partitions, temporary tables, `CREATE TABLE AS`, `SELECT INTO`, a database's setting |
@@ -744,7 +747,8 @@ by the patch and `contrib/gp`.
    a distributed subquery and carries the types, collations and positions of
    hash keys through direct projections; binary joins prove colocation from
    both hashed inputs and drive top-level `GpSlice` join and aggregate plans;
-   next is the locus model for the rest.
+   `INSERT ... SELECT` skips Motion when source and target are already
+   colocated; next is the locus model for the rest.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean

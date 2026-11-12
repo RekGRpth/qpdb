@@ -134,8 +134,10 @@ run("SELECT gp.distribute('src', ARRAY['x'])");
 run('CREATE TABLE dst (a int, b text)');
 run("SELECT gp.distribute('dst', ARRAY['a'])");
 run("INSERT INTO src SELECT g, 's' || g, g FROM generate_series(201, 250) g");
-like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM src'),
-	qr/Custom Scan \(GpDml\)/, 'INSERT ... SELECT redistributes the source');
+like(run('EXPLAIN (VERBOSE, COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM src'),
+	qr/Motion: true/, 'a different source column redistributes by the target key');
+like(run('EXPLAIN (VERBOSE, COSTS off) INSERT INTO dst (a, b) SELECT x, b FROM src'),
+	qr/Motion: false/, 'the target key of an already colocated source needs no motion');
 ($ret, $stdout, $stderr) = $coordinator->psql('postgres',
 	q{DO $$ DECLARE n bigint; BEGIN
 INSERT INTO dst (a, b) SELECT a, b FROM src;
@@ -149,13 +151,29 @@ WHERE p.relid = 'dst'::regclass GROUP BY 1 ORDER BY 1},
 	q{SELECT string_agg(a::text, ',' ORDER BY a) FROM dst},
 	'each selected row is on the segment of its target bucket');
 
+run('CREATE TABLE csrc (x int, b text)');
+run("SELECT gp.distribute('csrc', ARRAY['x'])");
+run('CREATE TABLE cdst (a int, b text)');
+run("SELECT gp.distribute('cdst', ARRAY['a'])");
+run("INSERT INTO csrc VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+like(run('EXPLAIN (VERBOSE, COSTS off) INSERT INTO cdst (a, b) SELECT x, b FROM csrc'),
+	qr/Motion: false/, 'the target key of an already colocated source needs no motion');
+run('INSERT INTO cdst (a, b) SELECT x, b FROM csrc');
+placed(
+	q{SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, g)),
+	   string_agg(g::text, ',' ORDER BY g)
+FROM generate_series(1, 3) g, gp.distribution_policy p
+WHERE p.relid = 'cdst'::regclass GROUP BY 1 ORDER BY 1},
+	q{SELECT string_agg(a::text, ',' ORDER BY a) FROM cdst},
+	'a colocated INSERT uses the target buckets without a motion');
+
 run('CREATE TABLE src2 (a int, b int)');
 run("SELECT gp.distribute('src2', ARRAY['a'])");
 run('CREATE TABLE dst2 (x int, y int)');
 run("SELECT gp.distribute('dst2', ARRAY['x'])");
 run("INSERT INTO src2 VALUES (1, 401), (2, 402), (3, 403)");
-like(run('EXPLAIN (COSTS off) INSERT INTO dst2 (x, y) SELECT b, a FROM src2'),
-	qr/Custom Scan \(GpDml\)/, 'the inner projection may have another order');
+like(run('EXPLAIN (VERBOSE, COSTS off) INSERT INTO dst2 (x, y) SELECT b, a FROM src2'),
+	qr/Motion: true/, 'the inner projection may have another order');
 run('INSERT INTO dst2 (x, y) SELECT b, a FROM src2');
 placed(
 	q{SELECT gp.bucket_segment(p.colocation_id, gp.bucket(1024, g)),
@@ -165,8 +183,8 @@ WHERE p.relid = 'dst2'::regclass GROUP BY 1 ORDER BY 1},
 	q{SELECT string_agg(x::text, ',' ORDER BY x) FROM dst2},
 	'the target key follows the inner column, not its position');
 
-like(run('EXPLAIN (COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM dst'),
-	qr/Custom Scan \(GpDml\)/, 'a table can be its own source of motion');
+like(run('EXPLAIN (VERBOSE, COSTS off) INSERT INTO dst (a, b) SELECT a, b FROM dst'),
+	qr/Motion: false/, 'a table is already colocated with itself');
 run('INSERT INTO dst (a, b) SELECT a, b FROM dst');
 is(total('SELECT count(*) FROM dst'), 100, 'self INSERT doubles the rows');
 
