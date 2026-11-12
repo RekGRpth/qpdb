@@ -917,15 +917,26 @@ gp_slice_union_leaf(Query *query)
 		query->distinctClause != NIL || query->rowMarks != NIL ||
 		query->sortClause != NIL || query->limitCount != NULL ||
 		query->limitOffset != NULL)
+	{
+		ereport(DEBUG1, errmsg("union leaf flags rejected"));
 		return false;
+	}
 	if (!IsA(query->jointree, FromExpr) ||
 		list_length(query->jointree->fromlist) != 1 ||
 		!IsA(linitial(query->jointree->fromlist), RangeTblRef) ||
 		query->jointree->quals != NULL)
+	{
+		ereport(DEBUG1, errmsg("union leaf join rejected"));
 		return false;
+	}
 	rte = rt_fetch(linitial_node(RangeTblRef, query->jointree->fromlist)->rtindex,
 					 query->rtable);
-	return rte->rtekind == RTE_RELATION && gp_policy_get(rte->relid, &policy);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
+	{
+		ereport(DEBUG1, errmsg("union leaf policy rejected"));
+		return false;
+	}
+	return true;
 }
 
 /* Every operation of the tree must be UNION ALL over such a leaf */
@@ -938,8 +949,13 @@ gp_slice_union_tree(Query *parse, Node *node)
 	if (IsA(node, RangeTblRef))
 	{
 		rte = rt_fetch(((RangeTblRef *) node)->rtindex, parse->rtable);
-		return rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
-			gp_slice_union_leaf(rte->subquery);
+		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+		{
+			ereport(DEBUG1, errmsg("union tree leaf kind %d subquery %d",
+								   rte->rtekind, rte->subquery != NULL));
+			return false;
+		}
+		return gp_slice_union_leaf(rte->subquery);
 	}
 	if (!IsA(node, SetOperationStmt))
 		return false;
@@ -958,10 +974,21 @@ gp_slice_union_query(Query *parse)
 		parse->hasRowSecurity || parse->cteList != NIL ||
 		parse->groupClause != NIL || parse->groupingSets != NIL ||
 		parse->distinctClause != NIL || parse->rowMarks != NIL)
+	{
+		ereport(DEBUG1, errmsg("union outer flags rejected"));
 		return NULL;
+	}
 	if (!gp_slice_union_tree(parse, parse->setOperations))
+	{
+		ereport(DEBUG1, errmsg("union tree rejected"));
 		return NULL;
-	return gp_slice_query_copy(parse);
+	}
+	{
+		Query	   *copy = gp_slice_query_copy(parse);
+
+		ereport(DEBUG1, errmsg("union query copy %s", copy ? "ok" : "rejected"));
+		return copy;
+	}
 }
 
 /* Collect whether the tree mixes replicated and hashed leaves */
