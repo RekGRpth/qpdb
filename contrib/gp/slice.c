@@ -230,7 +230,7 @@ gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
 	return true;
 }
 
-static GpLocus gp_locus_plan(Plan *plan, Query *query);
+static GpLocus gp_locus_plan(Plan *plan, List *rtable);
 
 static bool
 gp_locus_join_var(Node *node, Index varno, AttrNumber attno)
@@ -343,17 +343,55 @@ gp_locus_join(Join *join, GpLocus outer, GpLocus inner)
 	return gp_locus_make(GP_LOCUS_COORDINATOR);
 }
 
+/* All branches of an Append must have the same distribution to keep it */
+static GpLocus
+gp_locus_append(Append *append, List *rtable)
+{
+	GpLocus	result = gp_locus_make(GP_LOCUS_COORDINATOR);
+	bool		first = true;
+
+	foreach_ptr(Plan, child_plan, append->appendplans)
+	{
+		GpLocus	child = gp_locus_plan(child_plan, rtable);
+
+		if (child.kind == GP_LOCUS_COORDINATOR)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		if (first)
+		{
+			result = child;
+			first = false;
+			continue;
+		}
+		if (result.kind != child.kind || result.replicated != child.replicated ||
+			result.colocation_id != child.colocation_id ||
+			result.nkeys != child.nkeys)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		for (int i = 0; i < result.nkeys; i++)
+		{
+			if (result.keys[i] != child.keys[i] ||
+				(result.keytypes != NULL && child.keytypes != NULL &&
+				 result.keytypes[i] != child.keytypes[i]) ||
+				(result.keycollations != NULL && child.keycollations != NULL &&
+				 result.keycollations[i] != child.keycollations[i]))
+				return gp_locus_make(GP_LOCUS_COORDINATOR);
+		}
+	}
+	if (first)
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	return gp_locus_project(&append->plan, result);
+}
+
 /* Compute the locus bottom-up without changing the plan */
 static GpLocus
-gp_locus_plan(Plan *plan, Query *query)
+gp_locus_plan(Plan *plan, List *rtable)
 {
 	GpLocus	child;
 
 	if (plan == NULL)
 		return gp_locus_make(GP_LOCUS_COORDINATOR);
-	if (gp_is_gather(plan))
+	if (gp_is_gather(plan) || IsA(plan, SeqScan))
 	{
-		RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid, query->rtable);
+		RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid, rtable);
 		GpPolicy	policy;
 
 		if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
@@ -362,14 +400,16 @@ gp_locus_plan(Plan *plan, Query *query)
 	}
 	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
 	{
-		child = gp_locus_plan(plan->lefttree, query);
+		child = gp_locus_plan(plan->lefttree, rtable);
 		return gp_locus_unary(plan, child);
 	}
 	if (IsA(plan, SubqueryScan))
 	{
-		child = gp_locus_plan(((SubqueryScan *) plan)->subplan, query);
+		child = gp_locus_plan(((SubqueryScan *) plan)->subplan, rtable);
 		return gp_locus_unary(plan, child);
 	}
+	if (IsA(plan, Append))
+		return gp_locus_append((Append *) plan, rtable);
 	if (IsA(plan, Agg))
 	{
 		Agg		   *agg = (Agg *) plan;
@@ -377,7 +417,7 @@ gp_locus_plan(Plan *plan, Query *query)
 
 		while (below != NULL && IsA(below, Sort))
 			below = below->lefttree;
-		child = gp_locus_plan(agg->plan.lefttree, query);
+		child = gp_locus_plan(agg->plan.lefttree, rtable);
 		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
 			gp_locus_grouped(child, agg, below))
 			return gp_locus_project(&agg->plan, child);
@@ -386,8 +426,8 @@ gp_locus_plan(Plan *plan, Query *query)
 	if (IsA(plan, NestLoop) || IsA(plan, HashJoin) || IsA(plan, MergeJoin))
 	{
 		Join	   *join = (Join *) plan;
-		GpLocus	outer = gp_locus_plan(join->plan.lefttree, query);
-		GpLocus	inner = gp_locus_plan(join->plan.righttree, query);
+		GpLocus	outer = gp_locus_plan(join->plan.lefttree, rtable);
+		GpLocus	inner = gp_locus_plan(join->plan.righttree, rtable);
 
 		return gp_locus_join(join, outer, inner);
 	}
@@ -836,7 +876,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	if (below == NULL || !gp_is_gather(below))
 		return false;
 
-	locus = gp_locus_plan(&agg->plan, original);
+	locus = gp_locus_plan(&agg->plan, stmt->rtable);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
 	{
 		/* A grouping that is not colocated can still move by its columns */
@@ -861,6 +901,145 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 
 	return true;
 
+}
+
+/* A UNION ALL leaf reads one distributed table and nothing else */
+static bool
+gp_slice_union_leaf(Query *query)
+{
+	RangeTblEntry *rte;
+	GpPolicy	policy;
+
+	if (query->commandType != CMD_SELECT || query->setOperations != NULL ||
+		query->hasAggs || query->hasWindowFuncs || query->hasSubLinks ||
+		query->hasTargetSRFs || query->hasRowSecurity || query->cteList != NIL ||
+		query->groupClause != NIL || query->groupingSets != NIL ||
+		query->distinctClause != NIL || query->rowMarks != NIL ||
+		query->sortClause != NIL || query->limitCount != NULL ||
+		query->limitOffset != NULL)
+		return false;
+	if (!IsA(query->jointree, FromExpr) ||
+		list_length(query->jointree->fromlist) != 1 ||
+		!IsA(linitial(query->jointree->fromlist), RangeTblRef) ||
+		query->jointree->quals != NULL)
+		return false;
+	rte = rt_fetch(linitial_node(RangeTblRef, query->jointree->fromlist)->rtindex,
+					 query->rtable);
+	return rte->rtekind == RTE_RELATION && gp_policy_get(rte->relid, &policy);
+}
+
+/* Every operation of the tree must be UNION ALL over such a leaf */
+static bool
+gp_slice_union_tree(Query *parse, Node *node)
+{
+	SetOperationStmt *setop;
+	RangeTblEntry *rte;
+
+	if (IsA(node, RangeTblRef))
+	{
+		rte = rt_fetch(((RangeTblRef *) node)->rtindex, parse->rtable);
+		return rte->rtekind == RTE_SUBQUERY && rte->subquery != NULL &&
+			gp_slice_union_leaf(rte->subquery);
+	}
+	if (!IsA(node, SetOperationStmt))
+		return false;
+	setop = (SetOperationStmt *) node;
+	return setop->op == SETOP_UNION && setop->all &&
+		gp_slice_union_tree(parse, setop->larg) &&
+		gp_slice_union_tree(parse, setop->rarg);
+}
+
+Query *
+gp_slice_union_query(Query *parse)
+{
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->setOperations == NULL || parse->hasAggs ||
+		parse->hasWindowFuncs || parse->hasSubLinks || parse->hasTargetSRFs ||
+		parse->hasRowSecurity || parse->cteList != NIL ||
+		parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->distinctClause != NIL || parse->rowMarks != NIL)
+		return NULL;
+	if (!gp_slice_union_tree(parse, parse->setOperations))
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/* Collect whether the tree mixes replicated and hashed leaves */
+static void
+gp_slice_union_mixed(Query *parse, Node *node, bool *saw_replicated,
+					 bool *saw_hashed)
+{
+	SetOperationStmt *setop;
+	RangeTblEntry *rte;
+	GpPolicy	policy;
+
+	if (IsA(node, RangeTblRef))
+	{
+		rte = rt_fetch(((RangeTblRef *) node)->rtindex, parse->rtable);
+		if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL)
+			return;
+		rte = rt_fetch(linitial_node(RangeTblRef,
+									 rte->subquery->jointree->fromlist)->rtindex,
+						 rte->subquery->rtable);
+		if (!gp_policy_get(rte->relid, &policy))
+			return;
+		if (policy.replicated)
+			*saw_replicated = true;
+		else
+			*saw_hashed = true;
+		return;
+	}
+	if (!IsA(node, SetOperationStmt))
+		return;
+	setop = (SetOperationStmt *) node;
+	gp_slice_union_mixed(parse, setop->larg, saw_replicated, saw_hashed);
+	gp_slice_union_mixed(parse, setop->rarg, saw_replicated, saw_hashed);
+}
+
+/* Replace a compatible Append by one scan of its whole UNION ALL */
+bool
+gp_slice_union_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	GpLocus	locus;
+	CustomScan *cscan;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL || !IsA(plan, Append))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+
+	locus = gp_locus_plan(plan, stmt->rtable);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+	{
+		bool		saw_replicated = false;
+		bool		saw_hashed = false;
+
+		/* Different hash maps have no common locus, but no duplicates either */
+		gp_slice_union_mixed(original, original->setOperations,
+							 &saw_replicated, &saw_hashed);
+		if (saw_replicated && saw_hashed)
+			return false;
+	}
+	if (list_length(plan->targetlist) != list_length(original->targetList))
+		return false;
+	cscan = gp_slice_make(plan, original,
+						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+						  original->sortClause);
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	return true;
 }
 
 /*
@@ -1992,7 +2171,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return false;
 
-	locus = gp_locus_plan(plan, original);
+	locus = gp_locus_plan(plan, stmt->rtable);
 	if (!gp_slice_join_collect(linitial(original->jointree->fromlist),
 							   &tables, &conds))
 		return false;
@@ -2266,7 +2445,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		bool		single_segment = false;
 		GpJoinTable *agg_stay = NULL;
 
-		locus = gp_locus_plan(plan, candidate);
+		locus = gp_locus_plan(plan, candidate->rtable);
 		replicated = gp_slice_subquery_replicated(subquery, true);
 		copies = replicated;
 

@@ -623,6 +623,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	PlannedStmt *stmt;
 	Query	   *agg_original = NULL;
 	Query	   *join_original = NULL;
+	Query	   *union_original = NULL;
 	Query	   *insert_original = NULL;
 	bool		replaced = false;
 
@@ -632,6 +633,8 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)
 		join_original = gp_slice_join_query(parse);
+	if (agg_original == NULL && join_original == NULL)
+		union_original = gp_slice_union_query(parse);
 	if (parse->commandType == CMD_INSERT)
 		insert_original = copyObject(parse);
 
@@ -652,6 +655,9 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		replaced = gp_slice_agg_plan(agg_original, stmt);
 	else if (join_original != NULL)
 		replaced = gp_slice_join_plan(join_original, stmt);
+
+	if (!replaced && union_original != NULL)
+		replaced = gp_slice_union_plan(union_original, stmt);
 
 	if (!replaced)
 	{

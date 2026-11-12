@@ -89,6 +89,7 @@ tests += {
       't/031_interconnect_cancel.pl',
       't/032_gp_manifest.pl',
       't/033_multiple_slices.pl',
+      't/034_union_locus.pl',
     ],
   },
 }

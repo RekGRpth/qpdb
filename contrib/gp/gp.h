@@ -123,6 +123,8 @@ extern Query *gp_slice_join_query(Query *parse);
 extern bool gp_slice_join_plan(Query *original, PlannedStmt *stmt);
 extern void gp_slice_subquery_plans(Query *parse, PlannedStmt *stmt);
 extern void gp_slice_partial_plan(Query *parse, PlannedStmt *stmt);
+extern bool gp_slice_union_plan(Query *parse, PlannedStmt *stmt);
+extern Query *gp_slice_union_query(Query *parse);
 extern bool gp_slice_insert_motion(Query *parse, bool *motion);
 
 /* motion.c */
