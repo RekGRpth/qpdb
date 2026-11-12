@@ -386,6 +386,22 @@ gp_locus_plan(Plan *plan, Query *query)
 	return gp_locus_make(GP_LOCUS_COORDINATOR);
 }
 
+/*
+ * Copy a query after the planner, or refuse it when it cannot be deparsed.
+ * A pulled-up or removed subquery keeps its slot with subquery = NULL, and the
+ * join aliases of the flattened tree belong to the planner, not to ruleutils.
+ * Such a tree is good for analysis, but not for pg_get_querydef: keep the
+ * coordinator's plan rather than descend into a stale subquery.
+ */
+static Query *
+gp_slice_query_copy(Query *parse)
+{
+	foreach_node(RangeTblEntry, rte, parse->rtable)
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery == NULL)
+			return NULL;
+	return copyObject(parse);
+}
+
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
@@ -755,13 +771,13 @@ gp_slice_agg_query(Query *parse)
 
 	/* A replicated table is answered by one segment as a whole */
 	if (policy.replicated)
-		return copyObject(parse);
+		return gp_slice_query_copy(parse);
 
 	/* A table by hash without a grouping cannot be answered by one segment */
 	if (parse->groupClause == NIL)
 		return NULL;
 
-	return copyObject(parse);
+	return gp_slice_query_copy(parse);
 }
 
 /*
@@ -1898,7 +1914,7 @@ gp_slice_join_query(Query *parse)
 	if (parse->hasAggs && any_hash && parse->groupClause == NIL)
 		return NULL;
 
-	return copyObject(parse);
+	return gp_slice_query_copy(parse);
 }
 
 /*
