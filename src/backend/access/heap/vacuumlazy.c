@@ -955,9 +955,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	/*
 	 * Now actually update rel's pg_class entry.
 	 *
-	 * In principle new_live_tuples could be -1 indicating that we (still)
-	 * don't know the tuple count.  In practice that can't happen, since we
-	 * scan every page that isn't skipped using the visibility map.
+	 * new_live_tuples can be -1 when VACUUM skipped nearly all pages and had
+	 * no prior tuple-density estimate.
 	 */
 	vac_update_relstats(rel, new_rel_pages, vacrel->new_live_tuples,
 						new_rel_allvisible, new_rel_allfrozen,
@@ -976,7 +975,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	 * vacuuming.
 	 */
 	pgstat_report_vacuum(rel,
-						 Max(vacrel->new_live_tuples, 0),
+						 vacrel->new_live_tuples,
 						 vacrel->recently_dead_tuples +
 						 vacrel->missed_dead_tuples,
 						 starttime);

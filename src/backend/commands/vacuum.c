@@ -1372,6 +1372,20 @@ vac_estimate_reltuples(Relation relation,
 		return scanned_tuples;
 
 	/*
+	 * With no prior density, a tiny non-random sample is not sufficient to
+	 * estimate the relation's tuple count. This can happen when on-access
+	 * pruning marks most pages all-visible before the first VACUUM.
+	 */
+	if (old_rel_tuples < 0 || old_rel_pages == 0)
+	{
+		if (scanned_pages <= 1 ||
+			scanned_pages < (double) total_pages * 0.02)
+			return -1;
+
+		return floor((scanned_tuples / scanned_pages) * total_pages + 0.5);
+	}
+
+	/*
 	 * When successive VACUUM commands scan the same few pages again and
 	 * again, without anything from the table really changing, there is a risk
 	 * that our beliefs about tuple density will gradually become distorted.
@@ -1381,22 +1395,16 @@ vac_estimate_reltuples(Relation relation,
 	 * If the relation is _exactly_ the same size according to the existing
 	 * pg_class entry, and only a few of its pages (less than 2%) were
 	 * scanned, keep the existing value of reltuples.  Also keep the existing
-	 * value when only a subset of rel's pages <= a single page were scanned.
+	 * value when at most one page was scanned.  When the relation size has
+	 * changed, use the old density to account for the added or removed pages
+	 * instead of preserving a stale tuple count.
 	 *
 	 * (Note: we might be returning -1 here.)
 	 */
 	if (old_rel_pages == total_pages &&
-		scanned_pages < (double) total_pages * 0.02)
+		(scanned_pages <= 1 ||
+		 scanned_pages < (double) total_pages * 0.02))
 		return old_rel_tuples;
-	if (scanned_pages <= 1)
-		return old_rel_tuples;
-
-	/*
-	 * If old density is unknown, we can't do much except scale up
-	 * scanned_tuples to match total_pages.
-	 */
-	if (old_rel_tuples < 0 || old_rel_pages == 0)
-		return floor((scanned_tuples / scanned_pages) * total_pages + 0.5);
 
 	/*
 	 * Okay, we've covered the corner cases.  The normal calculation is to
