@@ -1179,6 +1179,11 @@ gp_process_utility(PlannedStmt *pstmt, const char *queryString,
 	}
 	PG_END_TRY();
 
+	if (gp_role == GP_ROLE_COORDINATOR && gp_dispatch_ddl &&
+		dispatch_depth == 0 && !creating_extension && IsUnderPostmaster &&
+		IsA(parsetree, VacuumStmt) && !((VacuumStmt *) parsetree)->is_vacuumcmd)
+		gp_analyze((VacuumStmt *) parsetree);
+
 	if (IsA(parsetree, CreateExtensionStmt) &&
 		strcmp(((CreateExtensionStmt *) parsetree)->extname, "gp") == 0)
 		gp_oids_save_extension(mark);

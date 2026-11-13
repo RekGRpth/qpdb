@@ -442,6 +442,7 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 {
 	GpPolicy	policy;
 	CustomPath *cpath;
+	Relation	relation;
 
 	if (prev_set_rel_pathlist)
 		prev_set_rel_pathlist(root, rel, rti, rte);
@@ -453,6 +454,20 @@ gp_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 	if (!gp_policy_get(rte->relid, &policy))
 		return;
+
+	/*
+	 * The table itself is empty here.  ANALYZE imports the sizes of the
+	 * cluster into pg_class, but the ordinary heap estimate still looks at
+	 * that empty file.  Recompute the sizes before making the only path.
+	 */
+	relation = table_open(rte->relid, NoLock);
+	if (relation->rd_rel->reltuples >= 0)
+	{
+		rel->pages = relation->rd_rel->relpages;
+		rel->tuples = relation->rd_rel->reltuples;
+		set_baserel_size_estimates(root, rel);
+	}
+	table_close(relation, NoLock);
 
 	if (rte->tablesample != NULL)
 		ereport(ERROR,

@@ -16,6 +16,7 @@ gp_sources = files(
   'route.c',
   'segments.c',
   'slice.c',
+  'stats.c',
 )
 
 if host_system == 'windows'
@@ -94,6 +95,7 @@ tests += {
       't/036_cte_locus.pl',
       't/037_distinct_locus.pl',
       't/038_grouping_locus.pl',
+      't/039_statistics.pl',
     ],
   },
 }
