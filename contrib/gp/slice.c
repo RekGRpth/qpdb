@@ -381,6 +381,38 @@ gp_locus_append(Append *append, List *rtable)
 	return gp_locus_project(&append->plan, result);
 }
 
+/* Set operations require every equal output row on the same segment */
+static GpLocus
+gp_locus_setop(SetOp *setop, List *rtable)
+{
+	GpLocus	outer = gp_locus_plan(setop->plan.lefttree, rtable);
+	GpLocus	inner = gp_locus_plan(setop->plan.righttree, rtable);
+	GpLocus	result;
+
+	if (outer.kind != inner.kind)
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	if (outer.kind == GP_LOCUS_ONE_SEGMENT)
+	{
+		if (!outer.replicated || !inner.replicated)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		result = gp_locus_make(GP_LOCUS_ONE_SEGMENT);
+		result.replicated = true;
+		return result;
+	}
+	if (outer.kind != GP_LOCUS_SEGMENTS || outer.nkeys == 0 ||
+		outer.nkeys != inner.nkeys ||
+		outer.colocation_id != inner.colocation_id)
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	for (int i = 0; i < outer.nkeys; i++)
+		if (outer.keys[i] != inner.keys[i] ||
+			(outer.keytypes != NULL && inner.keytypes != NULL &&
+			 outer.keytypes[i] != inner.keytypes[i]) ||
+			(outer.keycollations != NULL && inner.keycollations != NULL &&
+			 outer.keycollations[i] != inner.keycollations[i]))
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+	return gp_locus_project(&setop->plan, outer);
+}
+
 /* Compute the locus bottom-up without changing the plan */
 static GpLocus
 gp_locus_plan(Plan *plan, List *rtable)
@@ -413,6 +445,8 @@ gp_locus_plan(Plan *plan, List *rtable)
 	}
 	if (IsA(plan, Append))
 		return gp_locus_append((Append *) plan, rtable);
+	if (IsA(plan, SetOp))
+		return gp_locus_setop((SetOp *) plan, rtable);
 	if (IsA(plan, Agg))
 	{
 		Agg		   *agg = (Agg *) plan;
@@ -947,7 +981,8 @@ gp_slice_union_tree(Query *parse, Node *node)
 	if (!IsA(node, SetOperationStmt))
 		return false;
 	setop = (SetOperationStmt *) node;
-	return setop->op == SETOP_UNION &&
+	return (setop->op == SETOP_UNION || setop->op == SETOP_INTERSECT ||
+			setop->op == SETOP_EXCEPT) &&
 		gp_slice_union_tree(parse, setop->larg) &&
 		gp_slice_union_tree(parse, setop->rarg);
 }
@@ -1020,6 +1055,22 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		if (!IsA(plan, Gather))
 			parent = plan;
 		plan = plan->lefttree;
+	}
+	if (IsA(plan, SetOp))
+	{
+		/* HashSetOp has two inputs, not an Append: replace the whole node */
+		locus = gp_locus_plan(plan, stmt->rtable);
+		if (locus.kind == GP_LOCUS_COORDINATOR)
+			return false;
+		cscan = gp_slice_make(plan, original,
+							  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+							  original->sortClause);
+		if (parent == NULL)
+			stmt->planTree = &cscan->scan.plan;
+		else
+			parent->lefttree = &cscan->scan.plan;
+		stmt->parallelModeNeeded = false;
+		return true;
 	}
 	if (plan == NULL || !IsA(plan, Append))
 		return false;
