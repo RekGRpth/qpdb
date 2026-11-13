@@ -127,8 +127,12 @@ like(plan_for('SELECT a FROM t1 UNION ALL SELECT a FROM t3'),
 my $replicated = 'SELECT a FROM r1 UNION ALL SELECT a FROM r2';
 like(plan_for($replicated), qr/GpSlice/, 'replicated branches make one slice');
 unlike(plan_for($replicated), qr/GpMotion/, 'replicated branches need no motion');
-unlike(plan_for('SELECT a FROM t1 UNION SELECT a FROM t2'),
-	qr/GpSlice/, 'UNION DISTINCT is not a UNION ALL pushdown');
+like(plan_for('SELECT a FROM t1 UNION SELECT a FROM t2'),
+	qr/GpSlice/, 'equal output rows of one hash locus are distinct everywhere');
+like(plan_for('SELECT b, a FROM m1 UNION SELECT b, a FROM m2'),
+	qr/GpSlice/, 'a compound key supports DISTINCT too');
+like(plan_for('SELECT a FROM r1 UNION SELECT a FROM r2'),
+	qr/GpSlice/, 'replicated inputs are distinct on one segment');
 like(plan_for("$union ORDER BY a LIMIT 3"),
 	qr/GpSlice/, 'a sort and a limit stay above the union');
 like(parallel_query("EXPLAIN (COSTS OFF) $union"),
@@ -143,6 +147,8 @@ my @queries = (
 	'SELECT a FROM t1 UNION ALL SELECT a FROM t3 ORDER BY a',
 	$replicated . ' ORDER BY a',
 	'SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a',
+	'SELECT b, a, v FROM m1 UNION SELECT b, a, v FROM m2 ORDER BY b, a, v',
+	'SELECT a FROM r1 UNION SELECT a FROM r2 ORDER BY a',
 	"$union ORDER BY a LIMIT 3",
 	'SELECT a FROM t1 UNION ALL SELECT a FROM t2 UNION ALL SELECT a FROM t1 ORDER BY a',
 );
