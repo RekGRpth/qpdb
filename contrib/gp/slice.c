@@ -467,6 +467,17 @@ gp_locus_plan(Plan *plan, List *rtable, List *subplans)
 		return gp_locus_append((Append *) plan, rtable, subplans);
 	if (IsA(plan, SetOp))
 		return gp_locus_setop((SetOp *) plan, rtable, subplans);
+	if (IsA(plan, Unique))
+	{
+		Unique	   *unique = (Unique *) plan;
+
+		child = gp_locus_plan(unique->plan.lefttree, rtable, subplans);
+		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
+			gp_locus_columns(child, unique->plan.lefttree,
+							 unique->numCols, unique->uniqColIdx))
+			return gp_locus_project(&unique->plan, child);
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	}
 	if (IsA(plan, WindowAgg))
 	{
 		WindowAgg  *window = (WindowAgg *) plan;
@@ -1099,6 +1110,70 @@ gp_slice_window_plan(Query *original, PlannedStmt *stmt)
 		plan = plan->lefttree;
 	}
 	if (plan == NULL || !IsA(plan, WindowAgg))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+
+	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+		return false;
+	if (list_length(plan->targetlist) != list_length(original->targetList))
+		return false;
+	cscan = gp_slice_make(plan, original,
+						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+						  original->sortClause);
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	stmt->parallelModeNeeded = false;
+	return true;
+}
+
+/* A DISTINCT query is local when its output rows share one distribution key */
+Query *
+gp_slice_distinct_query(Query *parse)
+{
+	RangeTblEntry *rte;
+	GpPolicy	policy;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->distinctClause == NIL || parse->hasWindowFuncs ||
+		parse->hasSubLinks || parse->hasTargetSRFs || parse->hasRowSecurity ||
+		parse->setOperations != NULL || parse->cteList != NIL ||
+		parse->groupingSets != NIL || parse->rowMarks != NIL)
+		return NULL;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
+		parse->jointree->quals != NULL)
+		return NULL;
+	rte = rt_fetch(linitial_node(RangeTblRef, parse->jointree->fromlist)->rtindex,
+					 parse->rtable);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/* Replace a Unique or a distinct aggregate whose keys are all local */
+bool
+gp_slice_distinct_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	GpLocus	locus;
+	CustomScan *cscan;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit) ||
+							IsA(plan, Unique)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL)
 		return false;
 	if (original->sortClause != NIL && !sort_above)
 		return false;
