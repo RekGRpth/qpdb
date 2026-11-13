@@ -1194,6 +1194,130 @@ gp_slice_distinct_plan(Query *original, PlannedStmt *stmt)
 	return true;
 }
 
+static bool
+gp_slice_grouping_key(Query *parse, const GpPolicy *policy, GroupingSet *gs)
+{
+	ListCell   *lc;
+
+	if (gs->kind == GROUPING_SET_SETS)
+	{
+		/* GROUPING SETS ((a), (a)) has one extra list wrapper */
+		foreach(lc, gs->content)
+		{
+			if (!gp_slice_grouping_key(parse, policy,
+									   lfirst_node(GroupingSet, lc)))
+				return false;
+		}
+		return true;
+	}
+	if (gs->kind != GROUPING_SET_SIMPLE || gs->content == NIL)
+		return false;
+	for (int k = 0; k < policy->nkeys; k++)
+	{
+		bool		found = false;
+
+		foreach(lc, gs->content)
+		{
+			Index		ref = lfirst_int(lc);
+			TargetEntry *tle = get_sortgroupref_tle(ref, parse->targetList);
+			Var		   *var;
+
+			if (!IsA(tle->expr, Var))
+				return false;
+			var = (Var *) tle->expr;
+			if (var->varattno == policy->keys[k])
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
+/* Every grouping set must contain the whole distribution key and be nonempty */
+static bool
+gp_slice_grouping_keys(Query *parse, const GpPolicy *policy)
+{
+	ListCell   *lc;
+
+	foreach(lc, parse->groupingSets)
+	{
+		if (!gp_slice_grouping_key(parse, policy,
+								   lfirst_node(GroupingSet, lc)))
+			return false;
+	}
+	return true;
+}
+
+/* A GROUPING SETS query whose every set keeps its groups on one segment */
+Query *
+gp_slice_grouping_query(Query *parse)
+{
+	RangeTblEntry *rte;
+	GpPolicy	policy;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		!parse->hasAggs || parse->groupingSets == NIL ||
+		parse->hasWindowFuncs || parse->hasSubLinks || parse->hasTargetSRFs ||
+		parse->hasRowSecurity || parse->setOperations != NULL ||
+		parse->cteList != NIL || parse->distinctClause != NIL ||
+		parse->rowMarks != NIL)
+		return NULL;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
+		parse->jointree->quals != NULL)
+		return NULL;
+	rte = rt_fetch(linitial_node(RangeTblRef, parse->jointree->fromlist)->rtindex,
+					 parse->rtable);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy) ||
+		!gp_slice_grouping_keys(parse, &policy))
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/* Replace an aggregate whose every grouping set covers the distribution key */
+bool
+gp_slice_grouping_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	Agg		   *agg;
+	GpLocus	locus;
+	CustomScan *cscan;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL || !IsA(plan, Agg))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+	agg = (Agg *) plan;
+	locus = gp_locus_plan(&agg->plan, stmt->rtable, stmt->subplans);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+		return false;
+	if (list_length(agg->plan.targetlist) != list_length(original->targetList))
+		return false;
+	cscan = gp_slice_make(&agg->plan, original,
+						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+						  original->sortClause);
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	stmt->parallelModeNeeded = false;
+	return true;
+}
+
 /* A UNION ALL leaf reads one distributed table and nothing else */
 static bool
 gp_slice_union_leaf(Query *query)
