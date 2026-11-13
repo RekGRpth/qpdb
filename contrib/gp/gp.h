@@ -135,6 +135,9 @@ extern bool gp_slice_union_plan(Query *parse, PlannedStmt *stmt);
 extern Query *gp_slice_union_query(Query *parse);
 extern bool gp_slice_insert_motion(Query *parse, bool *motion);
 
+/* stats.c */
+extern void gp_analyze(VacuumStmt *stmt);
+
 /* motion.c */
 extern void gp_motion_init(void);
 

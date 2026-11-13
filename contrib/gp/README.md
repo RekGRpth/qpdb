@@ -225,8 +225,10 @@ ends what they keep of the command, and:
 `VACUUM` goes without OIDs, and `VACUUM FULL` lets the segments create
 relations for the rewrite (`gp.allow_local_ddl`, so only for superusers).  A
 list of tables that mixes temporary ones or those of extension `gp` with
-others is refused; `ANALYZE` is not sent, as the statistics of the cluster
-are for a later step.
+others is refused.  `ANALYZE` runs on the segments too; the coordinator sums
+relation sizes over them (counting a replicated table once), imports attribute
+statistics from the first segment, and uses the imported sizes and selectivity
+for planning.
 
 ### Distribution (`distribution.c`)
 
@@ -783,8 +785,9 @@ by the patch and `contrib/gp`.
    so no client computes the address by a rule; multiple slices of one statement
    on a segment are READ ONLY readers of one exported snapshot, and cancellation
    follows the whole reader tree.
-7. **Statistics** — `ANALYZE` on the segments, statistics on the
-   coordinator.
+7. **Statistics** — implemented for manual `ANALYZE`: relation sizes are
+   summed over the segments, attribute statistics are sampled from the first
+   segment, and the planner uses the imported cluster sizes.
 8. **More kinds of distribution** — replicated with the coordinator, on the
    coordinator only, on one segment.
 9. **Management without ssh** — systemd units, cluster state views,

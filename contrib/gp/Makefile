@@ -16,7 +16,8 @@ OBJS = \
 	recovery.o \
 	route.o \
 	segments.o \
-	slice.o
+	slice.o \
+	stats.o
 
 EXTENSION = gp
 DATA = gp--1.0.sql
