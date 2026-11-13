@@ -560,7 +560,13 @@ locus, the existing colocation and Motion rules decide the plan as before.  The
 same analysis drives top-level `GpSlice` plans; the construction of a Motion
 loads the distribution policies it needs independently of that decision.  An
 aggregate is checked against the target list below any `Sort`, whose output
-positions are not the attribute numbers of the base table.  A flattened query whose pulled-up subquery has already been dropped is not
+positions are not the attribute numbers of the base table.  `UNION ALL` and its
+`Append` preserve a compatible hashed locus; different hash maps make one
+distributed union without it, while replicated branches are read on one
+segment.  A parallel `Gather` is disabled before planning: `GpSlice` is
+distributed itself and must not multiply its full answer in parallel workers.
+Mixed replicated/hash branches and `UNION DISTINCT` are not pushed.
+A flattened query whose pulled-up subquery has already been dropped is not
 deparsed into a remote query; it keeps the coordinator's plan.
 
 An aggregate grouped by expressions, and a global aggregate that does
@@ -708,6 +714,7 @@ start their own clusters:
 | `031_interconnect_cancel.pl` | A query that dies of its statement timeout stops the workers of its fragments on the segments, though no row ever came to tell them so, and a next query reads the same rows |
 | `032_gp_manifest.pl` | The manifest of the answers of our own: a base answer changed upstream is caught before the tests turn red, and an answer that equals its base again is asked for removal |
 | `033_multiple_slices.pl` | A root and its self-motion reader are separate READ ONLY transactions with one exported snapshot per segment; a segment-local commit between their starts changes nothing, nested cancellation and statement end close every snapshot holder, and a later write still sees itself |
+| `034_union_locus.pl` | `UNION ALL` and `Append`: compatible hash keys, reversed and compound projections, different hash maps, replicated inputs, sort and limit, and a parallel `Gather` removed without duplicating the union; mixed replicated/hash and `UNION DISTINCT` stay on the coordinator |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
@@ -748,7 +755,8 @@ by the patch and `contrib/gp`.
    hash keys through direct projections; binary joins prove colocation from
    both hashed inputs and drive top-level `GpSlice` join and aggregate plans;
    `INSERT ... SELECT` skips Motion when source and target are already
-   colocated; next is the locus model for the rest.
+   colocated; `UNION ALL` keeps compatible hashed loci; next is the locus model
+   for the rest.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean

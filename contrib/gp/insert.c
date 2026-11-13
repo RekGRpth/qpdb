@@ -46,6 +46,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
+#include "optimizer/cost.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
@@ -623,8 +624,10 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	PlannedStmt *stmt;
 	Query	   *agg_original = NULL;
 	Query	   *join_original = NULL;
+	Query	   *union_original = NULL;
 	Query	   *insert_original = NULL;
 	bool		replaced = false;
+	int			saved_parallel_workers = max_parallel_workers_per_gather;
 
 	if (IsUnderPostmaster)
 		gp_check_modifications(parse, true);
@@ -632,13 +635,26 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	agg_original = gp_slice_agg_query(parse);
 	if (agg_original == NULL)
 		join_original = gp_slice_join_query(parse);
+	if (agg_original == NULL && join_original == NULL)
+		union_original = gp_slice_union_query(parse);
 	if (parse->commandType == CMD_INSERT)
 		insert_original = copyObject(parse);
 
-	if (prev_planner)
-		stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
-	else
-		stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	/* A GpSlice is distributed itself, not a branch of a parallel Gather */
+	if (union_original != NULL)
+		max_parallel_workers_per_gather = 0;
+	PG_TRY();
+	{
+		if (prev_planner)
+			stmt = prev_planner(parse, query_string, cursorOptions, boundParams, es);
+		else
+			stmt = standard_planner(parse, query_string, cursorOptions, boundParams, es);
+	}
+	PG_FINALLY();
+	{
+		max_parallel_workers_per_gather = saved_parallel_workers;
+	}
+	PG_END_TRY();
 
 	if (parse->commandType == CMD_INSERT && IsUnderPostmaster &&
 		stmt->planTree != NULL && IsA(stmt->planTree, ModifyTable))
@@ -652,6 +668,9 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		replaced = gp_slice_agg_plan(agg_original, stmt);
 	else if (join_original != NULL)
 		replaced = gp_slice_join_plan(join_original, stmt);
+
+	if (!replaced && union_original != NULL)
+		replaced = gp_slice_union_plan(union_original, stmt);
 
 	if (!replaced)
 	{
