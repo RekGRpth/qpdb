@@ -91,6 +91,7 @@ tests += {
       't/033_multiple_slices.pl',
       't/034_union_locus.pl',
       't/035_window_locus.pl',
+      't/036_cte_locus.pl',
     ],
   },
 }

@@ -239,7 +239,7 @@ gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
 	return gp_locus_columns(locus, below, agg->numCols, agg->grpColIdx);
 }
 
-static GpLocus gp_locus_plan(Plan *plan, List *rtable);
+static GpLocus gp_locus_plan(Plan *plan, List *rtable, List *subplans);
 
 static bool
 gp_locus_join_var(Node *node, Index varno, AttrNumber attno)
@@ -354,14 +354,14 @@ gp_locus_join(Join *join, GpLocus outer, GpLocus inner)
 
 /* All branches of an Append must have the same distribution to keep it */
 static GpLocus
-gp_locus_append(Append *append, List *rtable)
+gp_locus_append(Append *append, List *rtable, List *subplans)
 {
 	GpLocus	result = gp_locus_make(GP_LOCUS_COORDINATOR);
 	bool		first = true;
 
 	foreach_ptr(Plan, child_plan, append->appendplans)
 	{
-		GpLocus	child = gp_locus_plan(child_plan, rtable);
+		GpLocus	child = gp_locus_plan(child_plan, rtable, subplans);
 
 		if (child.kind == GP_LOCUS_COORDINATOR)
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
@@ -392,10 +392,10 @@ gp_locus_append(Append *append, List *rtable)
 
 /* Set operations require every equal output row on the same segment */
 static GpLocus
-gp_locus_setop(SetOp *setop, List *rtable)
+gp_locus_setop(SetOp *setop, List *rtable, List *subplans)
 {
-	GpLocus	outer = gp_locus_plan(setop->plan.lefttree, rtable);
-	GpLocus	inner = gp_locus_plan(setop->plan.righttree, rtable);
+	GpLocus	outer = gp_locus_plan(setop->plan.lefttree, rtable, subplans);
+	GpLocus	inner = gp_locus_plan(setop->plan.righttree, rtable, subplans);
 	GpLocus	result;
 
 	if (outer.kind != inner.kind)
@@ -424,7 +424,7 @@ gp_locus_setop(SetOp *setop, List *rtable)
 
 /* Compute the locus bottom-up without changing the plan */
 static GpLocus
-gp_locus_plan(Plan *plan, List *rtable)
+gp_locus_plan(Plan *plan, List *rtable, List *subplans)
 {
 	GpLocus	child;
 
@@ -441,27 +441,37 @@ gp_locus_plan(Plan *plan, List *rtable)
 	}
 	if (IsA(plan, Gather))
 		/* GpSlice is distributed itself; its full answer must not multiply here */
-		return gp_locus_plan(plan->lefttree, rtable);
+		return gp_locus_plan(plan->lefttree, rtable, subplans);
 	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, IncrementalSort) ||
 		IsA(plan, Result))
 	{
-		child = gp_locus_plan(plan->lefttree, rtable);
+		child = gp_locus_plan(plan->lefttree, rtable, subplans);
 		return gp_locus_unary(plan, child);
 	}
 	if (IsA(plan, SubqueryScan))
 	{
-		child = gp_locus_plan(((SubqueryScan *) plan)->subplan, rtable);
+		child = gp_locus_plan(((SubqueryScan *) plan)->subplan, rtable, subplans);
 		return gp_locus_unary(plan, child);
 	}
+	if (IsA(plan, CteScan))
+	{
+		CteScan   *cte = (CteScan *) plan;
+
+		if (subplans == NULL)
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		child = gp_locus_plan(list_nth(subplans, cte->ctePlanId - 1),
+							  rtable, subplans);
+		return gp_locus_project(&cte->scan.plan, child);
+	}
 	if (IsA(plan, Append))
-		return gp_locus_append((Append *) plan, rtable);
+		return gp_locus_append((Append *) plan, rtable, subplans);
 	if (IsA(plan, SetOp))
-		return gp_locus_setop((SetOp *) plan, rtable);
+		return gp_locus_setop((SetOp *) plan, rtable, subplans);
 	if (IsA(plan, WindowAgg))
 	{
 		WindowAgg  *window = (WindowAgg *) plan;
 
-		child = gp_locus_plan(window->plan.lefttree, rtable);
+		child = gp_locus_plan(window->plan.lefttree, rtable, subplans);
 		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
 			gp_locus_columns(child, window->plan.lefttree,
 							 window->partNumCols, window->partColIdx))
@@ -475,7 +485,7 @@ gp_locus_plan(Plan *plan, List *rtable)
 
 		while (below != NULL && IsA(below, Sort))
 			below = below->lefttree;
-		child = gp_locus_plan(agg->plan.lefttree, rtable);
+		child = gp_locus_plan(agg->plan.lefttree, rtable, subplans);
 		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
 			gp_locus_grouped(child, agg, below))
 			return gp_locus_project(&agg->plan, child);
@@ -484,8 +494,8 @@ gp_locus_plan(Plan *plan, List *rtable)
 	if (IsA(plan, NestLoop) || IsA(plan, HashJoin) || IsA(plan, MergeJoin))
 	{
 		Join	   *join = (Join *) plan;
-		GpLocus	outer = gp_locus_plan(join->plan.lefttree, rtable);
-		GpLocus	inner = gp_locus_plan(join->plan.righttree, rtable);
+		GpLocus	outer = gp_locus_plan(join->plan.lefttree, rtable, subplans);
+		GpLocus	inner = gp_locus_plan(join->plan.righttree, rtable, subplans);
 
 		return gp_locus_join(join, outer, inner);
 	}
@@ -508,6 +518,7 @@ gp_slice_query_copy(Query *parse)
 	return copyObject(parse);
 }
 
+static bool gp_slice_union_leaf(Query *query);
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
@@ -934,7 +945,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 	if (below == NULL || !gp_is_gather(below))
 		return false;
 
-	locus = gp_locus_plan(&agg->plan, stmt->rtable);
+	locus = gp_locus_plan(&agg->plan, stmt->rtable, stmt->subplans);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
 	{
 		/* A grouping that is not colocated can still move by its columns */
@@ -959,6 +970,72 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 
 	return true;
 
+}
+
+/* One nonrecursive CTE over one distributed table */
+Query *
+gp_slice_cte_query(Query *parse)
+{
+	CommonTableExpr *cte;
+	RangeTblEntry *rte;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasSubLinks ||
+		parse->hasTargetSRFs || parse->hasRowSecurity ||
+		parse->setOperations != NULL || parse->groupClause != NIL ||
+		parse->groupingSets != NIL || parse->distinctClause != NIL ||
+		parse->rowMarks != NIL || list_length(parse->cteList) != 1)
+		return NULL;
+	cte = linitial_node(CommonTableExpr, parse->cteList);
+	if (cte->cterecursive || !gp_slice_union_leaf((Query *) cte->ctequery))
+		return NULL;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef))
+		return NULL;
+	rte = rt_fetch(linitial_node(RangeTblRef, parse->jointree->fromlist)->rtindex,
+					 parse->rtable);
+	if (rte->rtekind != RTE_CTE)
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/* Replace a CteScan by the whole query, including its CTE */
+bool
+gp_slice_cte_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	GpLocus	locus;
+	CustomScan *cscan;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit)))
+	{
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL || !IsA(plan, CteScan))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+
+	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+		return false;
+	if (list_length(plan->targetlist) != list_length(original->targetList))
+		return false;
+	cscan = gp_slice_make(plan, original,
+						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+						  original->sortClause);
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	stmt->parallelModeNeeded = false;
+	return true;
 }
 
 /* A window query over one distributed table, with every partition local */
@@ -1026,7 +1103,7 @@ gp_slice_window_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return false;
 
-	locus = gp_locus_plan(plan, stmt->rtable);
+	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (locus.kind == GP_LOCUS_COORDINATOR)
 		return false;
 	if (list_length(plan->targetlist) != list_length(original->targetList))
@@ -1161,7 +1238,7 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 	if (IsA(plan, SetOp))
 	{
 		/* HashSetOp has two inputs, not an Append: replace the whole node */
-		locus = gp_locus_plan(plan, stmt->rtable);
+		locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 		if (locus.kind == GP_LOCUS_COORDINATOR)
 			return false;
 		cscan = gp_slice_make(plan, original,
@@ -1179,7 +1256,7 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return false;
 
-	locus = gp_locus_plan(plan, stmt->rtable);
+	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (locus.kind == GP_LOCUS_COORDINATOR && !distinct)
 	{
 		bool		saw_replicated = false;
@@ -2337,7 +2414,7 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (original->sortClause != NIL && !sort_above)
 		return false;
 
-	locus = gp_locus_plan(plan, stmt->rtable);
+	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_collect(linitial(original->jointree->fromlist),
 							   &tables, &conds))
 		return false;
@@ -2611,7 +2688,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		bool		single_segment = false;
 		GpJoinTable *agg_stay = NULL;
 
-		locus = gp_locus_plan(plan, candidate->rtable);
+		locus = gp_locus_plan(plan, candidate->rtable, NULL);
 		replicated = gp_slice_subquery_replicated(subquery, true);
 		copies = replicated;
 

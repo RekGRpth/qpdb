@@ -626,6 +626,7 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 	Query	   *join_original = NULL;
 	Query	   *union_original = NULL;
 	Query	   *window_original = NULL;
+	Query	   *cte_original = NULL;
 	Query	   *insert_original = NULL;
 	bool		replaced = false;
 	int			saved_parallel_workers = max_parallel_workers_per_gather;
@@ -640,11 +641,14 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		union_original = gp_slice_union_query(parse);
 	if (union_original == NULL)
 		window_original = gp_slice_window_query(parse);
+	if (window_original == NULL)
+		cte_original = gp_slice_cte_query(parse);
 	if (parse->commandType == CMD_INSERT)
 		insert_original = copyObject(parse);
 
 	/* A GpSlice is distributed itself, not a branch of a parallel Gather */
-	if (union_original != NULL || window_original != NULL)
+	if (union_original != NULL || window_original != NULL ||
+		cte_original != NULL)
 		max_parallel_workers_per_gather = 0;
 	PG_TRY();
 	{
@@ -676,6 +680,8 @@ gp_planner(Query *parse, const char *query_string, int cursorOptions,
 		replaced = gp_slice_union_plan(union_original, stmt);
 	if (!replaced && window_original != NULL)
 		replaced = gp_slice_window_plan(window_original, stmt);
+	if (!replaced && cte_original != NULL)
+		replaced = gp_slice_cte_plan(cte_original, stmt);
 
 	if (!replaced)
 	{
