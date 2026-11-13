@@ -192,27 +192,29 @@ gp_locus_project(Plan *plan, GpLocus child)
 static GpLocus
 gp_locus_unary(Plan *plan, GpLocus child)
 {
-	if (IsA(plan, Sort) || IsA(plan, Limit))
+	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, IncrementalSort))
 		return child;
 	if (IsA(plan, Result) || IsA(plan, SubqueryScan))
 		return gp_locus_project(plan, child);
 	return gp_locus_make(GP_LOCUS_COORDINATOR);
 }
 
-/* Whether every hash key is a grouping column of the aggregate */
+/* Whether every hash key is present in a grouping/partition column list */
 static bool
-gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
+gp_locus_columns(GpLocus locus, Plan *below, int numCols,
+				 AttrNumber *colIdx)
 {
 	if (locus.kind != GP_LOCUS_SEGMENTS || locus.nkeys == 0)
 		return false;
+	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
+		below = below->lefttree;
 	for (int k = 0; k < locus.nkeys; k++)
 	{
 		bool		grouped = false;
 
-		for (int i = 0; i < agg->numCols; i++)
+		for (int i = 0; i < numCols; i++)
 		{
-			TargetEntry *tle = list_nth(below->targetlist,
-										agg->grpColIdx[i] - 1);
+			TargetEntry *tle = list_nth(below->targetlist, colIdx[i] - 1);
 			Var		   *var;
 
 			if (!IsA(tle->expr, Var))
@@ -228,6 +230,13 @@ gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
 			return false;
 	}
 	return true;
+}
+
+/* Whether every hash key is a grouping column of the aggregate */
+static bool
+gp_locus_grouped(GpLocus locus, Agg *agg, Plan *below)
+{
+	return gp_locus_columns(locus, below, agg->numCols, agg->grpColIdx);
 }
 
 static GpLocus gp_locus_plan(Plan *plan, List *rtable);
@@ -433,7 +442,8 @@ gp_locus_plan(Plan *plan, List *rtable)
 	if (IsA(plan, Gather))
 		/* GpSlice is distributed itself; its full answer must not multiply here */
 		return gp_locus_plan(plan->lefttree, rtable);
-	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, Result))
+	if (IsA(plan, Sort) || IsA(plan, Limit) || IsA(plan, IncrementalSort) ||
+		IsA(plan, Result))
 	{
 		child = gp_locus_plan(plan->lefttree, rtable);
 		return gp_locus_unary(plan, child);
@@ -447,6 +457,17 @@ gp_locus_plan(Plan *plan, List *rtable)
 		return gp_locus_append((Append *) plan, rtable);
 	if (IsA(plan, SetOp))
 		return gp_locus_setop((SetOp *) plan, rtable);
+	if (IsA(plan, WindowAgg))
+	{
+		WindowAgg  *window = (WindowAgg *) plan;
+
+		child = gp_locus_plan(window->plan.lefttree, rtable);
+		if (child.kind == GP_LOCUS_ONE_SEGMENT ||
+			gp_locus_columns(child, window->plan.lefttree,
+							 window->partNumCols, window->partColIdx))
+			return gp_locus_project(&window->plan, child);
+		return gp_locus_make(GP_LOCUS_COORDINATOR);
+	}
 	if (IsA(plan, Agg))
 	{
 		Agg		   *agg = (Agg *) plan;
@@ -908,7 +929,7 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 
 	/* Below the aggregate there is the gather of the table and nothing else */
 	below = agg->plan.lefttree;
-	while (below != NULL && IsA(below, Sort))
+	while (below != NULL && (IsA(below, Sort) || IsA(below, IncrementalSort)))
 		below = below->lefttree;
 	if (below == NULL || !gp_is_gather(below))
 		return false;
@@ -938,6 +959,87 @@ gp_slice_agg_plan(Query *original, PlannedStmt *stmt)
 
 	return true;
 
+}
+
+/* A window query over one distributed table, with every partition local */
+Query *
+gp_slice_window_query(Query *parse)
+{
+	RangeTblEntry *rte;
+	GpPolicy	policy;
+
+	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
+		!parse->hasWindowFuncs || parse->hasAggs || parse->hasSubLinks ||
+		parse->hasTargetSRFs || parse->hasRowSecurity ||
+		parse->setOperations != NULL || parse->cteList != NIL ||
+		parse->groupClause != NIL || parse->groupingSets != NIL ||
+		parse->distinctClause != NIL || parse->rowMarks != NIL)
+		return NULL;
+	if (!IsA(parse->jointree, FromExpr) ||
+		list_length(parse->jointree->fromlist) != 1 ||
+		!IsA(linitial(parse->jointree->fromlist), RangeTblRef) ||
+		parse->jointree->quals != NULL)
+		return NULL;
+	rte = rt_fetch(linitial_node(RangeTblRef, parse->jointree->fromlist)->rtindex,
+					 parse->rtable);
+	if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
+		return NULL;
+	return gp_slice_query_copy(parse);
+}
+
+/* Replace a WindowAgg whose partitions all fit their distribution key */
+bool
+gp_slice_window_plan(Query *original, PlannedStmt *stmt)
+{
+	Plan	   *parent = NULL;
+	Plan	   *plan = stmt->planTree;
+	bool		sort_above = false;
+	GpLocus	locus;
+	CustomScan *cscan;
+
+	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit) ||
+							IsA(plan, IncrementalSort)))
+	{
+		if (IsA(plan, IncrementalSort))
+		{
+			Sort	   *full = makeNode(Sort);
+
+			*full = ((IncrementalSort *) plan)->sort;
+			full->plan.type = T_Sort;
+
+			/* A distributed answer has no presorted input for IncrementalSort */
+			full->plan.lefttree = plan->lefttree;
+			if (parent != NULL)
+				parent->lefttree = (Plan *) full;
+			parent = (Plan *) full;
+			plan = plan->lefttree;
+			sort_above = true;
+			continue;
+		}
+		if (IsA(plan, Sort))
+			sort_above = true;
+		parent = plan;
+		plan = plan->lefttree;
+	}
+	if (plan == NULL || !IsA(plan, WindowAgg))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+		return false;
+
+	locus = gp_locus_plan(plan, stmt->rtable);
+	if (locus.kind == GP_LOCUS_COORDINATOR)
+		return false;
+	if (list_length(plan->targetlist) != list_length(original->targetList))
+		return false;
+	cscan = gp_slice_make(plan, original,
+						  locus.kind == GP_LOCUS_ONE_SEGMENT, false,
+						  original->sortClause);
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	stmt->parallelModeNeeded = false;
+	return true;
 }
 
 /* A UNION ALL leaf reads one distributed table and nothing else */
