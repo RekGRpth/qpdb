@@ -2013,8 +2013,9 @@ CREATE STATISTICS stats_import.test_mr_stat_clone
   ON name, mrange, ( mrange + '{[10000,10200)}'::int4multirange)
   FROM stats_import.test_mr_clone;
 
--- Check for invalid value combinations for range types.
--- Only range_bounds_histogram (other two missing)
+-- Check value combinations for range types.  range_length_histogram and
+-- range_empty_frac must be given together.
+-- ok: only range_bounds_histogram, other two missing
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
   'relname', 'test_mr',
@@ -2022,8 +2023,8 @@ SELECT pg_catalog.pg_restore_extended_stats(
   'statistics_name', 'test_mr_stat',
   'inherited', false,
   'exprs', '[{"range_bounds_histogram": "{\"[1,10200)\",\"[11,10200)\"}"}]'::jsonb);
--- Only range_length_histogram and range_empty_frac
--- (range_bounds_histogram missing)
+-- ok: range_length_histogram and range_empty_frac defined,
+-- range_bounds_histogram missing.
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
   'relname', 'test_mr',
@@ -2031,24 +2032,31 @@ SELECT pg_catalog.pg_restore_extended_stats(
   'statistics_name', 'test_mr_stat',
   'inherited', false,
   'exprs', '[{"range_length_histogram": "{10179,10189}", "range_empty_frac": "0"}]'::jsonb);
--- Only range_bounds_histogram and range_empty_frac
--- (range_length_histogram missing)
+-- ok: range_length_histogram defined as an empty array, range_bounds_histogram
+-- missing.
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
   'relname', 'test_mr',
   'statistics_schemaname', 'stats_import',
   'statistics_name', 'test_mr_stat',
   'inherited', false,
-  'exprs', '[{"range_bounds_histogram": "{\"[1,10200)\"}", "range_empty_frac": "0"}]'::jsonb);
--- Only range_bounds_histogram and range_length_histogram
--- (range_empty_frac missing)
+  'exprs', '[{"range_length_histogram": "{}", "range_empty_frac": "0.5"}]'::jsonb);
+-- warn: only range_empty_frac, range_length_histogram missing
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
   'relname', 'test_mr',
   'statistics_schemaname', 'stats_import',
   'statistics_name', 'test_mr_stat',
   'inherited', false,
-  'exprs', '[{"range_bounds_histogram": "{\"[1,10200)\"}", "range_length_histogram": "{10179}"}]'::jsonb);
+  'exprs', '[{"range_empty_frac": "0"}]'::jsonb);
+-- warn: only range_length_histogram, range_empty_frac missing
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_mr',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_mr_stat',
+  'inherited', false,
+  'exprs', '[{"range_length_histogram": "{10179}"}]'::jsonb);
 -- warn: range bounds histogram with unsorted elements
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
@@ -2057,6 +2065,14 @@ SELECT pg_catalog.pg_restore_extended_stats(
   'statistics_name', 'test_mr_stat',
   'inherited', false,
   'exprs', '[{"range_length_histogram": "{10179,10189,10199}", "range_empty_frac": "0", "range_bounds_histogram": "{\"[50,60)\",\"[1,2)\",\"[90,100)\"}"}]'::jsonb);
+-- warn: range bounds histogram as an empty array
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_mr',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_mr_stat',
+  'inherited', false,
+  'exprs', '[{"range_bounds_histogram": "{}"}]'::jsonb);
 -- warn: range bounds histogram with empty range
 SELECT pg_catalog.pg_restore_extended_stats(
   'schemaname', 'stats_import',
@@ -2307,6 +2323,17 @@ SELECT pg_catalog.pg_restore_extended_stats(
   'inherited', false,
   'exprs', '[
               { "most_common_vals": "{{1,2},{3,4}}", "most_common_freqs": "{0.3,0.25,0.05,0.04}" },
+              { "most_common_vals": "{2}", "most_common_freqs": "{0.5}" }
+          ]'::jsonb);
+-- warn: exprs most_common_vals as an empty array
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test_clone',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_clone',
+  'inherited', false,
+  'exprs', '[
+              { "most_common_vals": "{}", "most_common_freqs": "{0.5}" },
               { "most_common_vals": "{2}", "most_common_freqs": "{0.5}" }
           ]'::jsonb);
 -- exprs most_common_vals element wrong type
@@ -2639,6 +2666,32 @@ SELECT pg_catalog.pg_restore_extended_stats(
   'exprs', '[
               {
                   "elem_count_histogram": "{BADELEMHIST,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1.5}"
+              }
+            ]'::jsonb);
+-- warn: exprs most_common_elem_freqs as an empty array
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_mcelem',
+  'inherited', false,
+  'exprs', '[
+              {
+                  "most_common_elems": "{}",
+                  "most_common_elem_freqs": "{}"
+              }
+            ]'::jsonb);
+-- ok: exprs most_common_elems as an empty array
+SELECT pg_catalog.pg_restore_extended_stats(
+  'schemaname', 'stats_import',
+  'relname', 'test',
+  'statistics_schemaname', 'stats_import',
+  'statistics_name', 'test_stat_mcelem',
+  'inherited', false,
+  'exprs', '[
+              {
+                  "most_common_elems": "{}",
+                  "most_common_elem_freqs": "{0.25,0.25,0}"
               }
             ]'::jsonb);
 -- ok: exprs mcelem
