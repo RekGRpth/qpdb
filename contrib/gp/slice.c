@@ -947,7 +947,7 @@ gp_slice_union_tree(Query *parse, Node *node)
 	if (!IsA(node, SetOperationStmt))
 		return false;
 	setop = (SetOperationStmt *) node;
-	return setop->op == SETOP_UNION && setop->all &&
+	return setop->op == SETOP_UNION &&
 		gp_slice_union_tree(parse, setop->larg) &&
 		gp_slice_union_tree(parse, setop->rarg);
 }
@@ -1006,11 +1006,13 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 	Plan	   *parent = NULL;
 	Plan	   *plan = stmt->planTree;
 	bool		sort_above = false;
+	bool		distinct = !((SetOperationStmt *) original->setOperations)->all;
 	GpLocus	locus;
 	CustomScan *cscan;
 
 	while (plan != NULL && (IsA(plan, Sort) || IsA(plan, Limit) ||
-							IsA(plan, Result) || IsA(plan, Gather)))
+							IsA(plan, Result) || IsA(plan, Gather) ||
+							(distinct && (IsA(plan, Unique) || IsA(plan, Agg)))))
 	{
 		if (IsA(plan, Sort))
 			sort_above = true;
@@ -1025,7 +1027,7 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		return false;
 
 	locus = gp_locus_plan(plan, stmt->rtable);
-	if (locus.kind == GP_LOCUS_COORDINATOR)
+	if (locus.kind == GP_LOCUS_COORDINATOR && !distinct)
 	{
 		bool		saw_replicated = false;
 		bool		saw_hashed = false;
@@ -1036,6 +1038,9 @@ gp_slice_union_plan(Query *original, PlannedStmt *stmt)
 		if (saw_replicated && saw_hashed)
 			return false;
 	}
+	if (locus.kind == GP_LOCUS_COORDINATOR && distinct)
+		/* DISTINCT needs one hashed place for every equal output row */
+		return false;
 	if (list_length(plan->targetlist) != list_length(original->targetList))
 		return false;
 	cscan = gp_slice_make(plan, original,
