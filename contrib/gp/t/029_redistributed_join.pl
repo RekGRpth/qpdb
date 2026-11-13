@@ -3,7 +3,8 @@
 
 # Inner joins of hashed tables of different colocation groups, connected by
 # the whole keys, move every table of another group by the map of the first.
-# Without such a key, a two-table join broadcasts its second table instead.
+# Without such a key, a two-table join without fresh statistics broadcasts its
+# second table instead; 040_motion_cost.pl checks the choice with statistics.
 # An outer join broadcasts its null-supplying side, and a full join broadcasts
 # both sides and runs on one segment
 

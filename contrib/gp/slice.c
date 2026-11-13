@@ -1927,6 +1927,23 @@ gp_slice_join_broadcastable(List *tables)
 		t1->policy.colocation_id != 0 && t2->policy.colocation_id != 0;
 }
 
+/* The imported row count of a table, if ANALYZE has provided one */
+static bool
+gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows)
+{
+	Relation	rel = table_open(rt_fetch(table->rti, parse->rtable)->relid,
+							 NoLock);
+
+	if (rel->rd_rel->reltuples < 0)
+	{
+		table_close(rel, NoLock);
+		return false;
+	}
+	*rows = rel->rd_rel->reltuples;
+	table_close(rel, NoLock);
+	return true;
+}
+
 /*
  * The kind of the first join of the query: an inner join, or which side of
  * it is kept even when it has no partner
@@ -2368,11 +2385,48 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		!gp_slice_join_all_inner(linitial(original->jointree->fromlist)))
 		return false;
 	if (redistributing)
+	{
 		move = linitial(moves);
+
+		/* Either side of a two-way inner join can stay: move the smaller */
+		if (jointype == JOIN_INNER && list_length(tables) == 2)
+		{
+			GpJoinTable *other_stay;
+			List	   *other_moves;
+			List	   *reverse = list_make2(lsecond(tables), linitial(tables));
+			double		rows;
+			double		other_rows;
+
+			if (gp_slice_join_redistributable(original, reverse, conds,
+											  &other_stay, &other_moves) &&
+				gp_slice_join_rows(original, move, &rows) &&
+				gp_slice_join_rows(original, linitial(other_moves), &other_rows) &&
+				other_rows < rows)
+			{
+				stay = other_stay;
+				moves = other_moves;
+				move = linitial(moves);
+			}
+		}
+	}
 	else
 	{
 		stay = linitial(tables);
 		move = lsecond(tables);
+
+		/* Broadcast the smaller side when there is no useful join key */
+		if (jointype == JOIN_INNER)
+		{
+			double		rows;
+			double		other_rows;
+
+			if (gp_slice_join_rows(original, stay, &rows) &&
+				gp_slice_join_rows(original, move, &other_rows) && rows < other_rows)
+			{
+				stay = lsecond(tables);
+				move = linitial(tables);
+			}
+		}
 		*agg_stay = stay;
 	}
 	switch (jointype)

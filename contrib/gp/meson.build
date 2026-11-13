@@ -96,6 +96,7 @@ tests += {
       't/037_distinct_locus.pl',
       't/038_grouping_locus.pl',
       't/039_statistics.pl',
+      't/040_motion_cost.pl',
     ],
   },
 }
