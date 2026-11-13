@@ -133,6 +133,16 @@ like(plan_for('SELECT b, a FROM m1 UNION SELECT b, a FROM m2'),
 	qr/GpSlice/, 'a compound key supports DISTINCT too');
 like(plan_for('SELECT a FROM r1 UNION SELECT a FROM r2'),
 	qr/GpSlice/, 'replicated inputs are distinct on one segment');
+like(plan_for('SELECT a FROM r1 UNION SELECT a FROM r2'),
+	qr/GpSlice/, 'replicated inputs are distinct on one segment');
+like(plan_for('SELECT a FROM t1 INTERSECT SELECT a FROM t2'),
+	qr/GpSlice/, 'INTERSECT works on one hashed locus');
+like(plan_for('SELECT a FROM t1 EXCEPT SELECT a FROM t2'),
+	qr/GpSlice/, 'EXCEPT works on one hashed locus');
+like(plan_for('SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2'),
+	qr/GpSlice/, 'INTERSECT ALL keeps the multiplicity of each key');
+unlike(plan_for('SELECT a FROM t1 INTERSECT SELECT a FROM t3'),
+	qr/GpSlice/, 'different hash maps keep SetOp on the coordinator');
 like(plan_for("$union ORDER BY a LIMIT 3"),
 	qr/GpSlice/, 'a sort and a limit stay above the union');
 like(parallel_query("EXPLAIN (COSTS OFF) $union"),
@@ -146,6 +156,14 @@ my @queries = (
 	'SELECT b, a, v FROM m1 UNION ALL SELECT b, a, v FROM m2 ORDER BY b, a, v',
 	'SELECT a FROM t1 UNION ALL SELECT a FROM t3 ORDER BY a',
 	$replicated . ' ORDER BY a',
+	'SELECT a FROM t1 INTERSECT SELECT a FROM t2 ORDER BY a',
+	'SELECT a FROM t1 EXCEPT SELECT a FROM t2 ORDER BY a',
+	'SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2 ORDER BY a',
+	'SELECT a FROM t1 EXCEPT ALL SELECT a FROM t2 ORDER BY a',
+	'SELECT a FROM t1 INTERSECT SELECT a FROM t3 ORDER BY a',
+	'SELECT a FROM t1 EXCEPT SELECT a FROM t3 ORDER BY a',
+	'SELECT a FROM r1 INTERSECT SELECT a FROM r2 ORDER BY a',
+	'SELECT a FROM r1 EXCEPT SELECT a FROM r2 ORDER BY a',
 	'SELECT a FROM t1 UNION SELECT a FROM t2 ORDER BY a',
 	'SELECT b, a, v FROM m1 UNION SELECT b, a, v FROM m2 ORDER BY b, a, v',
 	'SELECT a FROM r1 UNION SELECT a FROM r2 ORDER BY a',
