@@ -498,17 +498,20 @@ whole key of the distribution, or a replicated table joined to anything,
 or two replicated tables.  An inner join of any number of hashed tables
 of different colocation groups runs on the segments too, when its join
 graph is connected by equalities of the whole keys.  The first table and
-the tables of its group stay; every table of another group moves first:
-every segment asks every segment — itself among them — for the rows that
-the hash of its key places on it under the map of the first table, and
-joins what comes with its own rows.  The equalities may form a chain:
+the tables of its group stay by default; every table of another group moves
+first: every segment asks every segment — itself among them — for the rows that
+the hash of its key places on it under the map of the stationary table, and
+joins what comes with its own rows.  With statistics from `ANALYZE`, either
+side of a two-way inner join can stay instead: the side with fewer rows moves.
+The equalities may form a chain:
 they need not all name the first table.  The asking is `GpMotion`, a custom
 scan that runs on a segment as the user of the query:
 it takes the addresses of the segments from the coordinator at every
 call, so a cluster that changed stays correct, and it tells each segment
 which segment its rows are for by a setting of the connection.  When two
 hashed tables have no such colocation, an inner join broadcasts the second
-table instead: its whole copy goes to every segment, so any join condition,
+table by default, or the smaller one when both sides have statistics: its whole
+copy goes to every segment, so any join condition,
 including an expression or a cross join, works.  An outer join of two tables
 broadcasts its null-supplying side instead: the right side of a left join,
 and the left side of a right join.  A full join broadcasts both
