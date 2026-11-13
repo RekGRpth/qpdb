@@ -571,7 +571,9 @@ replace `HashSetOp` when both inputs share that locus, so equal rows and their
 multiplicities are computed on the segments.  A window partition by the whole
 distribution key is local to its segment; other partition keys stay on the
 coordinator.  An `Incremental Sort` above a distributed result becomes a full
-`Sort`, because there is no globally presorted input for it.
+`Sort`, because there is no globally presorted input for it.  A nonrecursive
+CTE gets its locus from `PlannedStmt.subplans`; projection, condition, sort
+and limit above `CteScan` preserve it.
 A flattened query whose pulled-up subquery has already been dropped is not
 deparsed into a remote query; it keeps the coordinator's plan.
 
@@ -722,6 +724,7 @@ start their own clusters:
 | `033_multiple_slices.pl` | A root and its self-motion reader are separate READ ONLY transactions with one exported snapshot per segment; a segment-local commit between their starts changes nothing, nested cancellation and statement end close every snapshot holder, and a later write still sees itself |
 | `034_union_locus.pl` | `UNION ALL` and `Append`: compatible hash keys, reversed and compound projections, different hash maps, replicated inputs, sort and limit, a parallel `Gather` removed, `UNION DISTINCT`, `INTERSECT` and `EXCEPT` when equal rows share a hashed locus; mixed replicated/hash and `UNION DISTINCT` without it stay on the coordinator |
 | `035_window_locus.pl` | Window partitions by the whole distribution key: `row_number`, `rank` and `sum`, compound keys, multiple `WindowAgg` nodes, replicated inputs, and `Incremental Sort` converted to a full sort above the distributed answer |
+| `036_cte_locus.pl` | Nonrecursive materialized CTEs: the locus comes from `PlannedStmt.subplans`, while projection, a condition, sort and limit above `CteScan` preserve it; replicated CTEs, and why outer joins, multiple CTEs and recursion stay on the coordinator |
 | `028_partial_agg.pl` | Two-step aggregates: `min`, `max` and `sum` by expressions and global ones are answered partly on the segments and finished on the coordinator; `count` and `avg` stay whole on this path |
 
 Besides, CI runs the whole test suite of PostgreSQL twice: on the patched
@@ -764,7 +767,8 @@ by the patch and `contrib/gp`.
    `INSERT ... SELECT` skips Motion when source and target are already
    colocated; `UNION ALL`, `UNION DISTINCT`, `INTERSECT` and `EXCEPT` keep
    compatible hashed loci; window partitions by the whole distribution key are
-   local; next is the locus model for the rest.
+   local; nonrecursive CTEs inherit that locus through their subplans; next is
+   the locus model for the rest.
 6. **Interconnect** — in progress: a `GpMotion` custom scan moves tables by
    redistribution or broadcast over a serialized-plan transport with binary
    tuples; clean
