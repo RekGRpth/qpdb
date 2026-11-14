@@ -114,9 +114,9 @@ like(plan_for('SELECT t1.a, t2.c FROM t1 FULL JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'a full join broadcasts both sides to one segment');
 like(plan_for('SELECT t1.a, count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t1.a'),
 	qr/GpSlice/, 'an aggregate by the preserved side stays on the segments');
-unlike(plan_for('SELECT t2.a, count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t2.a'),
+like(plan_for('SELECT t2.a, count(*) FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t2.a'),
 	qr/GpSlice/,
-	'an aggregate by the null-supplying side keeps its null group on the coordinator');
+	'an aggregate by the null-supplying side merges its null groups');
 unlike(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 LEFT JOIN t2 ON t1.a = t2.a GROUP BY t2.a) s'),
 	qr/GpSlice/,
 	'the null group of a subquery stays on the coordinator too');
@@ -149,8 +149,8 @@ like(plan_for('SELECT t1.a, t2.c FROM t1 CROSS JOIN t2'),
 	qr/GpSlice/, 'a cross join broadcasts a table too');
 like(plan_for('SELECT a FROM (SELECT t1.a AS a FROM t1 FULL JOIN t2 ON t1.a + 20 = t2.a GROUP BY t1.a) s'),
 	qr/GpSlice/, 'a full join by another expression moves inside a subquery');
-unlike(plan_for('SELECT t2.a, count(*) FROM t1 CROSS JOIN t2 GROUP BY t2.a'),
-	qr/GpSlice/, 'an aggregate by the broadcast side stays on the coordinator');
+like(plan_for('SELECT t2.a, count(*) FROM t1 CROSS JOIN t2 GROUP BY t2.a'),
+	qr/GpSlice/, 'an aggregate by the broadcast side is redistributed');
 unlike(plan_for('SELECT a, n FROM (SELECT t2.a AS a, count(*) AS n FROM t1 JOIN t2 ON t1.a + 20 = t2.a GROUP BY t2.a) s'),
 	qr/GpSlice/, 'a broadcast-side aggregate in a subquery stays too');
 

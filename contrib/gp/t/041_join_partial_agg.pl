@@ -68,6 +68,14 @@ unlike(plan_for('SELECT avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'average does not combine by dividing partial sums');
 unlike(plan_for('SELECT sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a'),
 	qr/GpSlice/, 'sum with another result type keeps its original combiner');
+like(plan_for('SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
+	qr/GpSlice/, 'a grouped count uses redistribution instead of a partial count');
+like(plan_for('SELECT t1.g, avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
+	qr/GpSlice/, 'a grouped average uses redistribution instead of a partial average');
+like(plan_for('SELECT t1.g, sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g'),
+	qr/GpSlice/, 'a grouped sum can change result type after redistribution');
+like(plan_for('SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a + 0 = t2.a GROUP BY t1.g'),
+	qr/GpSlice/, 'redistribution can follow a broadcast join');
 
 run('SET enable_mergejoin = off');
 my @queries = (
@@ -82,6 +90,10 @@ my @queries = (
 	'SELECT count(*) FROM t1 JOIN t2 ON t1.a = t2.a',
 	'SELECT avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a',
 	'SELECT sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a',
+	'SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g ORDER BY t1.g',
+	'SELECT t1.g, avg(t2.v) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g ORDER BY t1.g',
+	'SELECT t1.g, sum(t1.g) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.g ORDER BY t1.g',
+	'SELECT t1.g, count(*) FROM t1 JOIN t2 ON t1.a + 0 = t2.a GROUP BY t1.g ORDER BY t1.g',
 );
 foreach my $query (@queries)
 {

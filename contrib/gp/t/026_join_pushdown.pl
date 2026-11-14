@@ -84,11 +84,11 @@ like(plan_for('SELECT j1.a, j2.c FROM j1 JOIN j2 ON j1.b = j2.c'), qr/GpSlice/,
 	'a join not by the key is broadcast to the segments');
 like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a'),
 	qr/GpSlice/, 'an aggregate over a colocated join by the key is pushed');
-unlike(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a'),
+like(plan_for('SELECT j1.a, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.a ORDER BY j1.a'),
 	qr/GpSlice/,
-	'a sorted aggregate over a join that answers the order by itself is not pushed');
-unlike(plan_for('SELECT j1.b, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.b'),
-	qr/GpSlice/, 'an aggregate over a join not by the key is not pushed');
+	'a sorted aggregate over a join gets its final Sort above GpSlice');
+like(plan_for('SELECT j1.b, count(*) FROM j1 JOIN j2 ON j1.a = j2.a GROUP BY j1.b'),
+	qr/GpSlice/, 'a join grouped by another key is redistributed and pushed');
 unlike(plan_for('SELECT count(*) FROM j1 JOIN j2 ON j1.a = j2.a'), qr/GpSlice/,
 	'a global aggregate over a join is not pushed');
 like(plan_for('SELECT j1.a, r1.d, count(*) FROM j1 JOIN r1 ON j1.a = r1.a GROUP BY j1.a, r1.d'),
