@@ -48,6 +48,7 @@
 #include "nodes/nodes.h"
 #include "nodes/value.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
@@ -534,6 +535,9 @@ static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion, GpLocus *locus);
+static bool gp_slice_join_partial(Query *original, PlannedStmt *stmt,
+								  Plan *plan, Plan *parent, bool sort_above,
+								  bool motion);
 
 /*
  * The request worker does not inherit the settings of the session.  Only an
@@ -1667,6 +1671,20 @@ gp_slice_join_collect(Node *node, List **tables, List **conds)
 		gp_slice_join_collect(join->rarg, tables, conds);
 }
 
+/* A comma-separated FROM list is a set of inner joins too */
+static bool
+gp_slice_join_from(Query *parse, List **tables, List **conds)
+{
+	ListCell   *lc;
+
+	foreach(lc, parse->jointree->fromlist)
+	{
+		if (!gp_slice_join_collect(lfirst(lc), tables, conds))
+			return false;
+	}
+	return true;
+}
+
 /* Load the policies needed to build a motion, independently of its locus */
 static bool
 gp_slice_join_load_policies(Query *parse, List *tables)
@@ -2587,8 +2605,6 @@ gp_slice_join_query(Query *parse)
 {
 	List	   *tables = NIL;
 	List	   *conds = NIL;
-	ListCell   *lc;
-	bool		any_hash = false;
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT)
 		return NULL;
@@ -2597,11 +2613,9 @@ gp_slice_join_query(Query *parse)
 		parse->groupingSets != NIL || parse->rowMarks != NIL ||
 		parse->distinctClause != NIL)
 		return NULL;
-	if (!IsA(parse->jointree, FromExpr) ||
-		list_length(parse->jointree->fromlist) != 1)
+	if (!IsA(parse->jointree, FromExpr) || parse->jointree->fromlist == NIL)
 		return NULL;
-	if (!gp_slice_join_collect(linitial(parse->jointree->fromlist),
-							   &tables, &conds))
+	if (!gp_slice_join_from(parse, &tables, &conds))
 	{
 			return NULL;
 	}
@@ -2619,16 +2633,6 @@ gp_slice_join_query(Query *parse)
 			 !gp_slice_join_broadcastable(tables)))
 			return NULL;
 	}
-
-	foreach(lc, tables)
-	{
-		GpJoinTable *table = lfirst(lc);
-
-		if (!table->policy.replicated)
-			any_hash = true;
-	}
-	if (parse->hasAggs && any_hash && parse->groupClause == NIL)
-		return NULL;
 
 	return gp_slice_query_copy(parse);
 }
@@ -2663,13 +2667,12 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (plan == NULL)
 		return false;
 
-	/* A merge join answers the ORDER BY by itself, with no sort on top */
-	if (original->sortClause != NIL && !sort_above)
+	/* Non-aggregate plans without a final Sort keep their ordering here */
+	if (original->sortClause != NIL && !sort_above && !original->hasAggs)
 		return false;
 
 	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
-	if (!gp_slice_join_collect(linitial(original->jointree->fromlist),
-							   &tables, &conds))
+	if (!gp_slice_join_from(original, &tables, &conds))
 		return false;
 	conds = lappend(conds, original->jointree->quals);
 	if (locus.kind == GP_LOCUS_COORDINATOR &&
@@ -2702,10 +2705,15 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	if (list_length(plan->targetlist) != list_length(original->targetList))
 		return false;
 
-	/* An aggregate over the join must group by the key of a hashed table */
+	/* An aggregate over the join can be partial even when it is not by a key */
 	if (original->hasAggs && !replicated)
 	{
 		Plan	   *agg = plan;
+
+		if (gp_slice_join_partial(original, stmt, plan, parent, sort_above, motion))
+			return true;
+		if (original->groupClause == NIL)
+			return false;
 
 		while (agg != NULL && !IsA(agg, Agg))
 		{
@@ -2717,6 +2725,10 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 			!gp_slice_join_agg_keys((Agg *) agg, tables, original, agg_stay))
 			return false;
 	}
+
+	/* A failed partial aggregate must keep the original ordering here */
+	if (original->sortClause != NIL && !sort_above)
+		return false;
 
 	cscan = gp_slice_make(plan, original, replicated, motion, original->sortClause);
 
@@ -2756,8 +2768,7 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 		List	   *tables = NIL;
 		List	   *conds = NIL;
 
-		if (!gp_slice_join_collect(linitial(subquery->jointree->fromlist),
-								   &tables, &conds))
+		if (!gp_slice_join_from(subquery, &tables, &conds))
 			return false;
 		conds = lappend(conds, subquery->jointree->quals);
 		if (!gp_slice_join_colocated(subquery, tables, conds))
@@ -2945,8 +2956,7 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 		replicated = gp_slice_subquery_replicated(subquery, true);
 		copies = replicated;
 
-		if (!gp_slice_join_collect(linitial(candidate->jointree->fromlist),
-								   &tables, &conds))
+		if (!gp_slice_join_from(candidate, &tables, &conds))
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
 		conds = lappend(conds, candidate->jointree->quals);
 		if (locus.kind == GP_LOCUS_COORDINATOR &&
@@ -3025,6 +3035,7 @@ typedef struct GpPartialState
 	List	   *keys;			/* GpPartialKey */
 	Index		npos;			/* columns of the answer so far */
 	int			nextaggno;		/* aggno for the next combining aggregate */
+	Plan	   *below;			/* old input, for resolving planned join Vars */
 	bool		ok;				/* false once anything unsplittable is met */
 } GpPartialState;
 
@@ -3117,11 +3128,37 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 
 	if (node == NULL)
 		return NULL;
+	if (IsA(node, Var) && state->below != NULL)
+	{
+		Plan	   *source = state->below;
+
+		while (IsA(node, Var) &&
+			   (((Var *) node)->varno == OUTER_VAR ||
+				((Var *) node)->varno == INNER_VAR))
+		{
+			Var		   *var = (Var *) node;
+			TargetEntry *tle;
+
+			if (var->varattno <= 0)
+				break;
+			tle = list_nth(source->targetlist, var->varattno - 1);
+			node = (Node *) tle->expr;
+			if (IsA(node, Var) &&
+				((Var *) node)->varno == INNER_VAR && source->righttree != NULL)
+				source = source->righttree;
+			else if (IsA(node, Var) &&
+					 ((Var *) node)->varno == OUTER_VAR && source->lefttree != NULL)
+				source = source->lefttree;
+		}
+	}
 	foreach(lc, state->keys)
 	{
 		GpPartialKey *key = lfirst(lc);
 
-		if (equal(key->expr, node))
+		if (equal(key->expr, node) ||
+			(IsA(key->expr, Var) && IsA(node, Var) &&
+			 ((Var *) key->expr)->varno == ((Var *) node)->varno &&
+			 ((Var *) key->expr)->varattno == ((Var *) node)->varattno))
 			return (Node *) makeVar(OUTER_VAR, key->pos,
 									exprType(node), exprTypmod(node),
 									exprCollation(node), 0);
@@ -3156,6 +3193,84 @@ gp_partial_mutator(Node *node, GpPartialState *state)
 	return expression_tree_mutator(node, gp_partial_mutator, state);
 }
 
+/* Finish a partial aggregate over the slice built from its remote query */
+static bool
+gp_slice_partial_finish(Agg *agg, GpPartialState *state,
+						Query *remote, bool motion,
+						List *final_target, List *final_qual)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Plan	   *below = agg->plan.lefttree;
+	List	   *tlist = NIL;
+	ListCell   *lc;
+	int			pos = 0;
+
+	foreach(lc, remote->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		TargetEntry *out;
+		Var		   *var;
+
+		pos++;
+		var = makeVar(INDEX_VAR, pos, exprType((Node *) tle->expr),
+					  exprTypmod((Node *) tle->expr),
+					  exprCollation((Node *) tle->expr), 0);
+		out = makeTargetEntry((Expr *) var, tle->resno, NULL, false);
+		tlist = lappend(tlist, out);
+	}
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.scanrelid = 0;
+	cscan->scan.plan.startup_cost = agg->plan.lefttree->startup_cost;
+	cscan->scan.plan.total_cost = agg->plan.lefttree->total_cost;
+	cscan->scan.plan.plan_rows = agg->plan.lefttree->plan_rows;
+	cscan->scan.plan.plan_width = agg->plan.lefttree->plan_width;
+	cscan->custom_scan_tlist = copyObject(remote->targetList);
+	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
+								   makeBoolean(false), makeBoolean(motion),
+								   makeBoolean(gp_slice_autonomous(remote)));
+	cscan->methods = &gp_slice_plan_methods;
+
+	/* The final aggregate over the columns of the answer */
+	state->ok = true;
+	state->below = below;
+	tlist = NIL;
+	foreach(lc, final_target)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		TargetEntry *out;
+		Node	   *expr = gp_partial_mutator((Node *) tle->expr, state);
+
+		if (!state->ok)
+			return false;
+		out = makeTargetEntry((Expr *) expr, tle->resno,
+							  tle->resname ? pstrdup(tle->resname) : NULL,
+							  tle->resjunk);
+		out->ressortgroupref = tle->ressortgroupref;
+		tlist = lappend(tlist, out);
+	}
+	agg->plan.qual = (List *) gp_partial_mutator((Node *) final_qual, state);
+	if (!state->ok)
+		return false;
+
+	{
+		AttrNumber *grpColIdx = palloc_array(AttrNumber, list_length(state->keys));
+		int			i = 0;
+
+		foreach(lc, state->keys)
+		{
+			GpPartialKey *key = lfirst(lc);
+
+			grpColIdx[i++] = key->pos;
+		}
+		agg->grpColIdx = grpColIdx;
+	}
+	agg->aggsplit = AGGSPLIT_SIMPLE;
+	agg->plan.targetlist = tlist;
+	agg->plan.lefttree = &cscan->scan.plan;
+	return true;
+}
+
 /*
  * Answer an aggregate query in two steps, when the whole of it cannot run
  * on the segments: the segments aggregate their own rows — grouped by the
@@ -3181,10 +3296,6 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	ListCell   *lc;
 	Agg		   *agg;
 	Query	   *remote;
-	CustomScan *cscan;
-	List	   *tlist = NIL;
-	AttrNumber *grpColIdx;
-	int			nkeys;
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT ||
 		!parse->hasAggs)
@@ -3211,6 +3322,7 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	state.keys = NIL;
 	state.npos = 0;
 	state.nextaggno = 0;
+	state.below = NULL;
 	state.ok = true;
 	foreach(lc, parse->groupClause)
 	{
@@ -3278,75 +3390,109 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	remote->limitCount = NULL;
 	remote->limitOffset = NULL;
 
-	/* The slice that reads the answer of the segments */
-	cscan = makeNode(CustomScan);
-	{
-		int			pos = 0;
+	(void) gp_slice_partial_finish(agg, &state, remote, false,
+								  parse->targetList, (List *) parse->havingQual);
+}
 
-		foreach(lc, remote->targetList)
-		{
-			TargetEntry *tle = lfirst_node(TargetEntry, lc);
-			TargetEntry *out;
-			Var		   *var;
+/* A partitioned join feeds the same partial aggregate as a single table */
+static bool
+gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
+					  Plan *parent, bool sort_above, bool motion)
+{
+	GpPartialState state;
+	GpPartialState finalstate;
+	ListCell   *lc;
+	Agg		   *agg;
+	Query	   *remote;
 
-			pos++;
-			var = makeVar(INDEX_VAR, pos, exprType((Node *) tle->expr),
-						  exprTypmod((Node *) tle->expr),
-						  exprCollation((Node *) tle->expr), 0);
-			out = makeTargetEntry((Expr *) var, tle->resno, NULL, false);
-			tlist = lappend(tlist, out);
-		}
-	}
-	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual = NIL;
-	cscan->scan.scanrelid = 0;
-	cscan->scan.plan.startup_cost = agg->plan.lefttree->startup_cost;
-	cscan->scan.plan.total_cost = agg->plan.lefttree->total_cost;
-	cscan->scan.plan.plan_rows = agg->plan.lefttree->plan_rows;
-	cscan->scan.plan.plan_width = agg->plan.lefttree->plan_width;
-	cscan->custom_scan_tlist = copyObject(remote->targetList);
-	cscan->custom_private = list_make4(makeString(pg_get_querydef(remote, false)),
-									   makeBoolean(false),
-									   makeBoolean(false),
-									   makeBoolean(gp_slice_autonomous(remote)));
-	cscan->methods = &gp_slice_plan_methods;
+	if (!IsA(plan, Agg))
+		return false;
+	agg = (Agg *) plan;
+	if (agg->numCols != list_length(original->groupClause))
+		return false;
 
-	/* The final aggregate over the columns of the answer */
+	state.aggs = NIL;
+	state.keys = NIL;
+	state.npos = 0;
+	state.nextaggno = 0;
+	state.below = NULL;
 	state.ok = true;
-	tlist = NIL;
-	foreach(lc, parse->targetList)
+	foreach(lc, original->groupClause)
 	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-		Node	   *expr = gp_partial_mutator((Node *) tle->expr, &state);
+		SortGroupClause *sc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sc, original->targetList);
+		GpPartialKey *key = palloc0(sizeof(GpPartialKey));
 
-		if (!state.ok)
-			return;
-		tlist = lappend(tlist, makeTargetEntry((Expr *) expr, tle->resno,
-											   tle->resname ?
-											   pstrdup(tle->resname) : NULL,
-											   tle->resjunk));
-	}
-	agg->plan.qual = (List *) gp_partial_mutator((Node *) parse->havingQual,
-												 &state);
-	if (!state.ok)
-		return;
-
-	nkeys = list_length(state.keys);
-	grpColIdx = palloc_array(AttrNumber, nkeys);
-	{
-		int			i = 0;
-
-		foreach(lc, state.keys)
+		key->expr = tle->expr;
+		if (IsA(key->expr, Var))
 		{
-			GpPartialKey *key = lfirst(lc);
+			Var		   *var = (Var *) key->expr;
+			RangeTblEntry *group = rt_fetch(var->varno, original->rtable);
 
-			grpColIdx[i++] = key->pos;
+			if (group->rtekind == RTE_GROUP && var->varattno > 0)
+				key->expr = list_nth(group->groupexprs, var->varattno - 1);
 		}
+		state.npos++;
+		key->pos = state.npos;
+		key->ressortgroupref = tle->ressortgroupref;
+		state.keys = lappend(state.keys, key);
 	}
-	agg->grpColIdx = grpColIdx;
-	agg->aggsplit = AGGSPLIT_SIMPLE;
-	agg->plan.targetlist = tlist;
-	agg->plan.lefttree = &cscan->scan.plan;
+	gp_partial_walker((Node *) original->targetList, &state);
+	if (state.ok)
+		gp_partial_walker((Node *) original->havingQual, &state);
+	if (!state.ok || state.aggs == NIL)
+		return false;
+
+	remote = copyObject(original);
+	remote->targetList = NIL;
+	foreach(lc, state.keys)
+	{
+		GpPartialKey *key = lfirst(lc);
+		TargetEntry *tle = makeTargetEntry(copyObject(key->expr),
+									   key->pos, NULL, false);
+
+		tle->ressortgroupref = key->ressortgroupref;
+		remote->targetList = lappend(remote->targetList, tle);
+	}
+	foreach(lc, state.aggs)
+	{
+		GpPartialAgg *partial = lfirst(lc);
+		TargetEntry *tle = makeTargetEntry((Expr *) copyObject(partial->aggref),
+									   partial->pos, NULL, false);
+
+		remote->targetList = lappend(remote->targetList, tle);
+	}
+	remote->havingQual = NULL;
+	remote->sortClause = NIL;
+	remote->limitCount = NULL;
+	remote->limitOffset = NULL;
+
+	/* Remote SQL needs original Vars; the final Agg needs planned Aggrefs */
+	finalstate = state;
+	finalstate.aggs = NIL;
+	finalstate.npos = list_length(state.keys);
+	finalstate.nextaggno = 0;
+	finalstate.ok = true;
+	gp_partial_walker((Node *) agg->plan.targetlist, &finalstate);
+	if (finalstate.ok)
+		gp_partial_walker((Node *) agg->plan.qual, &finalstate);
+	if (!finalstate.ok || finalstate.aggs == NIL)
+		return false;
+
+	if (!gp_slice_partial_finish(agg, &finalstate, remote, motion,
+								 agg->plan.targetlist, agg->plan.qual))
+		return false;
+	if (original->sortClause != NIL && !sort_above)
+	{
+		Sort	   *sort = make_sort_from_sortclauses(original->sortClause,
+												  &agg->plan);
+
+		if (parent == NULL)
+			stmt->planTree = &sort->plan;
+		else
+			parent->lefttree = &sort->plan;
+	}
+	return true;
 }
 
 /*
