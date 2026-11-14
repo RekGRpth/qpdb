@@ -1616,13 +1616,30 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 	return cscan;
 }
 
+typedef struct GpJoinTable
+{
+	Index		rti;
+	Query	   *query;
+	GpPolicy	policy;
+} GpJoinTable;
+
 /*
  * Whether the condition equates the two given columns of the two tables,
- * at the top of an AND or below it
+ * at the top of an AND or below it, with each Var at its own query level
  */
 static bool
-gp_slice_join_pair(Node *qual, Index rti1, Index rti2,
-				   AttrNumber k1, AttrNumber k2)
+gp_slice_join_var_owned(Var *var, Query *condquery, GpJoinTable *table,
+						AttrNumber key)
+{
+	if (var->varno != table->rti || var->varattno != key)
+		return false;
+	return table->query == condquery ? var->varlevelsup == 0 :
+		var->varlevelsup > 0;
+}
+
+static bool
+gp_slice_join_pair(Node *qual, Query *condquery, GpJoinTable *table1,
+				   GpJoinTable *table2, AttrNumber k1, AttrNumber k2)
 {
 	OpExpr	   *op;
 	Var		   *var1;
@@ -1636,7 +1653,7 @@ gp_slice_join_pair(Node *qual, Index rti1, Index rti2,
 
 		foreach(lc, ((BoolExpr *) qual)->args)
 		{
-			if (gp_slice_join_pair(lfirst(lc), rti1, rti2, k1, k2))
+			if (gp_slice_join_pair(lfirst(lc), condquery, table1, table2, k1, k2))
 				return true;
 		}
 		return false;
@@ -1653,40 +1670,45 @@ gp_slice_join_pair(Node *qual, Index rti1, Index rti2,
 	var1 = (Var *) linitial(op->args);
 	var2 = (Var *) lsecond(op->args);
 
-	return (var1->varno == rti1 && var1->varattno == k1 &&
-			var2->varno == rti2 && var2->varattno == k2) ||
-		(var1->varno == rti2 && var1->varattno == k2 &&
-		 var2->varno == rti1 && var2->varattno == k1);
+	return (gp_slice_join_var_owned(var1, condquery, table1, k1) &&
+			gp_slice_join_var_owned(var2, condquery, table2, k2)) ||
+		(gp_slice_join_var_owned(var2, condquery, table1, k1) &&
+		 gp_slice_join_var_owned(var1, condquery, table2, k2));
 }
+
+/* A join condition and the query level that owns its RT indexes */
+typedef struct GpJoinCond
+{
+	Query	   *query;
+	Node	   *qual;
+} GpJoinCond;
 
 /* Whether any of the join conditions equates the two columns */
 static bool
-gp_slice_join_pair_list(List *conds, Index rti1, Index rti2,
-						AttrNumber k1, AttrNumber k2)
+gp_slice_join_pair_list(List *conds, GpJoinTable *table1,
+						GpJoinTable *table2, AttrNumber k1, AttrNumber k2)
 {
 	ListCell   *lc;
 
 	foreach(lc, conds)
 	{
-		if (gp_slice_join_pair(lfirst(lc), rti1, rti2, k1, k2))
+		GpJoinCond *cond = lfirst(lc);
+
+		/* Do not confuse equal RT indexes of unrelated query levels */
+		if (cond->query != table1->query && cond->query != table2->query)
+			continue;
+		if (gp_slice_join_pair(cond->qual, cond->query, table1, table2, k1, k2))
 			return true;
 	}
 	return false;
 }
-
-/* A table of a join, with its place in the distribution of the rows */
-typedef struct GpJoinTable
-{
-	Index		rti;
-	GpPolicy	policy;
-} GpJoinTable;
 
 /*
  * Collect the base tables of a join tree and all its join conditions;
  * false when a leaf is not a base table or a join type is not supported
  */
 static bool
-gp_slice_join_collect(Node *node, List **tables, List **conds)
+gp_slice_join_collect(Node *node, Query *query, List **tables, List **conds)
 {
 	JoinExpr   *join;
 
@@ -1695,6 +1717,7 @@ gp_slice_join_collect(Node *node, List **tables, List **conds)
 		GpJoinTable *table = palloc0(sizeof(GpJoinTable));
 
 		table->rti = ((RangeTblRef *) node)->rtindex;
+		table->query = query;
 		*tables = lappend(*tables, table);
 		return true;
 	}
@@ -1704,9 +1727,16 @@ gp_slice_join_collect(Node *node, List **tables, List **conds)
 	if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 		join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL)
 		return false;
-	*conds = lappend(*conds, join->quals);
-	return gp_slice_join_collect(join->larg, tables, conds) &&
-		gp_slice_join_collect(join->rarg, tables, conds);
+	if (join->quals != NULL)
+	{
+		GpJoinCond *cond = palloc0(sizeof(GpJoinCond));
+
+		cond->query = query;
+		cond->qual = join->quals;
+		*conds = lappend(*conds, cond);
+	}
+	return gp_slice_join_collect(join->larg, query, tables, conds) &&
+		gp_slice_join_collect(join->rarg, query, tables, conds);
 }
 
 /* A comma-separated FROM list is a set of inner joins too */
@@ -1715,12 +1745,82 @@ gp_slice_join_from(Query *parse, List **tables, List **conds)
 {
 	ListCell   *lc;
 
+	if (!IsA(parse->jointree, FromExpr))
+		return false;
 	foreach(lc, parse->jointree->fromlist)
 	{
-		if (!gp_slice_join_collect(lfirst(lc), tables, conds))
+		if (!gp_slice_join_collect(lfirst(lc), parse, tables, conds))
 			return false;
 	}
+	if (parse->jointree->quals != NULL)
+	{
+		GpJoinCond *cond = palloc0(sizeof(GpJoinCond));
+
+		cond->query = parse;
+		cond->qual = parse->jointree->quals;
+		*conds = lappend(*conds, cond);
+	}
 	return true;
+}
+
+typedef struct GpJoinSubqueries
+{
+	List	  **tables;
+	List	  **conds;
+	int			depth;
+	bool		ok;
+} GpJoinSubqueries;
+
+/* Collect every correlated level, keeping the owner of each RT index */
+static bool
+gp_slice_join_sublink_walker(Node *node, GpJoinSubqueries *state)
+{
+	SubLink    *sublink;
+	Query	   *subquery;
+
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, gp_slice_join_sublink_walker,
+							 state, 0);
+	if (!IsA(node, SubLink))
+		return expression_tree_walker(node, gp_slice_join_sublink_walker, state);
+	sublink = (SubLink *) node;
+	if (!IsA(sublink->subselect, Query))
+	{
+		state->ok = false;
+		return true;
+	}
+	subquery = (Query *) sublink->subselect;
+	/* Multiple outer levels need full varlevelsup-to-parent resolution later */
+	if (state->depth > 0)
+	{
+		state->ok = false;
+		return true;
+	}
+	state->depth++;
+	if (!gp_slice_join_from(subquery, state->tables, state->conds))
+	{
+		state->ok = false;
+		state->depth--;
+		return true;
+	}
+	{
+		bool		failed = query_tree_walker(subquery,
+										   gp_slice_join_sublink_walker, state, 0);
+
+		state->depth--;
+		return failed;
+	}
+}
+
+static bool
+gp_slice_join_sublinks(Query *parse, List **tables, List **conds)
+{
+	GpJoinSubqueries state = { .tables = tables, .conds = conds, .ok = true };
+
+	(void) query_tree_walker(parse, gp_slice_join_sublink_walker, &state, 0);
+	return state.ok;
 }
 
 /* Load the policies needed to build a motion, independently of its locus */
@@ -1732,7 +1832,7 @@ gp_slice_join_load_policies(Query *parse, List *tables)
 	foreach(lc, tables)
 	{
 		GpJoinTable *table = lfirst(lc);
-		RangeTblEntry *rte = rt_fetch(table->rti, parse->rtable);
+		RangeTblEntry *rte = rt_fetch(table->rti, table->query->rtable);
 
 		if (rte->rtekind != RTE_RELATION ||
 			!gp_policy_get(rte->relid, &table->policy))
@@ -1812,7 +1912,7 @@ gp_slice_join_colocated(Query *parse, List *tables, List *conds)
 
 				for (int i = 0; i < nkeys; i++)
 				{
-					if (!gp_slice_join_pair_list(conds, table->rti, other->rti,
+					if (!gp_slice_join_pair_list(conds, table, other,
 												 table->policy.keys[i],
 												 other->policy.keys[i]))
 					{
@@ -1930,7 +2030,7 @@ gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
 
 				for (int i = 0; i < nkeys; i++)
 				{
-					if (!gp_slice_join_pair_list(conds, table->rti, other->rti,
+					if (!gp_slice_join_pair_list(conds, table, other,
 											 table->policy.keys[i],
 											 other->policy.keys[i]))
 					{
@@ -1987,7 +2087,7 @@ gp_slice_join_broadcastable(List *tables)
 static bool
 gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows)
 {
-	Relation	rel = table_open(rt_fetch(table->rti, parse->rtable)->relid,
+	Relation	rel = table_open(rt_fetch(table->rti, table->query->rtable)->relid,
 							 NoLock);
 
 	if (rel->rd_rel->reltuples < 0)
@@ -2646,7 +2746,7 @@ gp_slice_join_query(Query *parse)
 
 	if (!IsUnderPostmaster || parse->commandType != CMD_SELECT)
 		return NULL;
-	if (parse->hasWindowFuncs || parse->hasSubLinks ||
+	if (parse->hasWindowFuncs ||
 		parse->setOperations != NULL || parse->cteList != NIL ||
 		parse->groupingSets != NIL || parse->rowMarks != NIL ||
 		parse->distinctClause != NIL)
@@ -2657,14 +2757,19 @@ gp_slice_join_query(Query *parse)
 	{
 			return NULL;
 	}
+	if (parse->hasSubLinks &&
+		!gp_slice_join_sublinks(parse, &tables, &conds))
+		return NULL;
 	if (list_length(tables) < 2)
 		return NULL;
-	conds = lappend(conds, parse->jointree->quals);
 	if (!gp_slice_join_colocated(parse, tables, conds))
 	{
 		GpJoinTable *stay;
 		List	   *moves;
 
+		/* Nested RTEs cannot be rewritten into Motion by the simple join path */
+		if (parse->hasSubLinks)
+			return NULL;
 		if (gp_dispatch_in_xact() ||
 			(!gp_slice_join_redistributable(parse, tables, conds,
 											&stay, &moves) &&
@@ -2714,10 +2819,11 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		return false;
 	if (!gp_slice_join_load_policies(original, tables))
 		return false;
-	conds = lappend(conds, original->jointree->quals);
 	if (locus.kind == GP_LOCUS_COORDINATOR &&
 		!gp_slice_join_colocated(original, tables, conds))
 	{
+		if (original->hasSubLinks)
+			return false;
 		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
 								  &agg_stay))
 			return false;
@@ -2726,6 +2832,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	else if (gp_slice_join_type_of(original) == JOIN_FULL &&
 			 locus.kind == GP_LOCUS_ONE_SEGMENT && !locus.replicated)
 	{
+		if (original->hasSubLinks)
+			return false;
 		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
 								  &agg_stay))
 			return false;
@@ -2813,7 +2921,6 @@ gp_slice_subquery_replicated(Query *subquery, bool is_join)
 
 		if (!gp_slice_join_from(subquery, &tables, &conds))
 			return false;
-		conds = lappend(conds, subquery->jointree->quals);
 		if (!gp_slice_join_colocated(subquery, tables, conds))
 		{
 			GpJoinTable *stay;
@@ -3001,7 +3108,6 @@ gp_slice_subquery_walk(Query *parse, Plan **planp, bool sort_above)
 
 		if (!gp_slice_join_from(candidate, &tables, &conds))
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
-		conds = lappend(conds, candidate->jointree->quals);
 		if (locus.kind == GP_LOCUS_COORDINATOR &&
 			!gp_slice_join_colocated(candidate, tables, conds))
 		{
