@@ -56,6 +56,8 @@ like(plan_for('SELECT a % 2, min(c), max(c) FROM t GROUP BY a % 2'),
 	qr/GpSlice/, 'min and max by another column are answered partly');
 like(plan_for('SELECT min(c), max(c), sum(c) FROM t'),
 	qr/GpSlice/, 'a global aggregate is answered partly on the segments');
+like(plan_for('SELECT sum(c) FROM t WHERE c > 100 AND c < 1000'),
+	qr/GpSlice/, 'a partial aggregate deparses several WHERE conditions');
 like(plan_for('SELECT a % 2, min(c) FROM t GROUP BY a % 2 HAVING min(c) > 100'),
 	qr/GpSlice/, 'HAVING stays on the coordinator and does not stop the answer');
 unlike(plan_for('SELECT a % 2, count(*) FROM t GROUP BY a % 2'), qr/GpSlice/,
@@ -74,6 +76,7 @@ my @queries = (
 	'SELECT a % 2, sum(c) FROM t GROUP BY a % 2 HAVING sum(c) > 300000 ORDER BY 1',
 	'SELECT a % 2, sum(c) FROM t WHERE c > 100 GROUP BY a % 2 ORDER BY 1',
 	'SELECT sum(c) FROM t HAVING max(c) > 1000',
+	'SELECT sum(c) FROM t WHERE c > 100 AND c < 1000',
 	'SELECT a % 2, count(*), avg(c) FROM t GROUP BY a % 2 ORDER BY 1',
 	'SELECT b, sum(c) FROM t GROUP BY b ORDER BY b LIMIT 5',
 );

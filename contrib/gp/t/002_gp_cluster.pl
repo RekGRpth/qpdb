@@ -86,6 +86,22 @@ command_like([ $script, 'status' ],
 	qr/\A\Q${\status('running')}\E\z/,
 	'status of a running cluster');
 
+# The registration workers, not a racing local CREATE EXTENSION, install gp
+my $extension_functions = q{SELECT p.oid, p.proname FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'gp' ORDER BY p.proname};
+my ($expected_functions) = run_command([
+	'psql', '-X', '-A', '-t', '-h', 'localhost', '-p', $port,
+	'-d', 'postgres', '-c', $extension_functions]);
+foreach my $i (1 .. $segments)
+{
+	my ($actual_functions) = run_command([
+		'psql', '-X', '-A', '-t', '-h', 'localhost', '-p', $port + $i,
+		'-d', 'postgres', '-c', $extension_functions]);
+	is($actual_functions, $expected_functions,
+		"segment $i has the extension functions with the coordinator's OIDs");
+}
+
 command_like([ $script, 'stop' ],
 	qr/\Acoordinator stopped\n.*^segment-1 stopped\n\z/ms,
 	'stop, coordinator first');

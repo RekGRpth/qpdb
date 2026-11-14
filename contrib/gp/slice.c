@@ -3250,6 +3250,11 @@ gp_slice_partial_plan(Query *parse, PlannedStmt *stmt)
 	 * only on the coordinator
 	 */
 	remote = copyObject(parse);
+	/* The planner leaves a list of implicit-AND conditions in the jointree */
+	if (remote->jointree->quals != NULL &&
+		IsA(remote->jointree->quals, List))
+		remote->jointree->quals =
+			(Node *) makeBoolExpr(AND_EXPR, (List *) remote->jointree->quals, -1);
 	remote->targetList = NIL;
 	foreach(lc, state.keys)
 	{
