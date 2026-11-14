@@ -536,8 +536,10 @@ on every segment.  A broadcast join allows only the key of its stationary
 table on that fully local path.  A global aggregate or grouping by other keys
 can instead use a partial aggregate over any partitioned join: the coordinator
 combines the partial results and performs the final grouping.  This supports
-`min`, `max`, and `sum` whose argument, result, and transition types match;
-other aggregates keep the coordinator plan.
+`min`, `max`, and `sum` whose argument, result, and transition types match.
+Otherwise a grouped join can redistribute its result by all grouping columns
+and run the full aggregate on the segments.  Global aggregates that cannot be
+answered partly keep the coordinator plan.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
 table grouped by the key or redistributed by plain grouping columns, or

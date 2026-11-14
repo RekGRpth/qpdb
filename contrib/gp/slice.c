@@ -538,6 +538,43 @@ static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 static bool gp_slice_join_partial(Query *original, PlannedStmt *stmt,
 								  Plan *plan, Plan *parent, bool sort_above,
 								  bool motion);
+static bool gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt,
+											Plan *plan, Plan *parent,
+											bool sort_above, List *tables);
+
+/* A Sort added after setrefs refers to its child as OUTER_VAR */
+static Node *
+gp_slice_sort_vars(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var) && ((Var *) node)->varno == INDEX_VAR)
+	{
+		Var		   *var = (Var *) node;
+
+		var->varno = OUTER_VAR;
+		var->varnosyn = OUTER_VAR;
+	}
+	return expression_tree_mutator(node, gp_slice_sort_vars, context);
+}
+
+/* Keep the original visibility of junk columns in an added Sort */
+static void
+gp_slice_sort_target(Query *original, Sort *sort)
+{
+	ListCell   *lc;
+
+	sort->plan.targetlist = (List *) gp_slice_sort_vars(
+		(Node *) copyObject(sort->plan.targetlist), NULL);
+	foreach(lc, sort->plan.targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		TargetEntry *orig = get_tle_by_resno(original->targetList, tle->resno);
+
+		if (orig != NULL)
+			tle->resjunk = orig->resjunk;
+	}
+}
 
 /*
  * The request worker does not inherit the settings of the session.  Only an
@@ -1559,6 +1596,7 @@ gp_slice_make(Plan *src, Query *original, bool replicated, bool motion,
 		out = makeTargetEntry((Expr *) var, tle->resno,
 							  tle->resname ? pstrdup(tle->resname) : NULL,
 							  false);
+		out->ressortgroupref = tle->ressortgroupref;
 		tlist = lappend(tlist, out);
 	}
 
@@ -2674,6 +2712,8 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	locus = gp_locus_plan(plan, stmt->rtable, stmt->subplans);
 	if (!gp_slice_join_from(original, &tables, &conds))
 		return false;
+	if (!gp_slice_join_load_policies(original, tables))
+		return false;
 	conds = lappend(conds, original->jointree->quals);
 	if (locus.kind == GP_LOCUS_COORDINATOR &&
 		!gp_slice_join_colocated(original, tables, conds))
@@ -2711,6 +2751,9 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 		Plan	   *agg = plan;
 
 		if (gp_slice_join_partial(original, stmt, plan, parent, sort_above, motion))
+			return true;
+		if (gp_slice_join_redistributed_agg(original, stmt, plan, parent,
+										 sort_above, tables))
 			return true;
 		if (original->groupClause == NIL)
 			return false;
@@ -3486,6 +3529,310 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	{
 		Sort	   *sort = make_sort_from_sortclauses(original->sortClause,
 												  &agg->plan);
+
+		gp_slice_sort_target(original, sort);
+
+		if (parent == NULL)
+			stmt->planTree = &sort->plan;
+		else
+			parent->lefttree = &sort->plan;
+	}
+	return true;
+}
+
+/* Resolve a grouping key through the parser's GROUP and join RTEs */
+static Node *
+gp_slice_join_agg_key(Query *original, SortGroupClause *sc)
+{
+	TargetEntry *tle = get_sortgroupclause_tle(sc, original->targetList);
+	Node	   *expr = (Node *) tle->expr;
+
+	if (IsA(expr, Var))
+	{
+		Var		   *var = (Var *) expr;
+		RangeTblEntry *rte = rt_fetch(var->varno, original->rtable);
+
+		if (rte->rtekind == RTE_GROUP && var->varattno > 0)
+			expr = list_nth(rte->groupexprs, var->varattno - 1);
+	}
+	return flatten_join_alias_for_parser(original, expr, 0);
+}
+
+static bool
+gp_slice_join_agg_equal(Node *a, Node *b)
+{
+	return equal(a, b) ||
+		(IsA(a, Var) && IsA(b, Var) &&
+		 ((Var *) a)->varno == ((Var *) b)->varno &&
+		 ((Var *) a)->varattno == ((Var *) b)->varattno);
+}
+
+/* Mapping of Vars of the original join to columns of its serialized answer */
+typedef struct GpJoinAggMap
+{
+	Query	   *original;
+	Query	   *inner;
+	bool		ok;
+} GpJoinAggMap;
+
+static Node *
+gp_slice_join_agg_var(Node *node, GpJoinAggMap *map)
+{
+	Node	   *expr = node;
+	Var		   *var;
+	RangeTblEntry *rte;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return NULL;
+	if (!IsA(node, Var))
+		return expression_tree_mutator(node, gp_slice_join_agg_var, map);
+	var = (Var *) node;
+	if (var->varlevelsup != 0 || var->varattno <= 0)
+	{
+		map->ok = false;
+		return node;
+	}
+	rte = rt_fetch(var->varno, map->original->rtable);
+	if (rte->rtekind == RTE_GROUP)
+		expr = list_nth(rte->groupexprs, var->varattno - 1);
+	else if (rte->rtekind == RTE_JOIN)
+		expr = flatten_join_alias_for_parser(map->original, expr, 0);
+
+	foreach(lc, map->inner->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (gp_slice_join_agg_equal((Node *) tle->expr, expr))
+			return (Node *) makeVar(1, tle->resno, exprType((Node *) tle->expr),
+								  exprTypmod((Node *) tle->expr),
+								  exprCollation((Node *) tle->expr), 0);
+	}
+	map->ok = false;
+	return node;
+}
+
+/* A function RTE that reads a serialized join with all of its output columns */
+static RangeTblEntry *
+gp_slice_join_agg_rte(Query *inner, const char *serialized)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	RangeTblFunction *rtf = makeNode(RangeTblFunction);
+	FuncExpr   *func = makeNode(FuncExpr);
+	Const	   *arg;
+	List	   *types = NIL;
+	List	   *typmods = NIL;
+	List	   *names = NIL;
+	List	   *collations = NIL;
+	ListCell   *lc;
+	Oid			peer_query_oid = DatumGetObjectId(DirectFunctionCall1(
+		regprocedurein, CStringGetDatum("gp.peer_query(text)")));
+
+	foreach(lc, inner->targetList)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		types = lappend_oid(types, exprType((Node *) tle->expr));
+		typmods = lappend_int(typmods, exprTypmod((Node *) tle->expr));
+		names = lappend(names, makeString(pstrdup(tle->resname)));
+		collations = lappend_oid(collations, exprCollation((Node *) tle->expr));
+	}
+	arg = makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+					PointerGetDatum(cstring_to_text(serialized)), false, false);
+	func->funcid = peer_query_oid;
+	func->funcresulttype = RECORDOID;
+	func->funcretset = true;
+	func->funcformat = COERCE_EXPLICIT_CALL;
+	func->inputcollid = DEFAULT_COLLATION_OID;
+	func->args = list_make1(arg);
+	rtf->funccolcount = list_length(types);
+	rtf->funccoltypes = types;
+	rtf->funccoltypmods = typmods;
+	rtf->funccolnames = names;
+	rtf->funccolcollations = collations;
+	rtf->funcexpr = (Node *) func;
+
+	rte->rtekind = RTE_FUNCTION;
+	rte->functions = list_make1(rtf);
+	rte->eref = makeAlias("moved", names);
+	rte->inFromCl = true;
+	return rte;
+}
+
+/*
+ * Compute a full aggregate after redistributing the join itself by all of its
+ * grouping columns.  This is the general fallback when a partial aggregate is
+ * not available: every group lands on one segment, whatever its aggregate does.
+ */
+static bool
+gp_slice_join_redistributed_agg(Query *original, PlannedStmt *stmt, Plan *plan,
+								Plan *parent, bool sort_above, List *tables)
+{
+	Agg		   *agg;
+	Query	   *inner;
+	Query	   *remote;
+	GpJoinAggMap map;
+	GpJoinTable *maptable = NULL;
+	StringInfoData sql;
+	AttrNumber *keypos;
+	ListCell   *lc;
+	CustomScan *cscan;
+	RangeTblEntry *rte;
+	FromExpr   *from;
+	int			pos = 0;
+	int			keyidx = 0;
+	int			nkeys = list_length(original->groupClause);
+	char	   *serialized;
+
+	if (nkeys == 0 || !IsA(plan, Agg))
+		return false;
+	agg = (Agg *) plan;
+	if (agg->numCols != nkeys)
+		return false;
+
+	/* The inner query computes the join, before any aggregation */
+	inner = copyObject(original);
+	inner->targetList = NIL;
+	inner->hasAggs = false;
+	inner->hasGroupRTE = false;
+	inner->groupClause = NIL;
+	inner->groupingSets = NIL;
+	inner->havingQual = NULL;
+	inner->distinctClause = NIL;
+	inner->sortClause = NIL;
+	inner->limitCount = NULL;
+	inner->limitOffset = NULL;
+	foreach(lc, original->rtable)
+	{
+		RangeTblEntry *input = lfirst_node(RangeTblEntry, lc);
+		Relation	rel;
+		TupleDesc	tupdesc;
+		int			rti = foreach_current_index(lc) + 1;
+
+		if (input->rtekind != RTE_RELATION &&
+			(input->rtekind != RTE_FUNCTION || !OidIsValid(input->relid)))
+			continue;
+		rel = table_open(input->relid, NoLock);
+		tupdesc = RelationGetDescr(rel);
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+			Var		   *var;
+			TargetEntry *tle;
+
+			if (att->attisdropped)
+				continue;
+			var = makeVar(rti, att->attnum, att->atttypid,
+						  att->atttypmod, att->attcollation, 0);
+			pos++;
+			tle = makeTargetEntry((Expr *) var, pos, psprintf("c%d", pos), false);
+			inner->targetList = lappend(inner->targetList, tle);
+		}
+		table_close(rel, NoLock);
+	}
+	if (inner->targetList == NIL)
+		return false;
+
+	/* Grouping expressions can be computed columns of the join answer */
+	keypos = palloc_array(AttrNumber, nkeys);
+	foreach(lc, original->groupClause)
+	{
+		SortGroupClause *sc = lfirst_node(SortGroupClause, lc);
+		Node	   *expr = gp_slice_join_agg_key(original, sc);
+		TargetEntry *found = NULL;
+		ListCell   *it;
+
+		if (!gp_slice_hashable(exprType(expr)))
+			return false;
+		foreach(it, inner->targetList)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, it);
+
+			if (gp_slice_join_agg_equal((Node *) tle->expr, expr))
+			{
+				found = tle;
+				break;
+			}
+		}
+		if (found == NULL)
+		{
+			pos++;
+			found = makeTargetEntry((Expr *) copyObject(expr), pos,
+									psprintf("c%d", pos), false);
+			inner->targetList = lappend(inner->targetList, found);
+		}
+		keypos[keyidx++] = found->resno;
+	}
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (!table->policy.replicated)
+		{
+			maptable = table;
+			break;
+		}
+	}
+	if (maptable == NULL)
+		return false;
+
+	/* Keep on the asking segment only rows whose grouping key belongs to it */
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT * FROM (%s) AS joined WHERE (ARRAY[",
+					 pg_get_querydef(inner, false));
+	for (int i = 0; i < maptable->policy.nbuckets; i++)
+		appendStringInfo(&sql, "%s%d", i > 0 ? "," : "",
+						 maptable->policy.map[i]);
+	appendStringInfo(&sql, "])[gp.bucket(%d", maptable->policy.nbuckets);
+	for (int i = 0; i < nkeys; i++)
+	{
+		TargetEntry *tle = list_nth(inner->targetList, keypos[i] - 1);
+
+		appendStringInfo(&sql, ", %s%s", quote_identifier(tle->resname),
+						 exprCollation((Node *) tle->expr) != InvalidOid ?
+						 " COLLATE pg_catalog.default" : "");
+	}
+	appendStringInfoString(&sql,
+		") + 1] OPERATOR(pg_catalog.=) current_setting('gp.requester_segment')::int4");
+	serialized = gp_interconnect_plan(sql.data);
+
+	/* The original aggregate now reads the moved columns from one function */
+	remote = copyObject(original);
+	rte = gp_slice_join_agg_rte(inner, serialized);
+	remote->rtable = list_make1(rte);
+	remote->rteperminfos = NIL;
+	remote->hasGroupRTE = false;
+	from = makeNode(FromExpr);
+	{
+		RangeTblRef *ref = makeNode(RangeTblRef);
+
+		ref->rtindex = 1;
+		from->fromlist = list_make1(ref);
+	}
+	remote->jointree = from;
+	map.original = original;
+	map.inner = inner;
+	map.ok = true;
+	remote = query_tree_mutator(remote, gp_slice_join_agg_var, &map, 0);
+	if (!map.ok)
+		return false;
+
+	cscan = gp_slice_make(plan, remote, false, true, original->sortClause);
+	/* All Vars above the replacement refer to the function's output */
+	stmt->rtable = copyObject(remote->rtable);
+	stmt->permInfos = NIL;
+	stmt->unprunableRelids = NULL;
+	if (parent == NULL)
+		stmt->planTree = &cscan->scan.plan;
+	else
+		parent->lefttree = &cscan->scan.plan;
+	if (original->sortClause != NIL && !sort_above)
+	{
+		Sort	   *sort = make_sort_from_sortclauses(original->sortClause,
+												  &cscan->scan.plan);
+
+		gp_slice_sort_target(original, sort);
 
 		if (parent == NULL)
 			stmt->planTree = &sort->plan;

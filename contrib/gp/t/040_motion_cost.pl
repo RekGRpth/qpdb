@@ -85,8 +85,8 @@ moves_smaller('SELECT small.a, big.v FROM small LEFT JOIN big ON small.a = big.a
 	'big', 'an outer join still broadcasts its null-supplying side');
 like(plan_for('SELECT big.a, count(*) FROM big JOIN small ON big.a + 0 = small.a GROUP BY big.a'),
 	qr/GpSlice/, 'an aggregate by the stationary side remains local');
-unlike(plan_for('SELECT small.a, count(*) FROM big JOIN small ON big.a + 0 = small.a GROUP BY small.a'),
-	qr/GpSlice/, 'an aggregate by the broadcast side stays on the coordinator');
+like(plan_for('SELECT small.a, count(*) FROM big JOIN small ON big.a + 0 = small.a GROUP BY small.a'),
+	qr/GpSlice/, 'an aggregate by the broadcast side is redistributed');
 
 run('SET enable_mergejoin = off');
 my @queries = (
