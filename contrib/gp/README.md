@@ -512,7 +512,10 @@ which segment its rows are for by a setting of the connection.  When two
 hashed tables have no such colocation, an inner join broadcasts the second
 table by default, or the smaller one when both sides have statistics: its whole
 copy goes to every segment, so any join condition,
-including an expression or a cross join, works.  An outer join of two tables
+including an expression or a cross join, works.  A multiway inner join can
+instead keep one connected colocated component and broadcast every other hashed
+table to all segments, preferring the component with the fewest broadcast rows.
+An outer join of two tables
 broadcasts its null-supplying side instead: the right side of a left join,
 and the left side of a right join.  A full join broadcasts both
 sides and runs on one segment, because either side can have an unmatched
