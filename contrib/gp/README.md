@@ -528,13 +528,16 @@ the limit stay on the coordinator, and a merge join that answers the
 `ORDER BY` by itself is left alone.  Inner, left, right and full joins
 are all colocated by the same argument: a row without a partner on its
 segment has no partner anywhere.  An outer join of more than two tables,
-a replicated table in a non-colocated join of several groups, and an
-aggregate over a join whose grouping does not cover the key are left to
+a replicated table in a non-colocated join of several groups are left to
 the coordinator.  An aggregate over a colocated join runs on the segments as
 well, when its grouping covers the key of a hashed table that is not
 null-supplying; a null-supplying key would leave a separate null group
 on every segment.  A broadcast join allows only the key of its stationary
-table, whose rows are not duplicated across segments.
+table on that fully local path.  A global aggregate or grouping by other keys
+can instead use a partial aggregate over any partitioned join: the coordinator
+combines the partial results and performs the final grouping.  This supports
+`min`, `max`, and `sum` whose argument, result, and transition types match;
+other aggregates keep the coordinator plan.
 
 A subquery in FROM has a locus of its own: an aggregate of a distributed
 table grouped by the key or redistributed by plain grouping columns, or
