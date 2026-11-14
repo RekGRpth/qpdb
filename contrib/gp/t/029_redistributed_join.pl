@@ -126,8 +126,8 @@ like(plan_for('SELECT t1.a, t2.c, t3.d FROM t3 JOIN t2 ON t3.a = t2.a JOIN t1 ON
 	qr/GpSlice/, 'the last table can stay while the first two move');
 like(plan_for('SELECT a FROM (SELECT t3.a AS a FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a GROUP BY t3.a) s'),
 	qr/GpSlice/, 'a three-way join moves inside a subquery too');
-unlike(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a CROSS JOIN t3'),
-	qr/GpSlice/, 'a disconnected join graph stays on the coordinator');
+like(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a CROSS JOIN t3'),
+	qr/GpSlice/, 'a disconnected join graph uses component broadcast');
 like(plan_for('SELECT t1.a, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.a = t3.a JOIN t4 ON t1.a = t4.a'),
 	qr/GpSlice/, 'a four-way join moves only the other colocation groups');
 unlike(plan_for('SELECT t1.a, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t2.a = t3.a) ON t1.a = t2.a'),

@@ -433,8 +433,13 @@ gp_locus_plan(Plan *plan, List *rtable, List *subplans)
 		return gp_locus_make(GP_LOCUS_COORDINATOR);
 	if (gp_is_gather(plan) || IsA(plan, SeqScan))
 	{
-		RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid, rtable);
+		RangeTblEntry *rte;
 		GpPolicy	policy;
+
+		if (((Scan *) plan)->scanrelid == 0 ||
+			((Scan *) plan)->scanrelid > list_length(rtable))
+			return gp_locus_make(GP_LOCUS_COORDINATOR);
+		rte = rt_fetch(((Scan *) plan)->scanrelid, rtable);
 
 		if (rte->rtekind != RTE_RELATION || !gp_policy_get(rte->relid, &policy))
 			return gp_locus_make(GP_LOCUS_COORDINATOR);
@@ -525,14 +530,21 @@ static Query *
 gp_slice_query_copy(Query *parse)
 {
 	foreach_node(RangeTblEntry, rte, parse->rtable)
+	{
 		if (rte->rtekind == RTE_SUBQUERY && rte->subquery == NULL)
 			return NULL;
+		if (rte->rtekind == RTE_JOIN &&
+			list_length(rte->joinaliasvars) != list_length(rte->eref->colnames))
+			return NULL;
+	}
 	return copyObject(parse);
 }
 
 static bool gp_slice_union_leaf(Query *query);
 static CustomScan *gp_slice_make(Plan *src, Query *original, bool replicated,
 								 bool motion, List *sortClause);
+typedef struct GpJoinTable GpJoinTable;
+static bool gp_slice_join_rows(Query *parse, GpJoinTable *table, double *rows);
 static bool gp_slice_agg_locus(Query *original, Agg *agg, Plan *below,
 							   bool *replicated, bool *motion, GpLocus *locus);
 static bool gp_slice_join_partial(Query *original, PlannedStmt *stmt,
@@ -2068,6 +2080,120 @@ gp_slice_join_redistributable(Query *parse, List *tables, List *conds,
 	return true;
 }
 
+/* A colocated component of a join graph, ignoring all other tables */
+static List *
+gp_slice_join_component(List *tables, List *conds, GpJoinTable *root)
+{
+	List	   *connected = list_make1(root);
+	List	   *pending = NIL;
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		GpJoinTable *table = lfirst(lc);
+
+		if (table != root && !table->policy.replicated)
+			pending = lappend(pending, table);
+	}
+	for (;;)
+	{
+		bool		grew = false;
+
+		foreach(lc, pending)
+		{
+			GpJoinTable *table = lfirst(lc);
+			ListCell   *other_lc;
+
+			foreach(other_lc, connected)
+			{
+				GpJoinTable *other = lfirst(other_lc);
+				bool		all_keys = table->policy.nkeys == other->policy.nkeys &&
+					table->policy.colocation_id == other->policy.colocation_id;
+
+				for (int i = 0; all_keys && i < table->policy.nkeys; i++)
+				{
+					if (!gp_slice_join_pair_list(conds, table, other,
+												 table->policy.keys[i],
+												 other->policy.keys[i]))
+						all_keys = false;
+				}
+				if (all_keys)
+				{
+					connected = lappend(connected, table);
+					pending = list_delete(pending, table);
+					grew = true;
+					break;
+				}
+			}
+			if (grew)
+				break;
+		}
+		if (!grew)
+			break;
+	}
+	return connected;
+}
+
+/* Choose a stationary component and broadcast every other hashed table */
+static bool
+gp_slice_join_broadcast_component(Query *original, List *tables, List *conds,
+								  GpJoinTable **stay, List **moves)
+{
+	List	   *best = NIL;
+	List	   *best_moves = NIL;
+	double		best_rows = 0;
+	int			best_count = 0;
+	bool		best_known = false;
+	ListCell   *lc;
+
+	*moves = NIL;
+	foreach(lc, tables)
+	{
+		GpJoinTable *root = lfirst(lc);
+		List	   *component;
+		List	   *other_moves = NIL;
+		ListCell   *it;
+		double		rows = 0;
+		bool		known = true;
+		int			count;
+
+		if (root->policy.replicated)
+			continue;
+		component = gp_slice_join_component(tables, conds, root);
+		foreach(it, tables)
+		{
+			GpJoinTable *table = lfirst(it);
+			double		table_rows;
+
+			if (table->policy.replicated || list_member_ptr(component, table))
+				continue;
+			other_moves = lappend(other_moves, table);
+			if (known && gp_slice_join_rows(original, table, &table_rows))
+				rows += table_rows;
+			else
+				known = false;
+		}
+		if (other_moves == NIL)
+			continue;
+		count = list_length(other_moves);
+		if (best == NIL ||
+			(known && (!best_known || rows < best_rows)) ||
+			(!known && !best_known && count < best_count))
+		{
+			best = component;
+			best_moves = other_moves;
+			best_rows = rows;
+			best_count = count;
+			best_known = known;
+		}
+	}
+	if (best == NIL)
+		return false;
+	*stay = linitial(best);
+	*moves = best_moves;
+	return true;
+}
+
 /* Whether two hashed tables can join by broadcasting one of them */
 static bool
 gp_slice_join_broadcastable(List *tables)
@@ -2510,6 +2636,19 @@ gp_slice_join_all_inner(Node *node)
 		gp_slice_join_all_inner(join->rarg);
 }
 
+static bool
+gp_slice_join_all_inner_from(Query *parse)
+{
+	ListCell   *lc;
+
+	foreach(lc, parse->jointree->fromlist)
+	{
+		if (!gp_slice_join_all_inner(lfirst(lc)))
+			return false;
+	}
+	return true;
+}
+
 /*
  * Move the sides of a join of colocation groups.  An inner join moves every
  * table of another group by the hash of its key under the map of the first.
@@ -2527,6 +2666,7 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 	ListCell   *lc;
 	JoinType	jointype;
 	bool		redistributing;
+	bool		multiway = false;
 
 	*single_segment = false;
 	*agg_stay = NULL;
@@ -2534,12 +2674,19 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 		return false;
 	redistributing = gp_slice_join_redistributable(original, tables, conds,
 												   &stay, &moves);
-	if (!redistributing && !gp_slice_join_broadcastable(tables))
+	if (!redistributing && list_length(tables) > 2)
+		multiway = gp_slice_join_broadcast_component(original, tables, conds,
+													&stay, &moves);
+	else if (!redistributing && !gp_slice_join_broadcastable(tables))
+		return false;
+	if (!redistributing && list_length(tables) > 2 && !multiway)
 		return false;
 	jointype = gp_slice_join_type_of(original);
 	if (list_length(tables) != 2 &&
-		!gp_slice_join_all_inner(linitial(original->jointree->fromlist)))
+		!gp_slice_join_all_inner_from(original))
+	{
 		return false;
+	}
 	if (redistributing)
 	{
 		move = linitial(moves);
@@ -2565,6 +2712,8 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 			}
 		}
 	}
+	else if (multiway)
+		*agg_stay = stay;
 	else
 	{
 		stay = linitial(tables);
@@ -2594,6 +2743,15 @@ gp_slice_join_motion(Query *original, List *tables, List *conds,
 				{
 					move = lfirst(lc);
 					if (!gp_slice_redistribute_rte(original, stay, move, false))
+						return false;
+				}
+			}
+			else if (multiway)
+			{
+				foreach(lc, moves)
+				{
+					move = lfirst(lc);
+					if (!gp_slice_redistribute_rte(original, stay, move, true))
 						return false;
 				}
 			}
@@ -2771,7 +2929,10 @@ gp_slice_join_query(Query *parse)
 		if (parse->hasSubLinks)
 			return NULL;
 		if (gp_dispatch_in_xact() ||
-			(!gp_slice_join_redistributable(parse, tables, conds,
+			(list_length(tables) > 2 &&
+			 !gp_slice_join_broadcast_component(parse, tables, conds,
+											 &stay, &moves) &&
+			 !gp_slice_join_redistributable(parse, tables, conds,
 											&stay, &moves) &&
 			 !gp_slice_join_broadcastable(tables)))
 			return NULL;
@@ -2824,9 +2985,14 @@ gp_slice_join_plan(Query *original, PlannedStmt *stmt)
 	{
 		if (original->hasSubLinks)
 			return false;
-		if (!gp_slice_join_motion(original, tables, conds, &single_segment,
-								  &agg_stay))
-			return false;
+		{
+			bool		motion_ok = gp_slice_join_motion(original, tables, conds,
+													 &single_segment, &agg_stay);
+
+						if (!motion_ok)
+				return false;
+		}
+
 		motion = true;
 	}
 	else if (gp_slice_join_type_of(original) == JOIN_FULL &&
@@ -3631,6 +3797,8 @@ gp_slice_join_partial(Query *original, PlannedStmt *stmt, Plan *plan,
 	if (!gp_slice_partial_finish(agg, &finalstate, remote, motion,
 								 agg->plan.targetlist, agg->plan.qual))
 		return false;
+	/* Partial groups from different segments are not sorted by group key */
+	agg->aggstrategy = AGG_HASHED;
 	if (original->sortClause != NIL && !sort_above)
 	{
 		Sort	   *sort = make_sort_from_sortclauses(original->sortClause,
