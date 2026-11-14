@@ -553,6 +553,15 @@ condition the planner pushed into the aggregate's `HAVING` and outputs it
 pruned.  A plan that answers the `ORDER BY` by its own order is left alone,
 and so is a subquery with a limit of its own and a subquery joined to a table.
 
+A correlated subquery can also run as part of a local slice when every hashed
+input at every supported level is connected to the others by the whole
+distribution key; replicated inputs need no such connection.  The analysis
+keeps the query level and `varlevelsup` of every condition, so equal RT indexes
+of unrelated levels cannot prove colocation.  Nested correlated levels,
+unconnected hashed inputs, and correlated plans that need Motion stay on the
+coordinator.  This covers correlated `EXISTS`, scalar aggregates, and outer
+aggregates without changing the original SQL.
+
 A distributed scan also has hash metadata: the colocation group and the
 positions, types and collations of all its distribution-key columns in the
 output of the subtree.  A direct projection renumbers these columns; sorting
