@@ -124,10 +124,8 @@ cmd_start()
 		-c 'CREATE EXTENSION IF NOT EXISTS gp' ||
 		die "could not create extension gp on the coordinator"
 
-	# The motion of a segment calls the functions of the extension there.
-	# Its registration worker normally creates it already, so the manual
-	# creation below only retries until it is there: a concurrent CREATE
-	# EXTENSION may fail once when the worker gets there first.
+	# The registration worker creates the extension with the coordinator's OIDs.
+	# Never race it with a local CREATE EXTENSION: those OIDs cannot decode plans.
 	list | while read -r name port role; do
 		[ "$role" = segment ] || continue
 		i=0
@@ -139,11 +137,6 @@ cmd_start()
 			i=$((i + 1))
 			[ "$i" -le 60 ] ||
 				die "extension gp did not appear on $name, see $dir/$name.log"
-			"$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -h localhost \
-				-p "$port" -d postgres \
-				-c 'SET gp.allow_local_ddl = on' \
-				-c 'CREATE EXTENSION IF NOT EXISTS gp' \
-				>>"$dir/$name.log" 2>&1 || true
 			sleep 1
 		done
 	done
