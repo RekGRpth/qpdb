@@ -2660,9 +2660,9 @@ static bool
 gp_slice_join_motion(Query *original, List *tables, List *conds,
 					 bool *single_segment, GpJoinTable **agg_stay)
 {
-	GpJoinTable *stay;
-	GpJoinTable *move;
-	List	   *moves;
+	GpJoinTable *stay = NULL;
+	GpJoinTable *move = NULL;
+	List	   *moves = NIL;
 	ListCell   *lc;
 	JoinType	jointype;
 	bool		redistributing;
